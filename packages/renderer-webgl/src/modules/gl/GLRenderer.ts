@@ -140,6 +140,32 @@ interface TextureEntry {
 }
 
 /**
+ * One ramp cache entry. The signature captures the rasterized stop content, so
+ * a reused key whose stops changed can be detected instead of handing back a
+ * row full of stale colors.
+ */
+interface RampEntry {
+    row: number;
+    signature: string;
+}
+
+/**
+ * Stable content fingerprint of a ramp's normalized stops. Colors are rounded
+ * so equivalent parsed values always match despite float noise.
+ */
+function rampStopsSignature(stops: ReadonlyArray<{ offset: number; color: RGBA }>): string {
+    let signature = "";
+    for (const stop of stops) {
+        signature += `${stop.offset}:`;
+        for (let c = 0; c < 4; c++) {
+            signature += `${Math.round(stop.color[c] * 1e6)},`;
+        }
+        signature += ";";
+    }
+    return signature;
+}
+
+/**
  * Thin batched drawing layer over a raw WebGL context.
  *
  * Each `draw*` call uploads a freshly built vertex array and issues a single
@@ -150,6 +176,8 @@ interface TextureEntry {
  */
 export class GLRenderer {
     private gl: GL;
+    /** Set once {@link dispose} runs; makes disposal idempotent. */
+    private disposed = false;
 
     private shape: ShapeProgram;
     private line: LineProgram;
@@ -161,7 +189,19 @@ export class GLRenderer {
 
     /** Gradient ramp atlas: one RAMP_WIDTH row per distinct ramp. */
     private rampTexture: WebGLTexture | null = null;
-    private rampRows = new Map<string, number>();
+    /**
+     * Keyed ramps. Map order is the LRU order: a read deletes and re-inserts
+     * its entry at the end, so the first key is the least recently used.
+     */
+    private rampRows = new Map<string, RampEntry>();
+    /** Row slots released through {@link releaseRampRow}, ready for reuse. */
+    private rampFreeRows = new Set<number>();
+    /**
+     * Number of rows ever freshly allocated (one past the highest fresh row).
+     * This is the atlas height that has to stay uploaded: explicit releases
+     * shrink {@link rampRows} without moving surviving rows down.
+     */
+    private rampHighWater = 0;
     private rampPixels = new Uint8Array(RAMP_WIDTH * 4);
     private rampDirty = false;
 
@@ -325,22 +365,35 @@ export class GLRenderer {
      * Register a color ramp and get back its row in the atlas.
      *
      * Rows are keyed structurally and kept across frames, because a scene's
-     * gradients rarely change; the texture only re-uploads when a new ramp
-     * shows up. An app that manufactures unbounded distinct gradients resets
-     * the atlas rather than growing without limit.
+     * gradients rarely change. Two ramps sharing a key share a row only while
+     * their normalized stops match; if the stops changed, the slot is
+     * re-rasterized so a caller can never read stale colors under a reused key.
+     *
+     * At {@link MAX_RAMP_ROWS} the least-recently-used key is evicted and its
+     * row number is handed to the new ramp, so the atlas never grows without
+     * bound and row numbers stay stable for the lifetime of an active ramp.
+     * Explicitly released rows (see {@link releaseRampRow}) are reused first.
      */
     rampRow(key: string, stops: Array<{ offset: number; color: RGBA }>): number {
+        const signature = rampStopsSignature(stops);
         const existing = this.rampRows.get(key);
-        if (existing !== undefined) {
-            return existing;
+        if (existing) {
+            // Mark most-recently-used by moving the entry to the Map's end.
+            this.rampRows.delete(key);
+            this.rampRows.set(key, existing);
+
+            if (existing.signature !== signature) {
+                // Same identity, new content: repaint the row in place and
+                // re-upload the atlas before the next draw samples it.
+                existing.signature = signature;
+                this.writeRamp(existing.row, stops);
+                this.rampDirty = true;
+            }
+            return existing.row;
         }
 
-        if (this.rampRows.size >= MAX_RAMP_ROWS) {
-            this.rampRows.clear();
-        }
-
-        const row = this.rampRows.size;
-        this.rampRows.set(key, row);
+        const row = this.allocateRampRow();
+        this.rampRows.set(key, { row, signature });
 
         const needed = (row + 1) * RAMP_WIDTH * 4;
         if (this.rampPixels.length < needed) {
@@ -351,6 +404,55 @@ export class GLRenderer {
 
         this.writeRamp(row, stops);
         this.rampDirty = true;
+        return row;
+    }
+
+    /**
+     * Drop a key's ramp because no draw registration references it any more,
+     * returning its row slot to the free list for reuse. Safe to call for an
+     * unknown or already-released key. The atlas texture itself is retained.
+     */
+    releaseRampRow(key: string): boolean {
+        const entry = this.rampRows.get(key);
+        if (!entry) {
+            return false;
+        }
+        this.rampRows.delete(key);
+        this.rampFreeRows.add(entry.row);
+        return true;
+    }
+
+    /**
+     * Pick the next row for a newly seen key: an explicitly freed slot (lowest
+     * first, for deterministic reuse), an LRU-evicted slot when full, or a
+     * fresh row below {@link MAX_RAMP_ROWS}.
+     */
+    private allocateRampRow(): number {
+        if (this.rampFreeRows.size > 0) {
+            let row = Number.POSITIVE_INFINITY;
+            for (const freeRow of this.rampFreeRows) {
+                if (freeRow < row) {
+                    row = freeRow;
+                }
+            }
+            this.rampFreeRows.delete(row);
+            return row;
+        }
+
+        if (this.rampRows.size >= MAX_RAMP_ROWS) {
+            // The first Map entry is the least recently used one.
+            const oldestKey = this.rampRows.keys().next().value;
+            if (oldestKey !== undefined) {
+                const evicted = this.rampRows.get(oldestKey);
+                this.rampRows.delete(oldestKey);
+                if (evicted) {
+                    return evicted.row;
+                }
+            }
+        }
+
+        const row = this.rampHighWater;
+        this.rampHighWater += 1;
         return row;
     }
 
@@ -405,7 +507,10 @@ export class GLRenderer {
      */
     private bindRamps(u_ramp: WebGLUniformLocation | null, u_rampRows: WebGLUniformLocation | null) {
         const gl = this.gl;
-        const rows = Math.max(1, this.rampRows.size);
+        // Height covers the highest row ever allocated, which survives
+        // explicit releases and LRU reuse; rampRows.size alone could drop
+        // below a live row index after a release.
+        const rows = Math.max(1, this.rampHighWater);
 
         if (!this.rampTexture) {
             this.rampTexture = gl.createTexture();
@@ -962,8 +1067,12 @@ export class GLRenderer {
         this.textureRegistry.unregister(entry);
     }
 
-    /** Release all GPU resources. */
+    /** Release all GPU resources. Idempotent: a second call touches no GL. */
     dispose() {
+        if (this.disposed) {
+            return;
+        }
+        this.disposed = true;
         const gl = this.gl;
         for (const entry of this.liveTextures) {
             gl.deleteTexture(entry.texture);
@@ -971,6 +1080,16 @@ export class GLRenderer {
         }
         this.liveTextures.clear();
         this.textures = new WeakMap();
+
+        if (this.rampTexture) {
+            gl.deleteTexture(this.rampTexture);
+            this.rampTexture = null;
+        }
+        this.rampRows.clear();
+        this.rampFreeRows.clear();
+        this.rampHighWater = 0;
+        this.rampDirty = false;
+
         gl.deleteBuffer(this.shapeBuffer);
         gl.deleteBuffer(this.lineBuffer);
         gl.deleteBuffer(this.textureBuffer);

@@ -103,8 +103,45 @@ const CIRCLE_STROKE_SEGMENTS = 48;
  */
 export type WebGLDrawContext = DrawContext<CanvasRenderingContext2D> & { gl: GLRenderer };
 
+/**
+ * Resources one draw registration currently holds. Texture counts are
+ * per-occurrence (the same image may appear in several items); ramp keys are
+ * de-duplicated per registration because one registration only contributes one
+ * layer-level reference to a palette row.
+ */
+interface HandleResources {
+    layer: number;
+    textures: Map<TexImageSource, number>;
+    rampKeys: Set<string>;
+}
+
+/**
+ * Handle returned by registration calls after {@link WebGLDraw.destroy}. It is
+ * never registered with the layer manager, so removing it stays a safe no-op.
+ */
+const DESTROYED_HANDLE: DrawHandle = Object.freeze({ layer: -1, id: Symbol("webgl-draw-destroyed") });
+
 export class WebGLDraw {
     private drawChanges = new DrawChanges();
+
+    /**
+     * GL renderer observed in the latest layer callback. The GL layer is
+     * injected per frame by {@link RendererWebGL}, so lifecycle teardown uses
+     * this captured instance rather than a constructor dependency.
+     */
+    private glRenderer: GLRenderer | null = null;
+
+    /** Set once {@link destroy} runs; all later registrations are no-ops. */
+    private destroyed = false;
+
+    /** Per-handle resource holdings, keyed by {@link DrawHandle.id}. */
+    private handleResources = new Map<symbol, HandleResources>();
+    /** Business-layer reference counts for image sources. */
+    private textureRefs = new Map<TexImageSource, number>();
+    /** Business-layer reference counts for gradient ramp keys. */
+    private rampRefs = new Map<string, number>();
+    /** Handle whose callback is currently executing, for ramp attribution. */
+    private activeHandleId: symbol | undefined;
 
     /** Transform helpers handed to custom draw callbacks. */
     private drawTransform: DrawTransform = {
@@ -118,22 +155,53 @@ export class WebGLDraw {
         private layers: Layer<WebGLDrawContext>,
         private transformer: CoordinateTransformer,
         private camera: ICamera,
-    ) {}
+        /**
+         * Optional explicit GL renderer. When omitted it is captured from the
+         * first rendered layer context; injection mainly helps tests and hosts
+         * that tear resources down before the first frame.
+         */
+        glRenderer?: GLRenderer | null,
+    ) {
+        this.glRenderer = glRenderer ?? null;
+    }
 
     /**
      * Register a layer callback, forwarding the registration's clip. Every
      * draw method funnels through here so a new draw kind cannot forget it.
+     *
+     * The wrapper also remembers the {@link GLRenderer} used for the latest
+     * frame and attributes any ramp rows the callback resolves to this handle,
+     * which is what lets teardown release exactly the resources it owned.
      */
     private register(
         layer: number,
         options: RendererClipOptions | undefined,
         fn: DrawCallback<WebGLDrawContext>,
     ): DrawHandle {
-        return this.layers.add(layer, fn, options?.clip);
+        if (this.destroyed) {
+            return DESTROYED_HANDLE;
+        }
+        let handle!: DrawHandle;
+        const wrapped: DrawCallback<WebGLDrawContext> = (dc) => {
+            this.glRenderer = dc.gl;
+            const previousHandleId = this.activeHandleId;
+            this.activeHandleId = handle.id;
+            try {
+                fn(dc);
+            } finally {
+                this.activeHandleId = previousHandleId;
+            }
+        };
+        handle = this.layers.add(layer, wrapped, options?.clip);
+        this.handleResources.set(handle.id, { layer, textures: new Map(), rampKeys: new Set() });
+        return handle;
     }
 
     /** Update the caches belonging to an existing collection registration. */
     applyDrawChanges(handle: DrawHandle, changes: readonly ItemCollectionChange<unknown>[]): void {
+        if (this.destroyed) {
+            return;
+        }
         this.drawChanges.apply(handle, changes);
     }
 
@@ -147,6 +215,9 @@ export class WebGLDraw {
         layer: number = 1,
         options?: RendererClipOptions,
     ): DrawHandle {
+        if (this.destroyed) {
+            return DESTROYED_HANDLE;
+        }
         return this.register(layer, options, ({ ctx, config, topLeft }) => {
             fn(ctx, topLeft, config, this.drawTransform);
         });
@@ -174,7 +245,11 @@ export class WebGLDraw {
             offset: stop.offset,
             color: this.colorParser.parse(stop.color),
         }));
-        const row = gl.rampRow(paintKey(paint), stops);
+        const key = paintKey(paint);
+        // Keep the row referenced by the handle whose callback is resolving
+        // this fill, so removing that handle can release it once unused.
+        this.noteRampKey(key);
+        const row = gl.rampRow(key, stops);
         return {
             color: stops[0]?.color ?? TRANSPARENT,
             gradient: { axis: gradientAxisPx(paint, box, toScreen), row },
@@ -186,6 +261,9 @@ export class WebGLDraw {
         layer: number = 1,
         options?: RendererDrawOptions<Rect, ShapeDecorationStyle>,
     ): DrawHandle {
+        if (this.destroyed) {
+            return DESTROYED_HANDLE;
+        }
         const list = Array.isArray(items) ? items : [items];
         const styleOf = options?.styleOf;
         const visibleOf = options?.visibleOf;
@@ -291,6 +369,9 @@ export class WebGLDraw {
         layer: number = 1,
         options?: RendererDrawOptions<Circle, ShapeDecorationStyle>,
     ): DrawHandle {
+        if (this.destroyed) {
+            return DESTROYED_HANDLE;
+        }
         const list = Array.isArray(items) ? items : [items];
         const styleOf = options?.styleOf;
         const visibleOf = options?.visibleOf;
@@ -389,6 +470,9 @@ export class WebGLDraw {
         layer: number = 1,
         options?: RendererDrawOptions<Line, LineDecorationStyle>,
     ): DrawHandle {
+        if (this.destroyed) {
+            return DESTROYED_HANDLE;
+        }
         const list = Array.isArray(items) ? items : [items];
         const styleOf = options?.styleOf;
         const visibleOf = options?.visibleOf;
@@ -439,6 +523,9 @@ export class WebGLDraw {
         layer: number = 2,
         options?: RendererDrawOptions<Text, TextDecorationStyle>,
     ): DrawHandle {
+        if (this.destroyed) {
+            return DESTROYED_HANDLE;
+        }
         this.textBounds.clear();
         const list = Array.isArray(items) ? items : [items];
         const styleOf = options?.styleOf;
@@ -514,6 +601,9 @@ export class WebGLDraw {
         layer: number = 1,
         options?: RendererDrawOptions<PathItem, PathDecorationStyle>,
     ): DrawHandle {
+        if (this.destroyed) {
+            return DESTROYED_HANDLE;
+        }
         const styleOf = options?.styleOf;
         const visibleOf = options?.visibleOf;
         // Identity-keyed bounds survive insertion/removal; immutable collection
@@ -651,6 +741,9 @@ export class WebGLDraw {
         layer: number = 1,
         options?: RendererImageDrawOptions<HTMLImageElement>,
     ): DrawHandle {
+        if (this.destroyed) {
+            return DESTROYED_HANDLE;
+        }
         const list = Array.isArray(items) ? items : [items];
         const visibleOf = options?.visibleOf;
 
@@ -742,7 +835,24 @@ export class WebGLDraw {
 
             gl.drawImages(images);
         });
-        this.drawChanges.add(handle, culler.applyChanges.bind(culler));
+
+        // Hold a business-layer reference to every source in the registered
+        // collection, independent of viewport culling: panning an image out of
+        // view must not free its texture, but removing it from the collection
+        // (delivered below), removing this handle, or clearing the layer does.
+        const resources = this.handleResources.get(handle.id);
+        if (resources) {
+            for (const item of list) {
+                this.retainTexture(resources, item.img);
+            }
+        }
+
+        this.drawChanges.add(handle, (changes: readonly ItemCollectionChange<ImageItem>[]) => {
+            if (resources) {
+                this.applyImageResourceChanges(resources, changes);
+            }
+            culler.applyChanges(changes);
+        });
         return handle;
     }
 
@@ -752,6 +862,9 @@ export class WebGLDraw {
         layer: number = 0,
         options?: RendererClipOptions,
     ): DrawHandle {
+        if (this.destroyed) {
+            return DESTROYED_HANDLE;
+        }
         if (!Number.isFinite(cellSize) || cellSize <= 0) {
             throw new RangeError("[CanvasTileEngine] cellSize must be a positive finite number");
         }
@@ -846,28 +959,199 @@ export class WebGLDraw {
     // ─── Layer management ───
 
     removeDrawHandle(handle: DrawHandle) {
+        // Tolerate a missing handle (e.g. cleanup after a destroyed instance).
+        if (!handle) {
+            return;
+        }
         this.drawChanges.remove(handle);
         this.layers.remove(handle);
+        this.disposeHandleResources(handle.id);
     }
 
     clearLayer(layer: number) {
         this.drawChanges.clear(layer);
         this.layers.clear(layer);
+        // Release only registrations on this layer. Reference counts ensure a
+        // texture or ramp row shared with another layer survives.
+        for (const [id, resources] of this.handleResources) {
+            if (resources.layer === layer) {
+                this.disposeResources(resources);
+                this.handleResources.delete(id);
+            }
+        }
     }
 
     clearAll() {
         this.drawChanges.clear();
         this.layers.clear();
+        for (const resources of this.handleResources.values()) {
+            this.disposeResources(resources);
+        }
+        this.handleResources.clear();
     }
 
     /**
-     * Release cached resources and layer callbacks.
+     * Release cached resources, GPU references and layer callbacks.
+     *
+     * Every image texture and gradient row referenced by this draw instance is
+     * decremented; resources no longer referenced are deleted/released exactly
+     * once on the captured {@link GLRenderer}. The renderer's remaining GPU
+     * objects (ramp atlas, programs, buffers) are then disposed as well;
+     * {@link GLRenderer.dispose} is idempotent, so the owning renderer can
+     * safely dispose it again. After this call the instance is permanently
+     * inert: further draw registrations return a no-op handle.
      */
     destroy() {
+        if (this.destroyed) {
+            return;
+        }
+        this.destroyed = true;
+
+        for (const resources of this.handleResources.values()) {
+            this.disposeResources(resources);
+        }
+        this.handleResources.clear();
+        this.textureRefs.clear();
+        this.rampRefs.clear();
+        this.activeHandleId = undefined;
+
+        const gl = this.glRenderer as (GLRenderer | null) & { dispose?: () => void };
+        this.glRenderer = null;
+        // Optional call keeps lightweight recording fakes usable in tests.
+        gl?.dispose?.();
+
         this.drawChanges.clear();
         this.layers.clear();
         this.colorParser.clear();
         this.textBounds.clear();
+    }
+
+    // ─── Resource reference counting ───
+
+    /** Add one business reference to an image source for a handle. */
+    private retainTexture(resources: HandleResources, source: TexImageSource | undefined | null) {
+        if (!source) {
+            return;
+        }
+        resources.textures.set(source, (resources.textures.get(source) ?? 0) + 1);
+        this.textureRefs.set(source, (this.textureRefs.get(source) ?? 0) + 1);
+    }
+
+    /**
+     * Remove one occurrence reference from a handle and the global table. When
+     * the global count reaches zero the cached GL texture is deleted once via
+     * {@link GLRenderer.invalidateTexture}, which is itself idempotent.
+     */
+    private releaseTexture(resources: HandleResources, source: TexImageSource | undefined | null) {
+        if (!source) {
+            return;
+        }
+
+        const owned = resources.textures.get(source) ?? 0;
+        if (owned <= 0) {
+            // Unbalanced or duplicate removal for a reference this handle does
+            // not hold. Never decrement the global count here: doing so could
+            // delete a texture another layer still uses.
+            return;
+        }
+        if (owned === 1) {
+            resources.textures.delete(source);
+        } else {
+            resources.textures.set(source, owned - 1);
+        }
+
+        const global = (this.textureRefs.get(source) ?? 0) - 1;
+        if (global > 0) {
+            this.textureRefs.set(source, global);
+            return;
+        }
+        this.textureRefs.delete(source);
+        this.safeInvalidateTexture(source);
+    }
+
+    /** Apply collection deltas to the image-reference ledger. */
+    private applyImageResourceChanges(resources: HandleResources, changes: readonly ItemCollectionChange<ImageItem>[]) {
+        for (const change of changes) {
+            if (change.type === "insert") {
+                this.retainTexture(resources, change.item.img);
+            } else if (change.type === "remove") {
+                this.releaseTexture(resources, change.item.img);
+            } else if (change.type === "update") {
+                // Replacing an item that keeps the same image changes nothing
+                // for texture lifetime; swapping images drops the old ref.
+                if (change.previous?.img !== change.item.img) {
+                    this.releaseTexture(resources, change.previous?.img);
+                    this.retainTexture(resources, change.item.img);
+                }
+            }
+        }
+    }
+
+    /** Record that the currently running handle uses a gradient ramp key. */
+    private noteRampKey(key: string) {
+        const id = this.activeHandleId;
+        if (id === undefined) {
+            return;
+        }
+        const resources = this.handleResources.get(id);
+        if (!resources || resources.rampKeys.has(key)) {
+            return;
+        }
+        resources.rampKeys.add(key);
+        this.rampRefs.set(key, (this.rampRefs.get(key) ?? 0) + 1);
+    }
+
+    /** Release one handle's worth of resource holdings. */
+    private disposeHandleResources(id: symbol) {
+        const resources = this.handleResources.get(id);
+        if (!resources) {
+            return;
+        }
+        this.disposeResources(resources);
+        this.handleResources.delete(id);
+    }
+
+    /** Decrement every reference held by one handle. */
+    private disposeResources(resources: HandleResources) {
+        for (const [source, count] of resources.textures) {
+            for (let i = 0; i < count; i++) {
+                const global = (this.textureRefs.get(source) ?? 0) - 1;
+                if (global > 0) {
+                    this.textureRefs.set(source, global);
+                } else {
+                    this.textureRefs.delete(source);
+                    this.safeInvalidateTexture(source);
+                }
+            }
+        }
+        resources.textures.clear();
+
+        for (const key of resources.rampKeys) {
+            const count = (this.rampRefs.get(key) ?? 0) - 1;
+            if (count > 0) {
+                this.rampRefs.set(key, count);
+                continue;
+            }
+            this.rampRefs.delete(key);
+            // The row slot becomes reusable; other layers still holding the key
+            // never reach this branch because their count stays positive.
+            this.safeReleaseRampRow(key);
+        }
+        resources.rampKeys.clear();
+    }
+
+    /** Delete a source's GL texture when a renderer is available. */
+    private safeInvalidateTexture(source: TexImageSource) {
+        const gl = this.glRenderer as (GLRenderer | null) & {
+            invalidateTexture?: (source: TexImageSource) => void;
+        };
+        gl?.invalidateTexture?.(source);
+    }
+
+    /** Release a ramp key on the captured renderer when it supports it. */
+    private safeReleaseRampRow(key: string) {
+        const gl = this.glRenderer as (GLRenderer | null) & { releaseRampRow?: (key: string) => boolean };
+        gl?.releaseRampRow?.(key);
     }
 
     // ─── Geometry helpers ───

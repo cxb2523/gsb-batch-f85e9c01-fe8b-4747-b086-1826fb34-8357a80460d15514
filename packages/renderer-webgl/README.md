@@ -84,6 +84,7 @@ Geometry is drawn in layer order, batching consecutive compatible paints within 
 - `drawStaticRect`, `drawStaticCircle`, and `drawStaticImage` delegate to dynamic drawing and use the same order-preserving GPU batches instead of the Canvas2D offscreen static cache.
 - Image sources are uploaded to the GPU and cached. Dimension changes are detected automatically, but if you mutate pixels at the same size, call `renderer.invalidateTexture(source)`.
 - The texture cache holds sources weakly: once your app drops an image or canvas and it is garbage-collected, its GPU texture is deleted too. You do not need `invalidateTexture` to free memory.
+- Draw registrations additionally reference-count image textures and gradient palette rows. Removing an image from an `ItemCollection`, removing its draw handle, or clearing its layer releases only the resources no other layer/handle references; `destroy()` releases all of them and disposes the GL resources.
 - The renderer prefers WebGL 2 and falls back to WebGL 1. If neither is available, `init()` throws.
 
 ## Canvas Fallback
