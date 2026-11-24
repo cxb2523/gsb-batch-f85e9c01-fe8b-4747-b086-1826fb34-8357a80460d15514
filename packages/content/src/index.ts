@@ -1,0 +1,45 @@
+// Character/stage TypeScript data modules + schema validator (Engine
+// Architecture part 2 section 7). packages/render, packages/net and
+// packages/app are still out of scope stubs; this package now provides
+// real content: the placeholder character and a validator a contributor's
+// PR runs before merge.
+export * from './validate.ts';
+export { PLACEHOLDER_CHARACTER } from './characters/placeholder/data.ts';
+export { BALLAST_CHARACTER } from './characters/ballast/data.ts';
+export { VOLTLING_CHARACTER } from './characters/voltling/data.ts';
+export { REED_CHARACTER } from './characters/reed/data.ts';
+export { WISP_CHARACTER } from './characters/wisp/data.ts';
+export { ZEPHYR_CHARACTER } from './characters/zephyr/data.ts';
+export { ANCHOR_CHARACTER } from './characters/anchor/data.ts';
+export { SCRAPPER_CHARACTER } from './characters/scrapper/data.ts';
+export {
+  ALL_CHARACTERS,
+  DEFAULT_CHARACTER_ID,
+  resolveCharacterId,
+  isKnownCharacterId,
+  type CharacterEntry,
+} from './characters.ts';
+export { BATTLE_ROYALE_20_ARENA } from './arenas/battle-royale-20/data.ts';
+export { THE_UNDERCROFT_ARENA } from './arenas/the-undercroft/data.ts';
+export { THE_SPIRE_ARENA } from './arenas/the-spire/data.ts';
+export {
+  ALL_ARENAS,
+  DEFAULT_ARENA_ID,
+  resolveArenaId,
+  isKnownArenaId,
+  pickArenaId,
+  type ArenaEntry,
+} from './arenas.ts';
+export { BASH_FIGHTER_ITEM_SET } from './items/data.ts';
+export { BASH_FIGHTER_HAZARD } from './hazards/data.ts';
+export { createMatchSim } from './match-sim.ts';
+export type { AnimationParams } from './animation/types.ts';
+export { PLACEHOLDER_ANIMATION } from './characters/placeholder/animation.ts';
+export { BALLAST_ANIMATION } from './characters/ballast/animation.ts';
+export { VOLTLING_ANIMATION } from './characters/voltling/animation.ts';
+export { REED_ANIMATION } from './characters/reed/animation.ts';
+export { WISP_ANIMATION } from './characters/wisp/animation.ts';
+export { ZEPHYR_ANIMATION } from './characters/zephyr/animation.ts';
+export { ANCHOR_ANIMATION } from './characters/anchor/animation.ts';
+export { SCRAPPER_ANIMATION } from './characters/scrapper/animation.ts';
+export { ANIMATION_BY_CHARACTER_NAME, resolveAnimation } from './animation-registry.ts';

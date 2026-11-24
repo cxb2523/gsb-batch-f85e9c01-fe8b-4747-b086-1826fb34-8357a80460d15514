@@ -1,0 +1,70 @@
+// Regression test for the 2026-09-10 stranded-spectator bug (see wiki
+// "Client-Server Match Divergence 2026-09-10" and "Match-End Client Bugs
+// and Session Wrap 2026-09-09"): a player already eliminated who kept
+// watching a match that genuinely resolved was told nothing at all --
+// onMatchOver's `if (eliminatedThisOnlineMatch) return;` swallowed the
+// resolved case unconditionally. The fix threads the winner into the
+// placement overlay's message via announceWinner/winnerAnnouncementLine.
+//
+// No jsdom here (npm registry is blocked for agents -- see "Sim Core
+// Implementation Notes"), so this covers the pure text logic directly
+// rather than building a DOM shim for innerHTML/querySelector: the text
+// composition is exactly what was missing, and it is fully testable
+// without a DOM.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { winnerAnnouncementLine, messageAfterMatchEnd, SPECTATE_OFFER } from '../src/ui/match-overlay.ts';
+
+test('winnerAnnouncementLine names the winning slot for a watching spectator', () => {
+  // Eliminated 6th, watched slot 16 win: this is the exact case from the
+  // divergence report that shipped with no announcement at all.
+  const line = winnerAnnouncementLine(16, null);
+  assert.match(line, /#17/); // slot is 0-based on the wire, 1-based on screen
+  assert.match(line, /won/);
+});
+
+test('winnerAnnouncementLine tells the player when they themselves won', () => {
+  const line = winnerAnnouncementLine(4, 4);
+  assert.match(line, /you won/i);
+});
+
+test('winnerAnnouncementLine handles a match with no winner (mass wipe)', () => {
+  const line = winnerAnnouncementLine(null, 4);
+  assert.match(line, /no winner/);
+});
+
+test('winnerAnnouncementLine does not claim victory for an uninvolved local slot', () => {
+  const line = winnerAnnouncementLine(4, 7);
+  assert.doesNotMatch(line, /you won/i);
+  assert.match(line, /#5/);
+});
+
+test('winnerAnnouncementLine uses the winner\'s display name over the bare slot number when nameFor is given', () => {
+  const line = winnerAnnouncementLine(4, 7, (slot) => (slot === 4 ? 'Rook' : `#${slot + 1}`));
+  assert.match(line, /Rook won/);
+  assert.doesNotMatch(line, /#5/);
+});
+
+test('winnerAnnouncementLine falls back to the slot label when nameFor returns the fallback itself', () => {
+  const line = winnerAnnouncementLine(4, 7, (slot) => `#${slot + 1}`);
+  assert.match(line, /#5 won/);
+});
+
+test('winnerAnnouncementLine still says "you won it" for the local winner even with nameFor given', () => {
+  const line = winnerAnnouncementLine(4, 4, () => 'Rook');
+  assert.match(line, /you won/i);
+  assert.doesNotMatch(line, /Rook/);
+});
+
+test('a match that has ended stops offering to keep watching it', () => {
+  const before = `You can jump straight into a new match${SPECTATE_OFFER}.`;
+  assert.equal(
+    messageAfterMatchEnd(before),
+    'You can jump straight into a new match.',
+    'the keep-watching clause must go once there is nothing left to watch',
+  );
+  // Idempotent, because announceWinner may be called more than once, and
+  // harmless on messages that never carried the offer.
+  assert.equal(messageAfterMatchEnd('You can jump straight into a new match.'), 'You can jump straight into a new match.');
+  assert.equal(messageAfterMatchEnd('This match ended before it finished.'), 'This match ended before it finished.');
+});

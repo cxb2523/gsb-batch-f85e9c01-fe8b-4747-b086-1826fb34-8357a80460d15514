@@ -1,0 +1,335 @@
+# Bash Fighter wire protocol
+
+Source of truth: `packages/net/src/protocol.ts`. This document describes the
+same thing in prose; if the two disagree, the code wins and this file is
+out of date.
+
+One WebSocket connection at `ws(s)://<host>/socket` per client. Two kinds of
+frames flow over it:
+
+- **Control** — JSON text frames. Infrequent (hello, lobby updates, match
+  start/end, elimination, errors, ping/pong). Human-readable on purpose:
+  contributors can watch these in a browser's network tab.
+- **Binary** — dense frames for the hot path: client input (60Hz) and
+  server snapshots (`SNAPSHOT_HZ`, currently 20Hz). Every byte here is
+  multiplied by tick rate and player count, so these are packed.
+
+## Version handshake
+
+The very first message a client sends must be `hello` with its
+`protocolVersion`. If it does not match the server's `PROTOCOL_VERSION`,
+the server replies with `error` (`code: "protocol_mismatch"`) and closes
+the connection. This is deliberate: silently letting a mismatched client
+continue is the worst failure mode for a deterministic sim, since it looks
+fine for a while and then two clients disagree about reality with no error
+anywhere. Any other message before `hello`, or a malformed message, gets
+`error` (`code: "bad_message"`) and a close.
+
+## Control messages, client -> server
+
+| `t` | Fields | Meaning |
+|---|---|---|
+| `hello` | `protocolVersion`, `name`, `profile`?, `arena`?, `requeued`?, `matchesPlayed`? | First message. Server assigns a match/slot and replies `welcome`. `profile` is an optional, small, non-identifying client snapshot (see below) used only for engagement telemetry -- see `docs/MEASUREMENT.md`. `arena` is a dev-only stage pin (see below). `matchesPlayed` is a client-side localStorage counter (integer, sanitised server-side to 0..99) used to taper the first-matches knockout boost -- see the tapered first-matches knockout boost note below. |
+| `spectate` | — | Client wants to only watch, not play (used after being assigned, or after elimination to keep watching without reconciliation). |
+| `pong` | `id` | Echo of a server `ping`, for RTT measurement. |
+| `startNow` | — | Sent by a client holding a seat in a still-filling lobby (the waiting screen's "Start now" button): fills the rest of that lobby with bots and starts immediately, instead of waiting out the countdown/bot-fill grace period. The server only honours this from a connection that actually holds a seat in that exact match (never a spectator, never a stranger); once the match has left the lobby phase, further `startNow` messages for it are a silent no-op, so a client may resend freely (e.g. a double click). |
+| `sessionReport` | `firstInputMs`, `inputTicks`, `frameMedianMs`, `frameP95Ms`, plus optional device/frame/input telemetry (see below) | Engagement telemetry only, added 2026-09-13 -- see `docs/MEASUREMENT.md`. Sent periodically (every ~5s) and once more, best-effort, when the tab is hidden. Never required for the match to function; a client that never sends one simply produces a less complete `[sessionEnd]` server log line. `firstInputMs` is milliseconds from match start to this seat's first non-neutral local input, or `null` if none yet. `inputTicks` is the cumulative count of ticks with any input. `frameMedianMs`/`frameP95Ms` are a rolling client frame-time distribution in ms. All fields are validated and clamped server-side (see `packages/net/src/protocol.ts`); a malformed payload is simply rejected like any other bad control message, never trusted partially. All fields beyond the four above are optional and may be absent from an older client build -- the server always treats absence as "not tracked", never a fabricated zero, and a report with none of them still validates and stores. As of 2026-09-15 this includes six `slowFrame*` fields (see "Slow-frame attribution" table below); an earlier 2026-09-14 change added `frameHistogram`, `hiddenFrames`, `networkHitchCount`, `keyboardInputTicks`, `touchInputTicks`, `gamepadInputTicks` (see `packages/net/src/protocol.ts` for their exact shapes -- not re-documented here). As of 2026-09-15 it also includes `visibleMs`/`hiddenMs` -- cumulative real ms of frame deltas observed with the tab visible vs hidden this match, the numerator for the "actually playing" session-duration metric (see `docs/MEASUREMENT.md` "Actually-playing session duration"); each is clamped to 0..21,600,000ms (6h) server-side and absence means "not tracked", same convention as every other optional field here. |
+
+### `hello.arena` (dev-only)
+
+An optional stage pin for local/CI development (issue #19): the id of a
+registered arena (see `@bash-fighter/content`'s `ALL_ARENAS`, e.g.
+`the-atoll`) the client asks the server to pin the match's stage to instead
+of the seeded pick. Two independent gates keep it out of production:
+
+- **Client side:** a dev build only. `NetMatch` reads `?arena=<id>` from
+  the URL, but puts it on the hello only when `import.meta.env.DEV` is
+  true -- a production build never sends it however the URL is mangled.
+- **Server side:** explicit opt-in. The server honours the request only
+  when `MATCH_ARENA_OVERRIDE=1` is set (the same `MATCH_*` env pattern as
+  every other dev/test override; the production systemd unit sets none of
+  them) and only when the id is registered (`isKnownArenaId`). A request
+  without the opt-in, or with an unknown id, is silently ignored and the
+  seeded `pickArenaId(seed)` stands -- never an error.
+
+Older servers that predate the field drop it like any other unrecognised
+registry validation happens server-side anyway. When the pin wins, the
+`[matchStart]` log line carries `arenaPinned: true` so a journalctl reader
+can tell a pinned dev/CI match from a seeded one. The first joiner to
+actually present a pin claims it for that lobby: a joiner without one
+neither claims nor blocks, and a later joiner never retargets a lobby
+another joiner has already pinned.
+
+### `hello.profile`
+
+An optional, small, non-identifying snapshot of the client's environment,
+added 2026-09-13 for engagement telemetry (see `docs/MEASUREMENT.md` for
+the full privacy statement -- short version: no IP, no user agent, no
+persistent id, nothing that survives past this one connection):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `touchActive` | boolean | Whether a touch input source is active in this client. |
+| `viewportWidth` / `viewportHeight` | number | The viewport size in CSS pixels, clamped to `[0, 20000]`. |
+| `buildSha` | string | The build sha the client was served, capped at 64 characters. |
+| `qa` | boolean | Self-declared QA hint, sent only when the client was opened with `?qa=1` (see docs/MEASUREMENT.md). A HINT, not proof -- a real player could set it, a tester could forget it. |
+| `hwConcurrencyBucket` / `deviceMemoryBucket` / `dprBucket` | number | Bucketed `navigator.hardwareConcurrency`/`.deviceMemory`/`devicePixelRatio` (added 2026-09-14) -- rounded up to a small fixed set of public ceilings, never the raw reading. |
+| `canvasWidthPx` / `canvasHeightPx` | number | **Added 2026-09-15, see "Slow-frame attribution" below.** The real `<canvas>` device-pixel backing-store size (CSS size times whatever resolution Pixi applied), clamped to `[0, 20000]`. Not bucketed -- see the field's doc comment in `packages/net/src/protocol.ts` for why. |
+| `screenWidthBucket` / `screenHeightBucket` | number | **Added 2026-09-15.** Bucketed `window.screen.width`/`.height` (the physical screen, not the browser viewport) -- rounded up to one of `[480, 768, 1024, 1440, 1920, 2560, 3840, 7680]`. |
+| `uaFamily` | `'chrome' \| 'firefox' \| 'safari' \| 'other'` | **Added 2026-09-15.** A coarse browser family derived client-side from `navigator.userAgent`, one of exactly these four values -- the raw user-agent string itself is never read into the profile or sent anywhere. Exists to tell a Safari-family mobile browser apart from a Chromium-family one when correlating slow frames, nothing finer. |
+
+Every field is optional and independently dropped if malformed rather than
+rejecting the whole `hello` -- a garbled profile must never keep a player
+out of their match.
+
+## Control messages, server -> client
+
+| `t` | Fields | Meaning |
+|---|---|---|
+| `welcome` | `protocolVersion`, `clientId`, `slot`, `matchId` | Reply to `hello`. `slot` is `-1` for a pure spectator. |
+| `lobby` | `players`, `capacity`, `minimum`, `countdownTicks`, `names` | Sent while a match is filling. `countdownTicks` is ticks (60/s) until the match starts anyway, or `-1` if no start deadline is known yet. As of 2026-09-13 this covers *both* reasons a lobby ever ends on its own: the post-minimum countdown once enough humans have joined, and the bot-fill grace period a lone player sits in before bots pad out the rest of the lobby -- whichever is sooner. It is computed server-side from a wall-clock deadline on every send, so it stays accurate across broadcast gaps; clients may tick it down locally between messages for a smooth display, but must treat `-1` as an honest "no deadline yet" state, never invent a countdown the server hasn't committed to. |
+| `matchStart` | `matchId`, `seed`, `numFighters`, `slot`, `settings`, `arenaId`, `names` | The match has started. Every client builds an identical `Sim` from `seed` + `numFighters` + `arenaId`. |
+| `eliminated` | `slot`, `placement`, `tick` | A fighter was eliminated. `placement` is `1` for the eventual winner (announced at match end), `N` for the first fighter out. |
+| `matchEnd` | `winner`, `leaderboard`, `tick` | Final result. `winner` is `null` only for a genuine simultaneous final KO. |
+| `error` | `code`, `message` | `protocol_mismatch`, `bad_message`, `match_full`, or `server_error`. Connection is closed after this is sent. |
+
+## Join codes and spectating (2026-09-22)
+
+`hello` may carry a `joinCode`: four characters from
+`ABCDEFGHJKLMNPQRSTUVWXYZ23456789` (no `I`, `O`, `0`, `1`, so a code survives
+being read aloud). The client mints it; `sanitiseJoinCode` in
+`packages/net/src/protocol.ts` is the single validator — uppercase, filter to
+the alphabet, and require exactly four surviving characters, otherwise the
+field is dropped. `welcome` echoes the lobby's real code, which is not
+necessarily the requested one.
+
+A coded lobby never becomes the public `filling` room and never runs the
+minimum-players countdown; it waits `MATCH_PRIVATE_BOT_FILL_SECONDS`
+(default 60) before bots fill it.
+
+`hello.spectate` asks for a seatless connection. The server resolves
+`joinCode` against lobbies and in-progress matches, falls back to the current
+public match when the code is unknown or its match has ended, and replies with
+`welcome.slot = -1`. A client following either kind of link discards any stored
+resume token first: the server honours `resume` above everything else in the
+hello, so without that a returning player was silently put back in their own
+old match instead of the lobby the link pointed at.
+
+## Player names
+
+`hello.name` is the client's requested display name (typed on the start
+screen and persisted client-side in localStorage; empty if the player
+never typed one -- see [[Player Names 2026-09-11]] for the full feature
+writeup). It is presentation and networking metadata only: never part of
+the sim snapshot, never fed into anything determinism-hashed, and never
+trusted as given.
+
+The server sanitises every name at the `hello` boundary (`sanitiseName` in
+`packages/net/src/protocol.ts`) before it is stored on the seat or
+broadcast to anyone:
+
+- Control characters (C0/C1) and newlines are stripped -- they would
+  break single-line layouts, HUD cards, and log/journal lines.
+- Interior whitespace runs are collapsed and the result trimmed, so a
+  name can't be an invisible run of spaces or tabs.
+- Truncated to `MAX_NAME_LENGTH` (16 characters).
+- Empty/whitespace-only/all-control input sanitises to `''`, not a
+  forced placeholder like `"Fighter"`. `''` is a first-class value
+  meaning "this seat has no chosen name"; every display of it (HUD,
+  in-world badge, win screen, placement/elimination text) falls back to
+  the slot label (`#N`, 1-based) instead. This keeps anonymous players
+  distinct from each other for free, which a forced shared placeholder
+  would not.
+
+Names are never HTML-escaped, because they are never inserted as markup
+anywhere: the DOM-based UI (HUD, overlays, win screen) writes them via
+`textContent` only, and the PIXI-based world renderer writes them as
+`Text` glyphs. There is no code path where a name string is interpreted
+as HTML/JS in this codebase, so sanitisation here is about layout/log
+safety, not escaping.
+
+Names are also de-duplicated per match (`dedupeName`, same file): a new
+seat whose sanitised name case-insensitively collides with an existing
+seat's name (human or bot) gets `" (2)"`, `" (3)"`, etc. appended, capped
+back to `MAX_NAME_LENGTH`. Two fighters called "Rook" would otherwise be
+indistinguishable in the HUD, the win screen, and the elimination log.
+Empty names are exempt from de-duplication -- they carry no identity to
+collide on.
+
+No wire-format field changed for this feature (the `name`/`names` fields
+already existed in the `hello`/`lobby`/`matchStart` schema since the
+initial protocol), so `PROTOCOL_VERSION` was **not** bumped for it. Only
+sanitisation/de-duplication behaviour and client-side UI changed.
+| `ping` | `id` | RTT probe; client should reply `pong` with the same `id`. |
+
+### Tapered first-matches knockout boost (2026-09-26)
+
+`hello.matchesPlayed` reports how many matches this browser has already
+played (a plain localStorage counter, see
+`packages/app/src/matches-played.ts`), so the server can taper a human
+seat's rookie knockback scale down over several matches instead of
+dropping straight from the first-match boost to 1.0x after match one.
+Missing or invalid falls back to the original `requeued`-based behaviour
+(`requeued=false` -> treated as 0, `requeued=true` -> no boost). No wire
+format change beyond the new optional `hello` field, so `PROTOCOL_VERSION`
+was **not** bumped for it. `matchStart`'s existing `settings.rookieSlots`
+/`botSlots` gained a parallel `rookieScales` array (replacing the old
+single `rookieKnockbackScale`) so server and client prediction see
+identical per-seat scales.
+
+## Binary: input (client -> server), 15 bytes
+
+`tag(1)=1 | tick(u32 LE) | buttons(u16 LE) | stickX(i32 LE, Q16.16) | stickY(i32 LE, Q16.16)`
+
+Sent once per local input change (or at least once per local tick) at up to
+60Hz. `tick` is the tick the client intends this input to apply from; the
+server uses it only to track the most recently-seen input tick per client
+(`ackedInputTick` in snapshots) so the client knows which locally-predicted
+inputs it can drop. The server never blocks the tick loop waiting for an
+input — a fighter with no input for the current tick simply keeps its last
+known input, and a disconnected fighter's input decays to neutral.
+
+Any frame that isn't exactly 15 bytes, or whose first byte isn't `1`, is
+silently dropped — never trusted, never allowed to reach the sim or crash
+the tick loop.
+
+#### Worked example: encoding one input frame
+
+A player at tick 4720 holds jump and attack together, stick pushed full
+right, stick Y neutral. `JUMP` is bit 0 and `ATTACK` is bit 1
+(`BUTTON_JUMP | BUTTON_ATTACK` = `0x0003`), the stick axes are Q16.16
+signed fixed point so full right (+1.0) encodes as 65536 (`0x00010000`),
+and every multi-byte field is little-endian. `encodeInput` produces:
+
+```
+01 70 12 00 00 03 00 00 00 01 00 00 00 00 00
+```
+
+| Offset | Bytes | Field | Value |
+|---|---|---|---|
+| 0 | `01` | `tag` | `INPUT` |
+| 1 | `70 12 00 00` | `tick` | 4720 (`0x00001270` LE) |
+| 5 | `03 00` | `buttons` | `0x0003` = `BUTTON_JUMP \| BUTTON_ATTACK` |
+| 7 | `00 00 01 00` | `stickX` | 65536 = +1.0 (full right), Q16.16 LE |
+| 11 | `00 00 00 00` | `stickY` | 0 (neutral) |
+
+Reading it back with `decodeInput` yields
+`{ tick: 4720, buttons: 3, stickX: 65536, stickY: 0 }`. A debugging trick
+that falls out of this layout: byte 0 is always the tag, so a hex dump of
+any binary frame starts with `01` (input), `02` (full snapshot), or `03`
+(delta), and an input frame is always exactly 15 bytes.
+
+## Binary: snapshot (server -> client), two shapes
+
+Sent to every connected client (players and spectators) at `SNAPSHOT_HZ`
+(20/sec), each with its own `ackedInputTick`. As of protocol version 3
+(2026-09-11, see wiki "Bandwidth Reduction Pass 2026-09-11") this is
+**delta-compressed**: a full keyframe only periodically, deltas the rest of
+the time. Which shape a given frame is is the first byte (`tag`).
+Protocol version 4 (control feel: input buffer, coyote time, short hop,
+fast-fall) added six per-fighter state fields, so snapshots carry six more
+values per fighter; no framing changed.
+
+### Full keyframe (`tag=2`, `SNAPSHOT`)
+
+Header (9 bytes): `tag(1)=2 | tick(u32 LE) | ackedInputTick(u32 LE)`, then
+the full serialized sim `StateBuffer` as consecutive `i32` LE words (see
+`Sim.saveState`/`loadState` in `packages/sim`). Sent:
+
+- as the very first snapshot on any connection (fresh join, resumed
+  reconnect — a connection can never be sent a delta against a baseline it
+  could not possibly have), and
+- at least once every `KEYFRAME_INTERVAL_SNAPSHOTS` (20, i.e. once/sec at
+  20Hz) regardless, as a resync safety net.
+
+### Delta (`tag=3`, `SNAPSHOT_DELTA`)
+
+Header (15 bytes): `tag(1)=3 | tick(u32 LE) | ackedInputTick(u32 LE) |
+baseTick(u32 LE) | changedCount(u16 LE)`, then `changedCount` entries of
+`index(u16 LE) | value(i32 LE)` (6 bytes each) — the sparse set of
+`StateBuffer` words that changed since `baseTick`.
+
+`baseTick` names the specific full keyframe this delta is relative to for
+*this connection*. A delta is always relative to the last keyframe sent on
+this same connection, never to another delta, so reconstruction is always
+one step (copy the keyframe, apply the changed words) — never a chain a
+single dropped frame could break silently.
+
+### Client decoding: `SnapshotStreamDecoder`
+
+Both server encoding (`SnapshotStreamEncoder`) and client decoding
+(`SnapshotStreamDecoder`) live in `packages/net/src/protocol.ts` — these are
+the only supported way to produce/consume this stream; nothing else should
+hand-roll delta application. `SnapshotStreamDecoder.decode(bytes)` returns a
+reconstructed full `WireSnapshot` exactly like `decodeSnapshot` used to
+return directly, so callers elsewhere in the client are unchanged. If a
+delta's `baseTick` doesn't match the decoder's current baseline (a dropped
+frame, or a stale decoder after some other frame was applied), `decode`
+returns `null` for that frame — the caller simply skips that tick's update,
+never guesses, and self-heals cleanly at the next full keyframe (at most
+`KEYFRAME_INTERVAL_SNAPSHOTS` away).
+
+## `sessionReport`'s `slowFrame*` fields: slow-frame attribution (2026-09-15)
+
+See `docs/MEASUREMENT.md` ("Slow-frame attribution") for the why. All six
+fields are optional, independently validated, and each conditioned on
+`SLOW_FRAME_THRESHOLD_MS` (33ms, exported from `packages/net/src/protocol.ts`)
+-- a frame delta at or above that threshold is what counts as "slow" for
+every field below. Sent as a running cumulative total for the match so far,
+same convention as `frameHistogram`.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `slowFrameCount` | number | How many rendered frames this match have met the threshold. The denominator every other field below is conditioned on. |
+| `slowFrameFightersAliveBuckets` | `number[4]` | Of those slow frames, how many happened while `[0-5, 6-10, 11-15, 16-20]` fighters (respectively) were still alive. |
+| `slowFrameFightersOnScreenBuckets` | `number[4]` | Same shape, but counting fighters the camera actually drew on screen. Expected to closely track the alive buckets -- the camera is built never to crop a live fighter out of frame -- so a persistent gap between the two is itself a signal. |
+| `slowFrameEffectsLoadBuckets` | `number[4]` | Of those slow frames, how many happened while `[0-20, 21-60, 61-120, 121+]` particles/pops/trail segments (respectively) were live in the effects layer. |
+| `slowFrameHitchCoincidentCount` | number | Of those slow frames, how many happened within 1s of a network hitch (see `networkHitchCount`). |
+| `slowFrameTransitionCoincidentCount` | number | Of those slow frames, how many happened within 1s of an elimination/match-transition effect being queued. |
+
+Every `number[4]` field is rejected whole (not partially trusted) if it is
+not an array of exactly 4 finite, non-negative numbers -- see
+`sanitiseFixedNumberArray` in `packages/net/src/protocol.ts`.
+
+## Client responsibilities
+
+## `sessionReport`'s `visibleMs`/`hiddenMs`: actually-playing session duration (2026-09-15)
+
+See `docs/MEASUREMENT.md` ("Actually-playing session duration") for the why
+-- the owner's North Star session-duration metric needs to distinguish a
+browser tab left open from a player actually looking at the game. Both
+fields are cumulative real ms of rendered-frame deltas for this match,
+summed by `FrameTimeTracker` in `packages/app/src/session-report.ts`
+directly off each frame's own delta (never a frame *count*, which a
+throttled background tab makes a poor proxy for elapsed time):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `visibleMs` | number | Ms of frame deltas recorded with `document.visibilityState === 'visible'`. |
+| `hiddenMs` | number | Ms of frame deltas recorded while hidden. |
+
+Each is clamped to `0..21_600_000` (6h) server-side and, like every other
+field on this page, absence means "not tracked" (older client), never a
+fabricated zero. The server pairs these with two tick-derived,
+server-authoritative figures that never touch the wire at all --
+`matchAgeAtLeaveSec` and `activePlayMs`, computed in
+`server/src/session-telemetry.ts`'s `computeDerivedPlayMetrics` from
+`Match.tick`, `Match.getMatchStartedAtTick()`, and the new
+`Seat.eliminatedAtTick` -- so "how far into the match did this session
+last, and was the player still an active fighter" cannot be spoofed by a
+compromised or buggy client, only a tab's raw open time can be
+(`sessionDurationSec`, unchanged).
+
+## Client responsibilities
+
+- Predict only its own fighter locally between snapshots, by replaying its
+  own buffered inputs since `ackedInputTick` against a `Sim` seeded
+  identically to the server's.
+- On each snapshot, `loadState` into its local sim, then re-apply any
+  locally buffered inputs newer than `ackedInputTick` to get back to
+  "now" — standard client-side prediction + reconciliation, not rollback
+  netcode (no other client's inputs are predicted).
+- Interpolate remote fighters between snapshots rather than snapping, since
+  those arrive at 20Hz but render at up to 60fps+.
+- Treat `eliminated` for its own slot as "stop sending input, may
+  `spectate`", but keep the connection open and keep applying snapshots.

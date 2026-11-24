@@ -1,0 +1,2785 @@
+:root {
+  --bg: #0b0d10;
+  --panel: #14171b;
+  --ink: #e8e6df;
+  --ink-dim: #8a8f98;
+  --accent: #e8b23c;
+  --accent-strong: #c8912a;
+  --accent-2: #4fa3c4;
+  --danger: #d7593f;
+  --font-ui: 'Inter', 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'Iosevka', 'JetBrains Mono', ui-monospace, monospace;
+  /* Width of the reserved 20-fighter HUD sidebar. Read by both #hud and
+     #canvas-root below so the world never renders behind it -- see the
+     #hud:has(.hud-list.dense) rule for why this needs to be a shared
+     variable rather than two hand-matched numbers. */
+  --hud-sidebar-width: 200px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  overflow: hidden;
+}
+
+#app {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+}
+
+#canvas-root {
+  position: absolute;
+  inset: 0;
+}
+
+/* Reserve the dense HUD's sidebar width so the game world is never
+   rendered underneath it -- pixi's `resizeTo: canvas-root` picks up the
+   resulting smaller box automatically, so the camera frames only the
+   space actually visible to the player. */
+#app:has(.hud-list.dense) #canvas-root {
+  left: var(--hud-sidebar-width);
+}
+
+/* The dense HUD sidebar reserves the full left edge top-to-bottom
+   (see #hud:has() below), which collides head-on with the touch
+   movement stick's fixed bottom-left position -- on any touch device
+   in a real (3+ fighter) match the stick used to sit directly on top
+   of the leaderboard's bottom rows. Shift the stick clear of the
+   sidebar rather than shrinking the sidebar's height, so the
+   leaderboard keeps its space and the stick keeps its reachable
+   bottom-corner position, just moved right of the reserved column.
+   Found in the mobile touch-quality pass, 2026-09-10. */
+#app:has(.hud-list.dense) .touch-stick-base {
+  left: calc(var(--hud-sidebar-width) + 20px);
+}
+
+.screen {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  background: var(--bg);
+  z-index: 10;
+  /* .screen is the ONLY scroll container on the start/end screens, and
+     this must hold regardless of cursor position. A player reported on
+     2026-09-13 that the roster was unreachable at 720px height; the fix
+     then made .below-fold scroll internally *in addition to* this rule,
+     which created a second, nested scroll region. A flex child with
+     flex:1 1 auto and min-height:0 shrinks to fit its allotted space
+     instead of forcing its parent to overflow, so with .below-fold
+     scrolling on its own, .screen's scrollHeight never exceeds its
+     clientHeight -- this overflow-y:auto became dead CSS satisfied by
+     zero scrollable distance. A visitor whose cursor sits anywhere
+     *outside* .below-fold's own (often tiny) band -- over the attract
+     canvas, the hero text, anywhere else -- got a wheel/touch event
+     that reached a "scrollable" element with nothing left to scroll,
+     and since html/body are overflow:hidden there was nowhere left to
+     chain to. Confirmed live 2026-09-15 with real wheel scroll dispatch
+     at 1280x600: scrolling over #attract-frame moved nothing anywhere;
+     the same gesture over the .below-fold band worked. Reported
+     externally, twice, as "still doesn't work. i have the cursor below
+     the played game on the homepage and still can't scroll down." See
+     [[First Ten Seconds and Phone Pass 2026-09-12]] for the fix and
+     evidence -- .below-fold no longer scrolls itself; its overflow
+     belongs to .screen so every cursor position and every input device
+     reaches the same, always-scrollable container. */
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 0;
+}
+
+/* Attract mode (packages/app/src/attract-mode.ts): a silent, self-
+   running bot match, framed as its own bounded "window" directly below
+   the pitch line -- not a background layer under the hero text. It
+   never sits underneath anything a visitor needs to read, so nothing
+   else on the start screen needs a special backing colour for it. */
+#attract-frame {
+  width: 100%;
+  max-width: 640px;
+  /* Shrinks on short viewports so it never pushes the roster out of
+     reach; see the .screen overflow note above. */
+  height: clamp(130px, 24vh, 220px);
+  margin: 4px 0 2px;
+  border: 1px solid var(--ink-dim);
+  background: var(--bg);
+  overflow: hidden;
+  position: relative;
+}
+
+#attract-root {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.attract-caption {
+  margin: 0 0 18px;
+  color: var(--ink-dim);
+  font-size: 0.85rem;
+}
+
+/* Title, pitch and the primary action ("Play online") always fit above
+   the fold, at any viewport down to 720px tall -- this is the one thing
+   a first-time visitor must see without scrolling. Character select and
+   everything else lives in .below-fold, which scrolls independently. */
+.hero {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 20px;
+  padding: clamp(20px, 5vh, 48px) 24px clamp(16px, 3vh, 28px);
+}
+
+.below-fold {
+  /* No overflow-y here -- see the note on .screen above. flex:1 1 auto
+     with no min-height override means this box does not shrink smaller
+     than its content, so its overflow becomes .screen's overflow and
+     .screen's own scrollbar (the only one on this page) actually has
+     something to scroll, reachable from a wheel or touch anywhere on
+     the screen, not just over this element. */
+  flex: 1 1 auto;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 20px;
+  padding: 0 0 28px;
+}
+
+.screen.hidden {
+  display: none;
+}
+
+.subtitle {
+  font-size: 16px;
+  color: var(--ink-dim);
+  font-weight: 400;
+  /* When this wraps to multiple lines (e.g. at phone width, or a long
+     winner name), its shrink-to-fit width clamps to the container's
+     full available width, so without an explicit centre the wrapped
+     lines sit flush against the left edge under a centred headline --
+     found on the Stocks win screen at 390px, 2026-09-12. */
+  text-align: center;
+}
+
+/* Always-visible how-to-play summary (2026-09-19): a real player
+   finished a full match and said they didn't understand how to win or
+   what to do. This sits above the fold, visible without opening the
+   Controls (C) or Moves (M) panels -- a short summary, not a
+   replacement for either. */
+.how-to-play {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  max-width: 560px;
+  text-align: center;
+  /* Balance the centred lines: unbalanced wrapping left a one-word
+     last line under a full one, which read as ragged. */
+  text-wrap: balance;
+}
+
+.how-to-play-goal,
+.how-to-play-damage {
+  font-size: 13px;
+  color: var(--ink-dim);
+}
+
+.how-to-play-controls {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 14px;
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.how-to-play-controls b {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.wordmark {
+  font-size: 56px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  border-bottom: 4px solid var(--accent);
+  padding-bottom: 10px;
+}
+
+/* Name entry, on the start screen: austere, one line, no forced input --
+   the field is a plain text box with a placeholder that shows what
+   joining looks like if you skip it (the slot label), not a validation
+   error waiting to fire. */
+.name-entry-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.name-entry-label {
+  font-size: 13px;
+  color: var(--ink-dim);
+}
+
+.name-entry-input {
+  background: var(--panel);
+  border: 1px solid #262a30;
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: 15px;
+  padding: 7px 10px;
+  border-radius: 4px;
+  width: 220px;
+  outline: none;
+}
+
+.name-entry-input::placeholder {
+  color: var(--ink-dim);
+}
+
+.name-entry-input:focus {
+  border-color: var(--accent-strong);
+}
+
+/* The fighter-select section is a single deliberate block: a heading
+   that always has clear air above and below it (never flush against the
+   hero or the grid beneath it), then the grid+preview composed as one
+   unit rather than a grid with a preview panel floating separately. */
+.fighter-select {
+  width: min(760px, 92vw);
+  padding-top: 12px;
+  border-top: 1px solid #1c1f24;
+}
+
+.section-label {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: var(--ink);
+  margin: 0 0 16px;
+}
+
+.roster-select {
+  display: flex;
+  gap: 20px;
+  align-items: stretch;
+  justify-content: center;
+}
+
+.roster-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  width: 488px;
+  flex: 0 0 auto;
+  align-content: flex-start;
+}
+
+/* Moveset preview beside character-select (issue #10) -- reuses the same
+   row shape/typography as .move-reference-row so the two panels read as
+   one visual language instead of two competing ones. Flexes to fill the
+   width left over next to the grid instead of a fixed narrow column, so
+   the composed block reads as one balanced unit rather than a grid with
+   a preview panel stranded in a corner and empty space beside it. */
+.roster-preview {
+  flex: 1 1 260px;
+  min-width: 0;
+  border: 1px solid #23262b;
+  background: var(--panel);
+  padding: 14px 16px;
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.roster-preview-title {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ink);
+  margin-bottom: 10px;
+}
+
+.roster-preview-row {
+  border-top: 1px solid #23262b;
+  padding: 8px 0;
+}
+
+.roster-preview-row:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+
+.roster-preview-name {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ink);
+  margin-bottom: 2px;
+}
+
+.roster-preview-input {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-dim);
+  margin-bottom: 2px;
+}
+
+.roster-preview-desc {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--ink-dim);
+  line-height: 1.4;
+}
+
+.roster-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  width: 110px;
+  padding: 14px 10px;
+  border: 1px solid #23262b;
+  background: var(--panel);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  cursor: pointer;
+}
+
+.roster-card:hover {
+  border-color: var(--ink-dim);
+}
+
+.roster-card.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.roster-swatch {
+  width: 56px;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.roster-icon {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  image-rendering: pixelated;
+}
+
+.roster-name {
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.roster-blurb {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--ink-dim);
+  font-family: var(--font-ui);
+  text-align: center;
+  line-height: 1.3;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.roster-weight {
+  font-size: 11px;
+  color: var(--ink-dim);
+  font-family: var(--font-mono);
+}
+
+.select-row {
+  display: flex;
+  gap: 48px;
+}
+
+.select-card {
+  border: 1px solid #23262b;
+  background: var(--panel);
+  padding: 20px 26px;
+  min-width: 220px;
+  text-align: left;
+}
+
+.select-card h3 {
+  margin: 0 0 10px;
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  color: var(--ink-dim);
+}
+
+.select-card .name {
+  font-size: 22px;
+  font-weight: 700;
+  margin-bottom: 14px;
+}
+
+.select-card .p1 .name { color: var(--accent); }
+.select-card .p2 .name { color: var(--accent-2); }
+
+.bindings {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-dim);
+  line-height: 1.7;
+}
+
+.btn {
+  font-family: var(--font-ui);
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--bg);
+  background: var(--ink);
+  border: none;
+  padding: 14px 34px;
+  cursor: pointer;
+}
+
+.btn:hover {
+  background: var(--accent);
+}
+
+/* Online play is the game; give it the visual weight to match. */
+.btn-primary {
+  font-size: 19px;
+  padding: 18px 56px;
+  background: var(--accent);
+  color: var(--bg);
+}
+
+/* Primary actions (Play online, Play again) stay amber under hover
+   and keyboard focus alike -- the bug this replaced swapped to
+   `--ink`, a pale off-white, so clicking "Play again" and leaving it
+   focused made the primary action look disabled/secondary instead of
+   the amber it should always be. --accent-strong is a darker amber so
+   there is still visible feedback without losing the colour identity. */
+.btn-primary:hover,
+.btn-primary:focus-visible {
+  background: var(--accent-strong);
+}
+
+.btn-secondary {
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid #2c3037;
+  font-weight: 600;
+}
+
+.btn-plain {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-dim);
+  background: transparent;
+  border: none;
+  padding: 10px 6px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: transparent;
+}
+
+.btn-plain:hover {
+  color: var(--ink);
+  text-decoration-color: var(--ink-dim);
+}
+
+/* Full-screen elimination / connection-lost overlay -- see
+   packages/app/src/ui/match-overlay.ts. Sits above the canvas, below
+   nothing: it is the only thing on screen while it is shown. */
+.match-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(10, 10, 10, 0.86);
+  z-index: 50;
+}
+
+.match-overlay.hidden {
+  display: none;
+}
+
+.match-overlay-panel {
+  width: min(440px, 86vw);
+  background: var(--panel);
+  border: 1px solid #2c3037;
+  padding: 40px 36px;
+  text-align: center;
+}
+
+.match-overlay-panel[data-tone='danger'] {
+  border-color: rgba(215, 89, 63, 0.5);
+}
+
+.match-overlay-kicker {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--accent);
+  margin-bottom: 14px;
+}
+
+.match-overlay-panel[data-tone='danger'] .match-overlay-kicker {
+  color: var(--danger);
+}
+
+.match-overlay-kicker.hidden {
+  display: none;
+}
+
+.match-overlay-title {
+  font-family: var(--font-ui);
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--ink);
+  margin-bottom: 12px;
+}
+
+.match-overlay-message {
+  font-family: var(--font-ui);
+  font-size: 14px;
+  color: var(--ink-dim);
+  line-height: 1.6;
+  margin-bottom: 28px;
+}
+
+.match-overlay-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.match-overlay-actions .btn {
+  width: 100%;
+}
+
+/* In-game move reference (repo issue #5) -- packages/app/src/ui/move-reference-panel.ts.
+   Sits above everything, same treatment as match-overlay, but never
+   pauses or ends a match underneath it -- it's a read-only lookup a
+   player can dismiss and resume from where they left off. */
+.move-reference-panel {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(10, 10, 10, 0.86);
+  z-index: 60;
+}
+
+.move-reference-panel.hidden {
+  display: none;
+}
+
+.move-reference-inner {
+  width: min(560px, 90vw);
+  max-height: 80vh;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid #2c3037;
+  padding: 28px 30px;
+}
+
+.move-reference-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 18px;
+  /* Both modals scroll internally and can be taller than the viewport.
+     Pinning the header keeps the Close button reachable at any scroll
+     position -- without this, a player who scrolled to the bottom of the
+     Controls panel had no visible way out of it. */
+  position: sticky;
+  top: -28px;
+  padding: 28px 0 12px;
+  margin-top: -28px;
+  background: var(--panel);
+  z-index: 1;
+}
+
+.move-reference-title {
+  font-family: var(--font-ui);
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.move-reference-close {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-dim);
+  background: transparent;
+  border: 1px solid #2c3037;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+
+.move-reference-close:hover {
+  color: var(--ink);
+}
+
+.move-reference-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 18px;
+}
+
+.move-reference-tab {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-dim);
+  background: transparent;
+  border: 1px solid #2c3037;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+.move-reference-tab.active {
+  color: var(--ink);
+  border-color: var(--ink);
+}
+
+.move-reference-row {
+  border-top: 1px solid #23262b;
+  padding: 12px 0;
+}
+
+.move-reference-row:first-child {
+  border-top: none;
+}
+
+.move-reference-name {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ink);
+  margin-bottom: 4px;
+}
+
+.move-reference-input {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-dim);
+  margin-bottom: 4px;
+}
+
+.move-reference-desc {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  color: var(--ink-dim);
+  line-height: 1.5;
+}
+
+/* Key-remapping settings panel (repo issue #9) --
+   packages/app/src/ui/settings-panel.ts. Reuses the move-reference
+   panel's modal shell (.settings-panel extends .move-reference-panel in
+   the markup) so it reads as the same product, not a second dialog
+   style. */
+.settings-hint {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--ink-dim);
+  margin-bottom: 16px;
+}
+
+.settings-unbound-notice {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--warn, #e0a030);
+  background: rgba(224, 160, 48, 0.12);
+  border: 1px solid rgba(224, 160, 48, 0.4);
+  border-radius: 4px;
+  padding: 6px 10px;
+  margin-bottom: 12px;
+}
+.settings-unbound-notice.hidden {
+  display: none;
+}
+
+.settings-group {
+  margin-bottom: 18px;
+}
+
+.settings-group-title {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ink);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 8px;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid #23262b;
+  padding: 10px 0;
+}
+
+.settings-group .settings-row:first-of-type {
+  border-top: none;
+}
+
+.settings-row-label {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  color: var(--ink-dim);
+}
+
+.settings-key-btn {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+  background: transparent;
+  border: 1px solid #2c3037;
+  padding: 6px 14px;
+  min-width: 84px;
+  cursor: pointer;
+}
+
+.settings-key-btn:hover {
+  border-color: var(--ink-dim);
+}
+
+.settings-key-btn.capturing {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.settings-reset-btn {
+  margin-top: 8px;
+}
+
+.settings-accessibility-group {
+  margin-top: 16px;
+  border-top: 1px solid #23262b;
+  padding-top: 12px;
+}
+
+.settings-checkbox-row {
+  cursor: pointer;
+}
+
+.settings-checkbox-row input[type='checkbox'] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+
+/* Single flex row anchored top-right that owns every overlay control
+   (sound, and the in-match Controls/Moves buttons below) -- see the
+   comment in main.ts. Children lay out left-to-right with a gap and
+   wrap onto a second line if the viewport is too narrow for all of
+   them, so nothing can ever land on top of anything else. */
+#top-right-controls {
+  position: fixed;
+  top: 12px;
+  right: 16px;
+  z-index: 40;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  max-width: calc(100vw - 32px);
+}
+
+.in-match-moves-btn {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-dim);
+  background: rgba(20, 23, 27, 0.85);
+  border: 1px solid #2c3037;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+.in-match-moves-btn:hover {
+  color: var(--ink);
+}
+
+.in-match-moves-btn.hidden {
+  display: none;
+}
+
+/* Brief controls reminder at match start -- packages/app/src/ui/controls-hint.ts. */
+.controls-hint {
+  position: fixed;
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--ink-dim);
+  background: rgba(20, 23, 27, 0.85);
+  border: 1px solid #2c3037;
+  padding: 10px 18px;
+  z-index: 30;
+  opacity: 1;
+  transition: opacity 0.6s ease;
+  pointer-events: none;
+}
+
+/* On a phone the touch buttons own the bottom of the screen, so the hint
+   sits under the heading instead. */
+.controls-hint.touch {
+  bottom: auto;
+  top: 62px;
+  max-width: 78vw;
+  text-align: center;
+}
+
+.controls-hint.fading {
+  opacity: 0;
+}
+
+.controls-hint.urgent {
+  font-family: var(--font-ui);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--ink);
+  border-color: var(--accent);
+  border-left-width: 3px;
+  background: #14171bf2;
+  bottom: 84px;
+}
+
+@media (max-width: 480px) {
+  .controls-hint.urgent {
+    font-size: 14px;
+    bottom: 200px;
+    max-width: 88vw;
+    text-align: center;
+  }
+}
+
+.controls-hint.hidden {
+  display: none;
+}
+
+/* Touch + urgent: .touch pins top, .urgent pins bottom; both at once stretched
+   the box into a full-height column over the fighters. Drop the top anchor and
+   sit the prompt just above the action buttons it points at. */
+.controls-hint.touch.urgent {
+  top: auto;
+  bottom: 176px;
+  left: auto;
+  right: 12px;
+  transform: none;
+  max-width: 70vw;
+}
+
+.btn-secondary:hover {
+  background: transparent;
+  border-color: var(--ink-dim);
+}
+
+/* Local two-player is a side door, folded away by default so it cannot be
+   mistaken for the main way to play. */
+.local-play {
+  border-top: 1px solid #1c1f24;
+  padding-top: 18px;
+  width: min(720px, 90vw);
+}
+
+.local-play summary {
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--ink-dim);
+  list-style: none;
+}
+
+.local-play summary::before {
+  content: '+ ';
+  color: var(--accent);
+}
+
+.local-play[open] summary::before {
+  content: '\2212 ';
+}
+
+.local-play summary:hover {
+  color: var(--ink);
+}
+
+.local-play > .select-row {
+  justify-content: center;
+  margin: 20px 0 18px;
+}
+
+.local-play > .hint {
+  margin-top: 14px;
+}
+
+.hint {
+  font-size: 13px;
+  color: var(--ink-dim);
+}
+
+#hud {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 18px 22px;
+  z-index: 5;
+  pointer-events: none;
+  font-family: var(--font-ui);
+}
+
+/* Dense mode (>2 fighters, i.e. every real match) gets a genuinely
+   reserved sidebar rather than an overlay: solid background, pinned to
+   the full height of the screen, and #canvas-root is pushed over to
+   match (see the :has() rule below) so the world is never drawn behind
+   it. A translucent panel over the play area still hides whatever
+   fighter is under it -- reserving real space is the only fix that
+   survives a fighter actually walking there. */
+#hud:has(.hud-list.dense) {
+  top: 0;
+  bottom: 0;
+  left: 0;
+  right: auto;
+  width: var(--hud-sidebar-width);
+  background: var(--panel);
+  border-right: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 16px 14px;
+  pointer-events: auto;
+}
+
+#hud.hidden {
+  display: none;
+}
+
+.hud-list {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+/* Compact list mode kicks in once there are more fighters than fit as
+   two big readouts — same markup, different density. */
+.hud-list.compact .hud-card {
+  min-width: 92px;
+  padding: 8px 10px;
+}
+
+/* Dense mode: up to 20 fighters. A wide flowing row of compact cards
+   would wrap into several rows and cover the stage, so dense mode is a
+   grid filling the reserved sidebar's width, using every bit of the
+   sidebar's vertical space (flex: 1 in a full-height sidebar) before
+   ever falling back to internal scrolling -- see the #hud:has() rule
+   above for why the sidebar has real height to give it in the first
+   place. */
+.hud-list.dense {
+  /* Sized to its own content (a 2-column, 10-row grid of 20 compact
+     cards is a fixed, known height), not flex: 1 -- the chip grid used
+     to claim the sidebar's full height and then sit there mostly empty
+     below row 10, which is the dead space the match-status block below
+     now uses. flex-shrink: 0 keeps it from being squeezed if the
+     viewport is unusually short; overflow-y still catches the
+     pathological case (very long names wrapping, a future larger
+     roster) without the sidebar ever pushing the canvas over. */
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: 55%;
+  width: 100%;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
+  grid-auto-rows: min-content;
+  overflow-y: auto;
+  gap: 4px;
+  align-content: start;
+}
+
+/* Name-and-percent-on-one-line dense card (Player Names 2026-09-11
+   follow-up): the four fields used to stack name/pct/stocks as three
+   separate text lines under the slot number, which made each card tall
+   enough that a full 20-entry, 2-column list no longer fit a 720px-tall
+   viewport -- entry #19/#20 were cut off or covered by the net-status
+   chip. A 2-row grid (slot+name+pct on row 1, stocks on row 2) is far
+   shorter per card, and font sizes below are picked to fit that single
+   line at the sidebar's narrowest real width (128px, see the 700px
+   media query) as well as the 200px desktop width. */
+.hud-list.dense .hud-card {
+  min-width: 0;
+  width: 100%;
+  padding: 3px 6px;
+  border-left-width: 2px;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  grid-template-rows: auto auto;
+  column-gap: 4px;
+  align-items: baseline;
+}
+
+.hud-list.dense .hud-card .slot-num {
+  grid-column: 1;
+  grid-row: 1;
+  font-size: 8px;
+}
+
+.hud-list.dense .hud-card .fighter-name {
+  grid-column: 2;
+  grid-row: 1;
+  min-width: 0;
+  font-size: 8px;
+}
+
+.hud-list.dense .hud-card .pct {
+  grid-column: 3;
+  grid-row: 1;
+  font-size: 11px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.hud-list.dense .hud-card .stocks {
+  grid-column: 1 / 4;
+  grid-row: 2;
+  margin-top: 1px;
+  font-size: 8px;
+}
+
+/* Found in the phone-width pass, 2026-09-12: the local player's "YOU"
+   badge (.hud-card.is-you::before, an absolutely positioned overlay
+   meant for the roomier non-dense card) sits top:2px/right:6px -- inside
+   a dense card that is a single ~14px-tall row, that lands directly on
+   top of the percent readout, rendering as something like "Y9%" with
+   both the tag and the fighter's actual damage unreadable. The dense
+   card has its own two-row grid already, so give "YOU" a real cell in
+   that grid (the end of the stocks row, which has room) instead of an
+   overlay, rather than trying to nudge an absolute position that will
+   only go back to colliding the next time column widths change. */
+.hud-list.dense .hud-card.is-you::before {
+  content: none;
+}
+
+.hud-list.dense .hud-card.is-you .stocks {
+  display: flex;
+  justify-content: space-between;
+}
+
+.hud-list.dense .hud-card.is-you .stocks::after {
+  content: 'YOU';
+  color: var(--ink);
+  letter-spacing: 0.1em;
+}
+
+.hud-card {
+  background: rgba(20, 23, 27, 0.85);
+  border-left: 3px solid var(--ink-dim);
+  padding: 10px 16px;
+  min-width: 140px;
+}
+
+.hud-card .slot-num {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--ink-dim);
+  letter-spacing: 0.04em;
+}
+
+/* Truncates with an ellipsis rather than wrapping -- MAX_NAME_LENGTH (16
+   chars) already keeps a name from being absurd, but a card at dense
+   density is only ~80px wide and must not grow to fit one. */
+.hud-card .fighter-name {
+  font-size: 11px;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.hud-card .pct {
+  font-family: var(--font-mono);
+  font-size: 30px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.hud-card .stocks {
+  margin-top: 6px;
+  font-size: 13px;
+  letter-spacing: 0.12em;
+  color: var(--ink-dim);
+}
+
+#win-screen .winner-name {
+  font-size: 15px;
+}
+
+/* Timed Brawl end screen (packages/app/src/ui/timed-brawl-end-screen.ts).
+   The whole block is vertically centred (unlike the shared .screen rule,
+   which top-aligns short content by default -- this content is long
+   enough at 20 rows that top-aligning it would look like a mistake). */
+#timed-brawl-end-screen {
+  justify-content: center;
+}
+
+/* Win screen (packages/app/src/ui/win-screen.ts): short, fixed-height
+   content that used to top-align like every other .screen and sit hard
+   against the viewport's top edge with a large empty area beneath --
+   unlike the placement overlay (.match-overlay, which centers), this is
+   the only other full-viewport end state and it should read the same
+   way. Centering here matches #timed-brawl-end-screen above. */
+#win-screen {
+  justify-content: center;
+}
+
+/* Two columns of up to 10 rows each, same convention as the HUD sidebar
+   (packages/app/src/ui/hud.ts's own two-column card grid) -- all 20
+   fighters always fit on screen at once with no scrolling, so the local
+   player's row (marked with the same amber outline the HUD/other
+   overlays use for "you") is never one scroll away from view. Falls back
+   to a single column under 700px, where two columns would be too narrow
+   to read (see the small-screen query at the end of this file). */
+.tb-standings {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-auto-flow: column;
+  grid-template-rows: repeat(10, auto);
+  gap: 4px 10px;
+  width: min(720px, 92vw);
+  max-height: 70vh;
+  overflow-y: auto;
+  margin: 16px 0;
+}
+
+.tb-standings.tb-standings-single {
+  grid-template-columns: minmax(0, 1fr);
+  grid-auto-flow: row;
+  grid-template-rows: none;
+  width: min(380px, 92vw);
+}
+
+.tb-standing-row {
+  display: grid;
+  grid-template-columns: 24px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel);
+  border-left: 3px solid var(--ink-dim);
+  padding: 5px 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+/* Local player's row -- same amber "you" marker used elsewhere (e.g. the
+   HUD's own local-player highlight), never the winner's per-fighter
+   colour, which stays confined to the thin left border on every row. */
+.tb-standing-row.is-you {
+  outline: 2px solid var(--accent-strong);
+  outline-offset: -1px;
+}
+
+.tb-place {
+  color: var(--ink-dim);
+  font-weight: 700;
+}
+
+.tb-name {
+  color: var(--ink);
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tb-score {
+  color: var(--ink-dim);
+  white-space: nowrap;
+}
+
+/* Small colour identity marker beside the winner's name in the headline
+   -- the only place the winner's fighter colour appears at headline
+   scale, per the design language keeping large text neutral. */
+.tb-winner-swatch {
+  display: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  margin-right: 10px;
+  vertical-align: middle;
+}
+
+.debug-hint {
+  position: absolute;
+  bottom: 12px;
+  right: 16px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-dim);
+  z-index: 5;
+}
+
+.mute-btn {
+  font-size: 12px;
+  color: var(--ink-dim);
+  background: var(--panel);
+  border: 1px solid var(--ink-dim);
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.mute-btn:hover {
+  color: var(--ink);
+  border-color: var(--ink);
+}
+
+.mute-btn[data-muted='true'] {
+  color: var(--ink-dim);
+  border-color: var(--ink-dim);
+  opacity: 0.7;
+}
+
+.survivors-line {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-dim);
+  margin-bottom: 8px;
+  letter-spacing: 0.04em;
+}
+
+/* Timed Brawl countdown clock (packages/app/src/ui/hud.ts). Amber like
+   every other primary/attention readout in the design language, sized
+   above the survivors-line text so it reads at a glance among 20 fighter
+   cards. */
+.hud-clock-line {
+  font-family: var(--font-mono);
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--accent-strong);
+  margin-bottom: 10px;
+  letter-spacing: 0.03em;
+}
+
+/* Match-status block: the space below the chip grid, previously dead
+   (see wiki "Camera Framing" -era layout notes) -- now a compact,
+   always-derived-from-existing-state readout: mode + win condition,
+   a clock (remaining for Timed Brawl, elapsed otherwise), and a short
+   elimination feed. flex: 1 takes exactly the space the chip grid gives
+   up; bottom padding keeps it clear of the fixed #net-status chip
+   (bottom: 14px, see #net-status below), same convention the chip grid
+   already used. */
+.match-status {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin-top: 10px;
+  padding-top: 10px;
+  padding-bottom: 44px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.match-status-mode {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  /* Was --ink-dim (#8a8f98): legible but flat against the panel next to
+     the bright per-fighter chip colours above it. Full --ink reads
+     clearly without competing -- it's plain text, not a warning/action,
+     so amber stays reserved as the design language requires. */
+  color: var(--ink);
+  letter-spacing: 0.02em;
+}
+
+.match-status-clock {
+  font-family: var(--font-mono);
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--accent-strong);
+  margin-top: 4px;
+  letter-spacing: 0.02em;
+}
+
+/* Live Timed Brawl knockout standing (2026-09-19): small and quiet on
+   purpose, sits between the clock and the elimination feed -- it must
+   not compete with the damage sidebar's chip grid or the world-space
+   damage badges for attention, just answer "am I winning" at a glance. */
+.match-status-ko {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-dim);
+  margin-top: 4px;
+  letter-spacing: 0.01em;
+}
+
+.elimination-feed {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow: hidden;
+}
+
+.elimination-feed-line {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  /* Was --ink-dim for every line, which read as too faint against the
+     panel to actually notice a death happening. Full --ink by default;
+     the small hierarchy cue below dims only the older lines instead of
+     the whole feed. */
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Most recent elimination (top of the now-correctly-ordered feed, see
+   sortFeedEntriesNewestFirst in hud-text.ts) stays full brightness; each
+   older line dims slightly so the eye lands on what just happened
+   without the whole block competing with the per-fighter chip colours
+   above it. Still plain --ink-dim, not amber/red -- those stay reserved
+   for warning/action and danger. */
+.elimination-feed-line:not(:first-child) {
+  color: var(--ink-dim);
+}
+
+.hud-card.eliminated {
+  opacity: 0.45;
+  border-left-color: #3a3d42 !important;
+}
+
+.hud-card.eliminated .pct {
+  color: var(--ink-dim) !important;
+}
+
+/* The local player's own HUD card: a solid border (not just the left
+   accent strip) plus a small "YOU" tag, so it stays findable by scanning
+   card *shape* even in a dense 20-card grid, not colour alone. */
+.hud-card.is-you {
+  border: 1px solid var(--ink);
+  background: rgba(232, 230, 223, 0.08);
+  position: relative;
+}
+
+.hud-card.is-you::before {
+  content: 'YOU';
+  position: absolute;
+  top: 2px;
+  right: 6px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  color: var(--ink);
+}
+
+.spectator-banner {
+  position: absolute;
+  bottom: 18px;
+  left: 18px;
+  z-index: 6;
+  background: rgba(20, 23, 27, 0.9);
+  border-left: 3px solid var(--accent);
+  padding: 10px 16px;
+  pointer-events: none;
+}
+
+.spectator-banner.hidden {
+  display: none;
+}
+
+.spectator-banner .placement-line {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.spectator-banner .hint {
+  margin-top: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-dim);
+}
+
+#net-status {
+  /* Top-right, clear of the HUD's top-left roster and the fighter's damage
+     readout, which is drawn in the bottom-left corner (see
+     computeLocalDamageReadout). Below the top controls row. */
+  position: fixed;
+  top: 84px;
+  right: 12px;
+  padding: 6px 12px;
+  font-family: 'JetBrains Mono', 'Menlo', monospace;
+  font-size: 13px;
+  color: #e8e8e8;
+  background: rgba(20, 20, 24, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+  letter-spacing: 0.02em;
+  z-index: 20;
+}
+
+/* While a match-end screen is up, the fixed bottom-left connection chip
+   ("Match complete") sits on top of the end screen's Feedback button --
+   found by playing a Timed Brawl to time-out at 256px width. The chip
+   says nothing the end screen does not already say, and feedback is the
+   one control on that screen we most want pressed, so the chip stands
+   down. Class set in timed-brawl-end-screen.ts and win-screen.ts. */
+body.end-screen-open #net-status,
+body.end-screen-open #net-mode-line {
+  display: none;
+}
+
+#net-status[data-state='error'],
+#net-status[data-state='disconnected'] {
+  color: #ff8a8a;
+  border-color: rgba(255, 100, 100, 0.35);
+}
+
+#net-status[data-state='in-match'] {
+  color: #9be89b;
+  border-color: rgba(120, 220, 120, 0.3);
+}
+
+#net-status[data-state='reconnecting'] {
+  color: #f0c869;
+  border-color: rgba(240, 200, 105, 0.35);
+}
+
+#net-status.hidden {
+  display: none;
+}
+
+/* Waiting screen (packages/app/src/ui/waiting-screen.ts) already shows the
+   mode line and the player count/countdown in its own centred composition
+   -- while it is up, the small always-on connection chip and mode chip
+   below it would just repeat the same two sentences a second time on the
+   same screen. Suppress them for exactly the 'waiting' state (driven off
+   the same data-state attribute setNetStatus() already sets, so there is
+   one source of truth); every other state (connecting, in-match,
+   spectating, reconnecting, disconnected, error, match-complete) keeps
+   both chips exactly as before. */
+#net-status[data-state='waiting'],
+#net-status[data-state='waiting'] ~ #net-mode-line {
+  display: none;
+}
+
+/* Mode line (2026-09-11, Timed Brawl mode rotation): sits just above the
+   connection chip, telling a waiting player which mode their match will
+   run in plain language. Amber, matching --accent-strong, since this is
+   information the player should notice but it is not a warning (red is
+   reserved for danger only per the design language). */
+#net-mode-line {
+  position: fixed;
+  bottom: 46px;
+  left: 22px;
+  padding: 6px 12px;
+  font-family: 'JetBrains Mono', 'Menlo', monospace;
+  font-size: 13px;
+  color: #c8912a;
+  background: rgba(20, 20, 24, 0.85);
+  border: 1px solid rgba(200, 145, 42, 0.35);
+  border-radius: 4px;
+  letter-spacing: 0.02em;
+  z-index: 20;
+}
+
+#net-mode-line.hidden {
+  display: none;
+}
+
+/* Waiting screen (packages/app/src/ui/waiting-screen.ts): the composed
+   state a player sees between clicking "Play online" and the lobby
+   filling, replacing what used to be plain black canvas plus the two
+   small connection chips. Sits above the canvas, below those chips
+   (they stay put at bottom-left for every other connection state, so
+   z-index here is lower). Quiet, not a billboard: one wordmark, one
+   mode line, one count, one line of controls, all centered and static
+   -- no motion, no colour beyond the accent already used everywhere
+   else for "notice this". */
+.waiting-screen {
+  position: absolute;
+  inset: 0;
+  z-index: 15;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  background: var(--bg);
+  text-align: center;
+  padding: 24px;
+  /* One more line and a button than this screen used to have; a short
+     viewport (small phones in landscape, or a squeezed preview window)
+     can now run out of vertical room. Scroll rather than clip or spill
+     into the fixed top-right controls / bottom-right debug hint --
+     verified by measured bounding boxes at 1280x720 and 390px wide, see
+     the overlap-check notes in this repo's test/verification history. */
+  overflow-y: auto;
+}
+
+.waiting-screen.hidden {
+  display: none;
+}
+
+.waiting-wordmark {
+  font-size: 40px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  border-bottom: 3px solid var(--accent);
+  padding-bottom: 8px;
+}
+
+.waiting-mode {
+  font-size: 15px;
+  color: #c8912a;
+}
+
+.waiting-mode.hidden {
+  display: none;
+}
+
+.waiting-count {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  color: var(--ink-dim);
+}
+
+/* Countdown line: this is the answer to "is anything going to happen?",
+   so it is now the visually dominant line on the screen -- larger and in
+   the accent colour, ahead of the plain player-count line and well ahead
+   of the control hint. Amber per the design language's "primary action
+   or warning" rule: not a warning exactly, but the one number on this
+   screen whose passage the player should track. */
+.waiting-countdown {
+  font-family: var(--font-mono);
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--ink-dim);
+}
+
+.waiting-countdown.waiting-countdown-active {
+  color: var(--accent);
+}
+
+/* The final 3-2-1-GO seconds before a real match starts, per real-player
+   feedback: made visually dominant (large, amber, mono) rather than one
+   text line among several -- it is the single thing worth a player's
+   full attention right before they need to find their fighter. No
+   animation beyond the text swap itself (no scale/pulse/motion), so it
+   costs nothing under the reduced-motion setting and needs no special
+   case for it: this is information, not decoration. */
+.waiting-countdown.waiting-countdown-big {
+  font-size: 64px;
+  line-height: 1;
+  letter-spacing: 0.02em;
+}
+
+@media (max-width: 480px) {
+  .waiting-countdown.waiting-countdown-big {
+    font-size: 48px;
+  }
+}
+
+.waiting-explain {
+  max-width: 480px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-dim);
+}
+
+/* "Start now": the one control on this screen, for the visitor who does
+   not want to wait out even the short grace period. Amber outline/text on
+   the flat dark panel fill -- primary action, not danger, so red is never
+   used here; no gradient, no glow, matching every other control in the
+   game. */
+.waiting-start-btn {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  padding: 8px 18px;
+  cursor: pointer;
+}
+
+/* Hidden while merely connecting: there is no lobby to start yet, so
+   offering "Start now" would be a control that cannot do anything. */
+.waiting-start-btn.hidden {
+  display: none;
+}
+
+.waiting-start-btn:hover {
+  color: var(--bg);
+  background: var(--accent);
+}
+
+.waiting-start-btn:disabled {
+  color: var(--ink-dim);
+  border-color: var(--ink-dim);
+  background: var(--panel);
+  cursor: default;
+}
+
+.waiting-hint {
+  max-width: 480px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ink-dim);
+}
+
+/* Shareable-lobby-link share row (2026-09-22, see join-link.ts): the
+   join code/link itself is plain ink on the flat panel, never amber --
+   amber stays reserved for the single primary action ("Start now") and
+   the copy button, which is quieter than that, uses the same
+   .btn-plain treatment as every other secondary text control. */
+.waiting-share {
+  max-width: 480px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* The generic "empty seats fill with bots" line is replaced by the share
+   panel for a friend lobby, not stacked above it: WaitingScreen.setShareLink
+   toggles .hidden on it, and without this rule the class did nothing, so a
+   host saw both explanations at once. Found by playing the flow locally. */
+.waiting-explain.hidden {
+  display: none;
+}
+
+.waiting-hint.hidden {
+  display: none;
+}
+
+.waiting-share.hidden {
+  display: none;
+}
+
+.waiting-share-label {
+  font-size: 12px;
+  color: var(--ink-dim);
+}
+
+.waiting-share-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.waiting-share-link {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid #2c3037;
+  padding: 6px 10px;
+  word-break: break-all;
+}
+
+@media (max-width: 480px) {
+  .waiting-share {
+    max-width: 92vw;
+  }
+  .waiting-share-link {
+    font-size: 12px;
+  }
+}
+
+@media (max-width: 330px) {
+  .waiting-share-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
+@media (max-width: 480px) {
+  .waiting-wordmark {
+    font-size: 30px;
+  }
+  .waiting-countdown {
+    font-size: 17px;
+  }
+  .waiting-explain,
+  .waiting-hint {
+    max-width: 92vw;
+  }
+}
+
+/* Win screen headline: the wordmark's weight without borrowing the
+   wordmark itself, which belongs to the game's name and nothing else. */
+.win-headline {
+  font-size: 48px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  border-bottom: 3px solid var(--accent);
+  padding-bottom: 8px;
+}
+
+/* ---- Touch controls -----------------------------------------------
+   Shown only on touch-capable devices (see isTouchCapable in
+   packages/input/src/touch.ts). Flat fills, no gradients, restrained
+   like the rest of the HUD -- this is a control surface, not a toy. */
+#touch-controls {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  pointer-events: none;
+}
+
+#touch-controls.hidden {
+  display: none;
+}
+
+.touch-stick-base {
+  position: absolute;
+  left: max(20px, env(safe-area-inset-left));
+  bottom: max(20px, env(safe-area-inset-bottom));
+  width: 132px;
+  height: 132px;
+  border-radius: 50%;
+  background: rgba(232, 230, 223, 0.06);
+  border: 1px solid rgba(232, 230, 223, 0.18);
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.touch-stick-nub {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 56px;
+  height: 56px;
+  margin-left: -28px;
+  margin-top: -28px;
+  border-radius: 50%;
+  background: rgba(232, 230, 223, 0.28);
+  transition: transform 0.02s linear;
+}
+
+.touch-buttons {
+  position: absolute;
+  right: max(16px, env(safe-area-inset-right));
+  bottom: max(16px, env(safe-area-inset-bottom));
+  width: 204px;
+  height: 204px;
+  pointer-events: none;
+}
+
+.touch-btn {
+  position: absolute;
+  width: 68px;
+  height: 68px;
+  border-radius: 50%;
+  background: rgba(232, 230, 223, 0.08);
+  border: 1px solid rgba(232, 230, 223, 0.22);
+  color: var(--ink-dim);
+  font-size: 12px;
+  font-weight: 600;
+  font-family: inherit;
+  letter-spacing: 0.02em;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: auto;
+  touch-action: none;
+  user-select: none;
+  /* These are <button> elements now (issue #27): strip the default
+   * button chrome (padding) and font (buttons don't inherit
+   * font-family) so the swap from divs is visually a no-op. */
+  appearance: none;
+  padding: 0;
+}
+
+.touch-btn.pressed {
+  background: rgba(232, 178, 60, 0.28);
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+/* Keyboard users tab to these buttons; keep a clearly visible focus
+ * ring (accent on the dark arena background) instead of the browser
+ * default, which can be nearly invisible here. */
+.touch-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Diamond layout, thumb-reachable from the bottom-right corner: jump
+   closest to the outer edge (most reflexive, largest target already
+   covered by muscle memory from other genres), attack innermost since
+   it fires most often, special/shield to the sides. */
+/* 2026-09-11 (see wiki "Client Gaps Closed 2026-09-11"): spacing used
+   to be 54px between adjacent 68px-diameter circular buttons -- since
+   68 > 54, every adjacent pair's circular hit areas geometrically
+   overlapped by 14px, a real dead zone where a tap could land on
+   whichever button happened to be later in paint order instead of the
+   one the player was aiming for. Spacing must be >= the button
+   diameter for two same-size circles to never overlap; 68px spacing
+   makes adjacent circles exactly tangent (touching, not overlapping). */
+.touch-btn-jump { right: 0; bottom: 68px; }
+.touch-btn-attack { right: 68px; bottom: 0; }
+.touch-btn-special { right: 0; bottom: 0; }
+.touch-btn-shield { right: 136px; bottom: 0; }
+
+/* ---- Small-screen layout ------------------------------------------
+   Everything below this line is unchanged on desktop; these queries
+   only kick in under roughly tablet width, where the fixed-width rows
+   used elsewhere in this file start to overflow instead of wrap. */
+@media (max-width: 700px) {
+  .roster-row {
+    flex-wrap: wrap;
+    justify-content: center;
+    max-width: 100%;
+    width: 100%;
+    overflow-x: visible;
+  }
+
+  .roster-select {
+    flex-direction: column;
+  }
+
+  .fighter-select {
+    width: 100%;
+  }
+
+  .roster-preview {
+    width: 100%;
+    flex: 1 1 auto;
+  }
+
+  .hero {
+    padding: 16px 16px 12px;
+    gap: 12px;
+  }
+
+  .wordmark {
+    font-size: 36px;
+  }
+
+  .below-fold {
+    padding: 0 16px 16px;
+    gap: 16px;
+  }
+
+  .win-headline {
+    font-size: 32px;
+  }
+
+  /* Every full-screen overlay (start screen's hero, win screen,
+     elimination/placement screens) starts flush at the top; at narrow
+     widths its centered heading is wide enough to run under the fixed
+     top-right Sound/Controls/Moves row (found: "BASH FIGHTER" and
+     "Nobody survived" both clipped by the Sound button at 390px). Give
+     every .screen the same reserved top gap in one place rather than
+     patching each heading -- .hero is a child of .screen but has no
+     top padding of its own at this breakpoint, so this is the only
+     source of clearance, not a stack. Mobile touch-quality pass,
+     2026-09-10. */
+  .screen {
+    padding-top: 56px;
+  }
+
+  #hud {
+    max-width: 55vw;
+    padding: 10px 12px;
+    font-size: 11px;
+  }
+
+  /* Timed Brawl end screen at phone width: one column (two would be
+     too narrow to read a name plus a score), and a shorter max-height
+     so the Play again button never gets pushed below the fold on a
+     390x844 screen. */
+  .tb-standings {
+    grid-template-columns: 1fr;
+    grid-auto-flow: row;
+    grid-template-rows: none;
+    width: 100%;
+    max-height: 52vh;
+  }
+
+  /* Narrower reserved sidebar on phone/tablet widths -- still real
+     space, not an overlay, so it composes with the #hud:has()/
+     #canvas-root rules above unchanged. */
+  :root {
+    --hud-sidebar-width: 128px;
+  }
+
+  .hud-list.compact .hud-card {
+    min-width: 62px;
+    padding: 4px 6px;
+  }
+
+  .hud-list.compact .hud-card .pct {
+    font-size: 18px;
+  }
+
+  /* At 128px sidebar width, two columns leave ~55px per card -- not
+     enough room for "#20 CPU Kestrel 100%" on one line. Drop to a
+     single column so the full row width is available for name+percent;
+     the list still scrolls (overflow-y: auto, unchanged) if 20 single
+     rows exceed the viewport height. */
+  .hud-list.dense {
+    grid-template-columns: 1fr;
+  }
+
+  .hud-list.dense .hud-card {
+    padding: 3px 6px;
+  }
+
+  .hud-list.dense .hud-card .fighter-name {
+    font-size: 10px;
+  }
+
+  .hud-list.dense .hud-card .pct {
+    font-size: 12px;
+  }
+
+  .touch-stick-base {
+    width: 108px;
+    height: 108px;
+  }
+
+  .touch-stick-nub {
+    width: 46px;
+    height: 46px;
+    margin-left: -23px;
+    margin-top: -23px;
+  }
+
+  .touch-buttons {
+    width: 174px;
+    height: 174px;
+  }
+
+  .touch-btn {
+    width: 58px;
+    height: 58px;
+    font-size: 10px;
+  }
+
+  /* Same fix as the main layout above, scaled to the 58px small-screen
+     button size: spacing must be >= 58px so adjacent circles are
+     tangent rather than overlapping. */
+  .touch-btn-jump { right: 0; bottom: 58px; }
+  .touch-btn-attack { right: 58px; bottom: 0; }
+  .touch-btn-special { right: 0; bottom: 0; }
+  .touch-btn-shield { right: 116px; bottom: 0; }
+
+  /* 2026-09-19: this used to target .match-overlay, which is the
+     full-screen inset:0 backdrop -- an over-constrained width that the
+     browser simply ignored, so the panel never shrank on a phone at all.
+     It is the panel that needs the narrower box. */
+  .match-overlay-panel, .win-panel {
+    width: min(92vw, 420px);
+    padding: 20px;
+  }
+
+  /* At the 128px phone sidebar, the single-column dense list (see
+     .hud-list.dense above) runs to 20 full rows and can use most of the
+     available height itself -- give the match-status block smaller
+     type and a shorter feed so mode/clock stay legible in whatever
+     space is left, rather than clipping silently. */
+  .match-status {
+    padding-bottom: 40px;
+  }
+
+  .match-status-mode {
+    font-size: 9px;
+  }
+
+  .match-status-clock {
+    font-size: 14px;
+  }
+
+  .elimination-feed-line {
+    font-size: 9px;
+  }
+
+  .elimination-feed-line:nth-child(n+3) {
+    display: none;
+  }
+}
+
+
+/* Landscape phones (~390-430px tall): the 20-card list took 55% of the
+   sidebar, so the clipped match-status block pushed "N KOs · Nth of 20"
+   under the fixed #net-status chip. A shorter (still scrollable) list and
+   smaller rules text keep the player's own standing visible. */
+@media (max-height: 500px) {
+  .hud-list.dense {
+    max-height: 40%;
+  }
+
+  .match-status-mode {
+    font-size: 9px;
+  }
+}
+
+/* Replay viewer (issue #3) */
+#replay-picker-back-btn {
+  margin-top: 0.5rem;
+}
+.replay-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin: 1rem 0;
+  max-width: 520px;
+}
+.replay-picker.hidden {
+  display: none;
+}
+.replay-fixture-card {
+  text-align: left;
+  padding: 0.75rem 1rem;
+}
+.replay-player {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 1rem;
+}
+.replay-player.hidden {
+  display: none;
+}
+.replay-canvas-mount {
+  width: 100%;
+  max-width: 960px;
+  /* Pixi's `resizeTo: parent` reads this element's box to size the
+     canvas. Without an explicit height the mount collapses to its
+     content (the canvas itself), so the canvas falls back to its
+     default 800x600 and the whole player -- picture, scrubber, Play
+     and Back buttons -- gets pushed hundreds of pixels below the
+     fold behind the heading and fixture list above it. A fixed
+     aspect-ratio box gives it a real height to resize into. */
+  aspect-ratio: 4 / 3;
+  max-height: 55vh;
+}
+.replay-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  width: 100%;
+  max-width: 960px;
+}
+.replay-controls input[type='range'] {
+  flex: 1;
+}
+.replay-tick-label {
+  font-variant-numeric: tabular-nums;
+  min-width: 8rem;
+  text-align: right;
+}
+
+/* Winner colour marker on the win screen: identifies the fighter without
+   colouring a display-size line of text. */
+.winner-dot {
+  display: inline-block;
+  width: 0.5em;
+  height: 0.5em;
+  margin-right: 0.4em;
+  vertical-align: 0.08em;
+  border-radius: 50%;
+}
+
+/* Escape hatch for a player who chose to keep watching after their own
+   elimination: small, out of the way, and always clickable. */
+.spectate-chip {
+  position: fixed;
+  right: 16px;
+  /* Clears the .debug-hint line (bottom: 12px, ~14px tall): found by
+     playing production, where the chip landed exactly on top of it. */
+  bottom: 38px;
+  z-index: 40;
+}
+
+/* The chip has to read as a button on top of a moving arena, so it carries
+   its own border and backing rather than relying on the plain-text style
+   used inside modals. */
+.spectate-chip .btn {
+  padding: 7px 14px;
+  font-size: 13px;
+  color: var(--ink);
+  background: rgba(14, 14, 14, 0.88);
+  border: 1px solid rgba(232, 230, 223, 0.28);
+  border-radius: 3px;
+}
+
+.spectate-chip .btn:hover,
+.spectate-chip .btn:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.spectate-chip.hidden {
+  display: none;
+}
+
+/* Account-free player feedback (2026-09-13) -- packages/app/src/ui/feedback-panel.ts.
+   Reuses the .move-reference-panel modal shell; only the parts specific
+   to the comment box / rating scale / status line live here. */
+.feedback-inner {
+  width: min(520px, 90vw);
+}
+
+.feedback-hint {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--ink-dim);
+  margin-bottom: 8px;
+}
+
+.feedback-textarea {
+  width: 100%;
+  min-height: 84px;
+  resize: vertical;
+  background: var(--bg);
+  color: var(--ink);
+  border: 1px solid #2c3037;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 10px 12px;
+  margin-bottom: 18px;
+  box-sizing: border-box;
+}
+
+.feedback-textarea:focus-visible {
+  outline: none;
+  border-color: var(--accent-2);
+}
+
+.feedback-ratings {
+  margin-bottom: 8px;
+}
+
+.feedback-rating-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px solid #23262b;
+  padding: 10px 0;
+}
+
+.feedback-ratings .feedback-rating-row:first-child {
+  border-top: none;
+}
+
+.feedback-rating-label {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  color: var(--ink-dim);
+  flex: 1;
+}
+
+.feedback-rating-scale {
+  display: flex;
+  gap: 4px;
+  flex: none;
+}
+
+.feedback-rating-btn {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-dim);
+  background: transparent;
+  border: 1px solid #2c3037;
+  width: 28px;
+  height: 28px;
+  cursor: pointer;
+}
+
+.feedback-rating-btn:hover {
+  border-color: var(--ink-dim);
+  color: var(--ink);
+}
+
+.feedback-rating-btn.selected {
+  color: var(--bg);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.feedback-status {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  min-height: 16px;
+  margin: 10px 0;
+}
+
+.feedback-status-ok {
+  color: var(--accent-2);
+}
+
+.feedback-status-error {
+  color: var(--danger);
+}
+
+.feedback-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.feedback-github-link {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--ink-dim);
+  text-decoration: underline;
+}
+
+.feedback-github-link:hover {
+  color: var(--ink);
+}
+
+/* The unobtrusive text entry points -- start screen and in-match HUD.
+   In-match, it lives inside #top-right-controls alongside the existing
+   mute/Controls/Moves buttons, which already wrap to avoid the debug
+   hint (bottom-right) and spectate chip -- see the overlap-measurement
+   test in feedback-panel.test.ts and the note on [[Client Traps Fixed
+   2026-09-11 Evening]] about this codebase's history of overlapping HUD
+   elements. */
+.feedback-link-btn {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--ink-dim);
+  background: transparent;
+  border: 1px solid #2c3037;
+  padding: 6px 12px;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.feedback-link-btn:hover,
+.feedback-link-btn:focus-visible {
+  color: var(--ink);
+  border-color: var(--ink-dim);
+}
+
+/* Prominent-but-not-pushy feedback invite on the win/Timed-Brawl end
+   screens -- the moment a player actually has an opinion. Amber is used
+   here only as the existing primary-action colour on the Submit button
+   inside the panel it opens, not as decoration on this block itself. */
+.feedback-end-screen-block {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid #23262b;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.feedback-end-screen-copy {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  color: var(--ink-dim);
+}
+
+/* Match intro -- names the fighter that belongs to you for the first
+   couple of seconds of play. Never interactive: pointer events pass
+   straight through to the game underneath. */
+.match-intro {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 22%;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+  z-index: 40;
+}
+
+.match-intro.hidden {
+  display: none;
+}
+
+.match-intro-card {
+  background: rgba(11, 13, 16, 0.82);
+  border: 1px solid #2a2f36;
+  border-left: 3px solid var(--accent);
+  padding: 14px 22px;
+  max-width: 26rem;
+  animation: match-intro-fade 2.6s ease-out forwards;
+}
+
+.match-intro-who {
+  margin: 0;
+  font-size: 1.35rem;
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.match-intro-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+.match-intro-hint {
+  margin: 6px 0 0;
+  font-size: 0.95rem;
+  color: var(--ink-dim);
+}
+
+@keyframes match-intro-fade {
+  0% { opacity: 0; }
+  8% { opacity: 1; }
+  80% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .match-intro-card { animation: none; }
+}
+
+/* ---- Phone widths: the world gets the screen -----------------------
+   2026-09-19. Three real non-QA touch sessions recorded 21-72s of match
+   time with literally zero input, so I measured the layout at the canvas
+   sizes those sessions reported (down to 256 CSS px wide) by loading
+   production inside a 256x493 iframe. Two defects, both fatal on a small
+   phone:
+
+   1. The dense HUD reserves a 128px column at <=700px. At 256px that is
+      half the screen handed to a 20-row leaderboard, leaving the game
+      128px wide.
+   2. Because the movement stick is shifted clear of that reserved column
+      (left: sidebar + 20px), at narrow widths it lands directly on top of
+      the Jump/Special/Attack buttons -- every drag to move also covered
+      the attack buttons, which is exactly what "zero input, felt buggy"
+      looks like from the outside.
+
+   The reserved column was the right call on a desktop (see the
+   #hud:has() rule above: an overlay hides whoever walks under it), but on
+   a phone the leaderboard is redundant -- each fighter already carries a
+   name+damage badge over its head, and the local player has the big
+   damage readout. So on phone widths the dense list goes away, the HUD
+   becomes a small non-interactive status overlay, the canvas takes the
+   full width, and the stick returns to the bottom-left corner. */
+@media (max-width: 480px) {
+  #app:has(.hud-list.dense) #canvas-root {
+    left: 0;
+  }
+
+  #app:has(.hud-list.dense) .touch-stick-base {
+    left: max(20px, env(safe-area-inset-left));
+  }
+
+  /* #top-right-controls wraps onto two rows at this width, and with the
+     reserved column gone the HUD status block sits directly under it, so
+     the status text has to start below the wrapped rows. */
+  #hud:has(.hud-list.dense) {
+    top: 80px;
+    bottom: auto;
+    max-height: 40vh;
+    overflow: hidden;
+    width: auto;
+    max-width: 62vw;
+    background: transparent;
+    border-right: 0;
+    padding: 10px 12px;
+    pointer-events: none;
+  }
+
+  .hud-list.dense {
+    display: none;
+  }
+
+  /* Without the reserved column the status text sits straight on the
+     arena, where it tangled with the fighters' own damage badges. A quiet
+     backdrop behind just the text keeps both readable, and the feed is
+     clamped to two lines so it cannot grow over the match. */
+  #hud:has(.hud-list.dense) .survivors-line,
+  #hud:has(.hud-list.dense) .hud-clock-line,
+  #hud:has(.hud-list.dense) .match-status {
+    background: rgba(11, 13, 16, 0.74);
+    border-radius: 4px;
+    padding: 4px 7px;
+    width: fit-content;
+  }
+
+  #hud:has(.hud-list.dense) .elimination-feed {
+    max-height: 2.6em;
+    overflow: hidden;
+  }
+
+  /* At 256px the 32px win headline ran off both edges of the screen and
+     the body copy sat hard against x=0. */
+  .win-headline {
+    font-size: 22px;
+    line-height: 1.2;
+  }
+
+  .screen {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+
+  /* The "You are X" card sat over the rules box in the HUD for its 2.6s;
+     drop it below the status block. */
+  .match-intro {
+    top: 30%;
+  }
+
+  /* The spectate chip's bottom-right corner is the action buttons on a
+     phone: playing at 256px it sat straight on Attack and Special. It goes
+     above the whole control block (104px of buttons plus their margin). */
+  .spectate-chip {
+    bottom: 132px;
+    right: 12px;
+    left: 12px;
+  }
+
+  /* After "Keep spectating" the rating leaves the HUD and sits on the chip. */
+  .elim-rating.elim-rating-docked {
+    top: auto;
+    bottom: 180px;
+  }
+
+  /* The elimination overlay used to take 414px of a 493px-tall phone
+     screen behind a near-opaque backdrop, so "keep watching this one play
+     out" was an empty offer -- and 71% of real sessions end at the
+     player's own elimination. On a phone it becomes a compact bottom
+     sheet with the match still visible above it. */
+  .match-overlay {
+    align-items: flex-end;
+    background: transparent;
+  }
+
+  .match-overlay-panel {
+    width: 100%;
+    padding: 14px 16px calc(14px + env(safe-area-inset-bottom));
+    border-left: 0;
+    border-right: 0;
+    border-bottom: 0;
+  }
+
+  .match-overlay-title {
+    font-size: 19px;
+    margin-bottom: 6px;
+  }
+
+  .match-overlay-message {
+    font-size: 13px;
+    line-height: 1.45;
+    margin-bottom: 14px;
+  }
+}
+
+/* Under ~330px the stick (108px) and the three-wide button cluster
+   (174px) cannot both fit beside the screen margins, so the buttons drop
+   to a 2x2 block. 52px circles with 52px spacing stay tangent, never
+   overlapping, and stay above the 44px minimum tap target. */
+@media (max-width: 330px) {
+  .touch-stick-base {
+    width: 92px;
+    height: 92px;
+  }
+
+  .touch-stick-nub {
+    width: 40px;
+    height: 40px;
+    margin-left: -20px;
+    margin-top: -20px;
+  }
+
+  .touch-buttons {
+    width: 104px;
+    height: 104px;
+  }
+
+  .touch-btn {
+    width: 52px;
+    height: 52px;
+    font-size: 9px;
+  }
+
+  .touch-btn-special { right: 0; bottom: 0; }
+  .touch-btn-attack { right: 52px; bottom: 0; }
+  .touch-btn-jump { right: 0; bottom: 52px; }
+  .touch-btn-shield { right: 52px; bottom: 52px; }
+}
+
+/* Pulses the touch Attack button until a newcomer's first attack. */
+.touch-btn.beckon {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 0 rgba(232, 178, 60, 0.6);
+  animation: touch-beckon 1.2s ease-out infinite;
+}
+@keyframes touch-beckon {
+  0% { box-shadow: 0 0 0 0 rgba(232, 178, 60, 0.6); }
+  100% { box-shadow: 0 0 0 14px rgba(232, 178, 60, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .touch-btn.beckon { animation: none; box-shadow: 0 0 0 3px var(--accent); }
+}
+
+/* Contextual attack hint for a first match -- ui/attack-hint.ts. */
+.attack-hint {
+  position: fixed;
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-family: var(--font-ui);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--ink);
+  background: rgba(20, 23, 27, 0.92);
+  border: 1px solid var(--accent);
+  padding: 10px 18px;
+  z-index: 30;
+  pointer-events: none;
+  animation: attack-hint-in 0.25s ease-out;
+}
+.attack-hint.hidden,
+.touch-attack-hint-label.hidden { display: none; }
+.attack-hint.reduced { animation: none; }
+@keyframes attack-hint-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.touch-btn.hinted {
+  border-color: var(--accent);
+  background: rgba(232, 178, 60, 0.22);
+  color: var(--ink);
+}
+.touch-attack-hint-label {
+  position: absolute;
+  right: 72px;
+  bottom: 72px;
+  white-space: nowrap;
+  text-align: center;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--ink);
+  background: rgba(20, 23, 27, 0.92);
+  border: 1px solid var(--accent);
+  padding: 6px 8px;
+  pointer-events: none;
+}
+
+/* Next-visit "why did you leave?" prompt: inline under Play, never modal. */
+.leave-prompt {
+  margin: 14px auto 0;
+  max-width: 420px;
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid #2c3037;
+  border-radius: 8px;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  color: var(--ink);
+  text-align: left;
+}
+.leave-prompt-thanks { text-align: center; color: var(--ink-dim); }
+.leave-prompt-head { display: flex; gap: 8px; justify-content: space-between; align-items: flex-start; }
+.leave-prompt-close {
+  background: none; border: 0; color: var(--ink-dim); font-size: 20px; line-height: 1;
+  cursor: pointer; padding: 0 4px; min-width: 32px; min-height: 32px;
+}
+.leave-prompt-close:hover { color: var(--ink); }
+.leave-prompt-chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.leave-prompt-chip {
+  font-family: inherit; font-size: 13px; color: var(--ink); background: transparent;
+  border: 1px solid #2c3037; border-radius: 999px; padding: 8px 12px; cursor: pointer;
+}
+.leave-prompt-chip[aria-pressed='true'] { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+.leave-prompt-row { display: flex; gap: 8px; }
+.leave-prompt-input {
+  flex: 1; min-width: 0; font-family: inherit; font-size: 14px; color: var(--ink);
+  background: var(--bg); border: 1px solid #2c3037; border-radius: 6px; padding: 8px 10px;
+}
+.leave-prompt-send {
+  font-family: inherit; font-size: 14px; font-weight: 600; color: var(--bg); background: var(--accent);
+  border: 0; border-radius: 6px; padding: 8px 16px; cursor: pointer;
+}
+.leave-prompt-send:disabled { opacity: 0.4; cursor: default; }
+
+/* A returning player already saw the attract match; keep Play and the leave prompt above the fold. */
+body:has(.leave-prompt) #attract-frame, body:has(.leave-prompt) .attract-caption { display: none; }
+
+/* One-tap match rating on the end screens. */
+.match-rating { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 8px; margin-top: 14px; font-size: 13px; color: var(--ink-dim); }
+.match-rating-btn {
+  font-family: var(--font-ui); font-size: 13px; color: var(--ink); background: transparent;
+  border: 1px solid #2c3037; padding: 6px 14px; cursor: pointer;
+}
+.match-rating-btn:hover { border-color: var(--ink-dim); }
+.match-rating-btn[aria-pressed='true'] { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+.match-rating-thanks { color: var(--ink-dim); }
+
+.ko-pop {
+  position: fixed;
+  left: 50%;
+  top: 38%;
+  transform: translate(-50%, -50%);
+  z-index: 60;
+  pointer-events: none;
+  font: 900 clamp(64px, 14vw, 140px) / 1 system-ui, sans-serif;
+  letter-spacing: 0.06em;
+  color: #e8b23c;
+  background: rgba(10, 10, 12, 0.72);
+  padding: 0.1em 0.35em;
+  animation: ko-pop 700ms ease-out forwards;
+}
+@keyframes ko-pop {
+  0% { transform: translate(-50%, -50%) scale(1.8); opacity: 0; }
+  15% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+  75% { opacity: 1; }
+  100% { transform: translate(-50%, -50%) scale(0.95); opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ko-pop { animation: ko-pop-fade 700ms linear forwards; }
+}
+@keyframes ko-pop-fade { 0%, 75% { opacity: 1; } 100% { opacity: 0; } }
+
+.tb-new-best {
+  color: #e8b23c;
+  font-size: 16px;
+}
+
+.tb-new-best.hidden {
+  display: none;
+}
+
+.waiting-goal {
+  font-size: 15px;
+  color: #e8b23c;
+}
+
+.waiting-goal:empty {
+  display: none;
+}
+
+.start-countdown {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 40%;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+  z-index: 45;
+}
+.start-countdown.hidden { display: none; }
+.start-countdown-text {
+  font: 900 clamp(64px, 12vw, 140px) / 1 system-ui, sans-serif;
+  letter-spacing: 0.06em;
+  color: #e8b23c;
+  background: rgba(10, 10, 12, 0.72);
+  padding: 0.05em 0.3em;
+  animation: start-countdown-pop 1000ms ease-out forwards;
+}
+.start-countdown-text.go { animation-name: start-countdown-go; }
+.start-countdown-text.reduced { animation: none; }
+.start-countdown-text.go.reduced { animation: start-countdown-fade 1000ms linear forwards; }
+@keyframes start-countdown-pop {
+  0% { transform: scale(1.5); opacity: 0; }
+  20% { transform: scale(1); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+}
+@keyframes start-countdown-go {
+  0% { transform: scale(1.5); opacity: 0; }
+  15% { transform: scale(1); opacity: 1; }
+  50% { opacity: 1; }
+  100% { transform: scale(1); opacity: 0; }
+}
+@keyframes start-countdown-fade { 0%, 50% { opacity: 1; } 100% { opacity: 0; } }
+/* Desktop exit-intent prompt (ui/exit-intent-prompt.ts): top centre, non-modal. */
+.exit-intent {
+  position: fixed;
+  top: 64px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 80;
+  width: min(440px, calc(100vw - 32px));
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  color: var(--ink);
+}
+.exit-intent-head { display: flex; gap: 8px; justify-content: space-between; align-items: flex-start; }
+.exit-intent-title { font-weight: 600; }
+.exit-intent-close { background: none; border: 0; color: var(--ink-dim); font-size: 18px; line-height: 1; cursor: pointer; }
+.exit-intent-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.elim-rating {
+  position: fixed;
+  top: 64px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 60;
+  width: min(360px, calc(100vw - 32px));
+  box-sizing: border-box;
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  color: var(--ink);
+}
+.elim-rating .exit-intent-body { margin-top: 10px; }
+/* One-tap rating (ui/quick-rating.ts): exit-intent prompt and end screens. */
+.exit-intent-body { margin-top: 10px; }
+.quick-rating { display: flex; flex-direction: column; gap: 8px; width: 100%; min-width: min(290px, 100vw - 32px); align-self: center; box-sizing: border-box; margin-top: 14px; }
+.exit-intent-body .quick-rating { margin-top: 0; }
+.quick-rating:not(.quick-rating-thanks) { flex-direction: row; }
+.quick-rating-btn {
+  flex: 1 1 0; min-width: 0; min-height: 52px; padding: 0 8px;
+  background: var(--panel); color: var(--ink); border: 1px solid var(--ink-dim);
+  border-radius: 8px; font: inherit; font-size: 16px; font-weight: 600; cursor: pointer;
+}
+.quick-rating-btn:hover { border-color: var(--accent); }
+.quick-rating-thanks-line { color: var(--ink-dim); text-align: center; }
+.quick-rating-followup { display: flex; gap: 8px; }
+.quick-rating-input {
+  flex: 1 1 auto; min-width: 0; min-height: 48px; padding: 0 10px; box-sizing: border-box;
+  background: var(--bg); color: var(--ink); border: 1px solid var(--ink-dim); border-radius: 8px; font: inherit; font-size: 16px;
+}
+.quick-rating-send {
+  min-height: 48px; padding: 0 16px; background: var(--accent); color: var(--bg);
+  border: 0; border-radius: 8px; font: inherit; font-weight: 600; cursor: pointer;
+}

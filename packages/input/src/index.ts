@@ -1,0 +1,214 @@
+// packages/input: translates raw browser input (keyboard + Gamepad API)
+// into the sim's InputFrame struct for two local players. Each player's
+// slot is either a keyboard binding or a connected gamepad; a gamepad only
+// takes priority over keyboard for a slot once it is actually producing
+// non-neutral input (see isNeutralFrame in gamepad.ts) -- mere presence of
+// an attached pad, or idle stick drift, is not enough (fixed 2026-09-14,
+// see wiki "Gamepad Priority Fix"). Below that, touch still always wins
+// while a control is actively held.
+import { fixed as fx, makeInputFrame, type InputFrame } from '@bash-fighter/sim';
+import { BUTTON_BY_FIELD, BUTTON_FIELDS, DEFAULT_P1_BINDING, DEFAULT_P2_BINDING, type BindingField, type KeyBinding } from './bindings.ts';
+import { codesForField, MOUSE_ATTACK_CODE, type KeyAliases } from './aliases.ts';
+import { KeyboardSource } from './keyboard.ts';
+import { pollGamepad, listConnectedGamepads, isNeutralFrame } from './gamepad.ts';
+import { TouchSource } from './touch.ts';
+
+export type { KeyBinding } from './bindings.ts';
+export {
+  DEFAULT_P1_BINDING,
+  DEFAULT_P2_BINDING,
+  cloneBinding,
+  BINDING_FIELDS,
+  BINDING_FIELD_LABELS,
+  loadPersistedBindings,
+  savePersistedBindings,
+  clearPersistedBindings,
+  type BindingField,
+  type PersistedBindings,
+} from './bindings.ts';
+export { ONLINE_ALIASES, MOUSE_ATTACK_CODE, codesForField, type KeyAliases } from './aliases.ts';
+export { shouldIgnoreKeydown } from './keyboard.ts';
+export { listConnectedGamepads, isNeutralFrame } from './gamepad.ts';
+export { isTouchCapable, TouchSource, type TouchButton } from './touch.ts';
+
+export interface PlayerSlotConfig {
+  binding: KeyBinding;
+  /** Gamepad index to prefer for this slot, or null for keyboard-only. */
+  gamepadIndex: number | null;
+  /** Extra keys that trigger an action in addition to `binding`. */
+  aliases?: KeyAliases;
+}
+
+/** Which real input source produced a given slot's most recent
+ *  InputFrame -- observed *usage*, not device capability. Used only for
+ *  the input-device usage counters in packages/app/src/session-report.ts;
+ *  has no effect on the sim. */
+export type InputSourceKind = 'touch' | 'gamepad' | 'keyboard';
+
+
+function keyboardFrame(kb: KeyboardSource, binding: KeyBinding, aliases?: KeyAliases): InputFrame {
+  const held = (field: BindingField): boolean => codesForField(binding, aliases, field).some((c) => kb.isDownForPoll(c));
+  let buttons = 0;
+  for (const field of BUTTON_FIELDS) {
+    if (held(field)) buttons |= BUTTON_BY_FIELD[field];
+  }
+  let stickX = 0;
+  let stickY = 0;
+  if (held('left')) stickX = fx.sub(stickX, fx.ONE);
+  if (held('right')) stickX = fx.add(stickX, fx.ONE);
+  if (held('down')) stickY = fx.sub(stickY, fx.ONE);
+  if (held('up')) stickY = fx.add(stickY, fx.ONE);
+  return makeInputFrame(buttons, stickX, stickY);
+}
+
+/** Owns the keyboard listener and per-slot config for two local players,
+ * and produces one InputFrame per slot per app frame. */
+export class InputManager {
+  private readonly keyboard = new KeyboardSource();
+  // Touch is keyed by slot rather than being a single global instance:
+  // in principle any local slot could get a touch source, though in
+  // practice only slot 0 (the local human on a touch device) ever will.
+  private readonly touch = new Map<number, TouchSource>();
+  // Last real source that produced each slot's InputFrame, keyed by
+  // slot index -- see InputSourceKind. Updated every pollSlot() call,
+  // read (not consumed) by the caller after poll(); a plain array, no
+  // allocation per tick.
+  private readonly lastSource: InputSourceKind[] = [];
+  // Local slots are an array, not a fixed pair: this milestone plays 2
+  // local humans, but nothing here assumes exactly 2 — a future local
+  // multi-controller session (or a networked FFA where only your own
+  // slot is local) just changes how many entries this holds.
+  readonly slots: PlayerSlotConfig[] = [
+    { binding: DEFAULT_P1_BINDING, gamepadIndex: 0 },
+    { binding: DEFAULT_P2_BINDING, gamepadIndex: 1 },
+  ];
+
+  attach(target: Window = window): void {
+    this.keyboard.attach(target);
+    target.addEventListener('blur', () => this.keyboard.reset());
+  }
+
+  detach(target: Window = window): void {
+    this.keyboard.detach(target);
+  }
+
+  setBinding(slot: number, binding: KeyBinding): void {
+    (this.slots[slot] as PlayerSlotConfig).binding = binding;
+  }
+
+  setAliases(slot: number, aliases: KeyAliases | undefined): void {
+    (this.slots[slot] as PlayerSlotConfig).aliases = aliases;
+  }
+
+  /** Treat a primary-button mouse press on `surface` (only when the press
+   * lands on a <canvas>, not on HUD buttons or overlays) as holding
+   * MOUSE_ATTACK_CODE. Touch and pen are ignored: touch has its own
+   * on-screen controls. Returns a function that removes the listeners. */
+  attachCanvasMouse(surface: HTMLElement, target: Window = window): () => void {
+    const onDown = (e: PointerEvent): void => {
+      if (e.pointerType !== 'mouse' || e.button !== 0) return;
+      if ((e.target as { tagName?: string } | null)?.tagName !== 'CANVAS') return;
+      this.keyboard.press(MOUSE_ATTACK_CODE);
+    };
+    const onUp = (e: PointerEvent): void => {
+      if (e.pointerType === 'mouse' && e.button === 0) this.keyboard.release(MOUSE_ATTACK_CODE);
+    };
+    surface.addEventListener('pointerdown', onDown);
+    target.addEventListener('pointerup', onUp);
+    target.addEventListener('pointercancel', onUp);
+    return () => {
+      surface.removeEventListener('pointerdown', onDown);
+      target.removeEventListener('pointerup', onUp);
+      target.removeEventListener('pointercancel', onUp);
+      this.keyboard.release(MOUSE_ATTACK_CODE);
+    };
+  }
+
+  setGamepadIndex(slot: number, gamepadIndex: number | null): void {
+    (this.slots[slot] as PlayerSlotConfig).gamepadIndex = gamepadIndex;
+  }
+
+  /** Which connected gamepads are currently unassigned to any slot, useful
+   * for a "press a button to claim a controller" prompt in the UI. */
+  unassignedGamepads(): number[] {
+    const assigned = new Set(this.slots.map((s) => s.gamepadIndex).filter((i): i is number => i !== null));
+    return listConnectedGamepads().filter((i) => !assigned.has(i));
+  }
+
+  /** Poll both slots for the current app frame. Call once per rendered
+   * frame; the app layer samples the latest returned pair on each fixed
+   * 60Hz sim tick (poll-and-hold, not per-tick re-polling of the DOM). */
+  poll(): InputFrame[] {
+    const frames = this.slots.map((_, i) => this.pollSlot(i));
+    this.keyboard.endPoll();
+    return frames;
+  }
+
+  /** Register (or clear, passing null) the touch source that should be
+   * checked for this slot. The app layer owns the actual on-screen
+   * elements and creates one TouchSource per slot that wants them (see
+   * packages/app/src/ui/touch-controls.ts); this just plugs it into the
+   * per-frame priority chain below. */
+  setTouchSource(slot: number, source: TouchSource | null): void {
+    if (source) this.touch.set(slot, source);
+    else this.touch.delete(slot);
+  }
+
+  private pollSlot(slot: number): InputFrame {
+    const cfg = this.slots[slot] as PlayerSlotConfig;
+    // Priority: an actively-touched on-screen control wins over both
+    // gamepad and keyboard for that slot this frame -- "whichever they
+    // touch takes over" (see touch.ts). The instant no finger is on a
+    // control, isActive() goes false and the very next frame falls
+    // straight back to gamepad/keyboard with no mode switch to manage.
+    //
+    // Below touch: gamepad beats keyboard only when the gamepad frame is
+    // non-neutral (isNeutralFrame, gamepad.ts) -- an attached-but-idle pad
+    // (or one sitting inside the deadzone) must not mask keyboard input.
+    // If neither the (non-neutral) gamepad nor the keyboard produced real
+    // input this frame, we still return the (neutral) keyboard frame, but
+    // deliberately do NOT overwrite lastSource: it keeps reporting the
+    // last source that actually produced input this session, rather than
+    // flapping to 'keyboard' on every idle frame.
+    const touchSource = this.touch.get(slot);
+    if (touchSource && touchSource.isActive()) {
+      this.lastSource[slot] = 'touch';
+      return touchSource.poll();
+    }
+    // A gamepad frame only outranks keyboard when it actually carries
+    // input (see isNeutralFrame): a pad that is merely attached, or one
+    // idling with a hair of stick drift the deadzone doesn't fully
+    // absorb, must not silently swallow the keyboard for this slot --
+    // that was the root cause of production's gamepad mis-attribution.
+    if (cfg.gamepadIndex !== null) {
+      const pad = pollGamepad(cfg.gamepadIndex);
+      if (pad && !isNeutralFrame(pad)) {
+        this.lastSource[slot] = 'gamepad';
+        return pad;
+      }
+    }
+    const kb = keyboardFrame(this.keyboard, cfg.binding, cfg.aliases);
+    // Semantics for a frame with no real input from anything this slot
+    // has: rather than flapping lastSource to 'keyboard' every neutral
+    // frame (which would make the usage counters look like everyone is
+    // a keyboard player even when they're mid-swing on a pad or just not
+    // touching anything yet), only update lastSource when the keyboard
+    // frame is itself non-neutral. If nothing has ever produced real
+    // input for this slot, lastSource[slot] stays unset and
+    // lastSourceForSlot() falls through to its documented 'keyboard'
+    // default -- so the *reported* value never changes here, only
+    // whether we bother to overwrite an already-real source.
+    if (!isNeutralFrame(kb)) {
+      this.lastSource[slot] = 'keyboard';
+    }
+    return kb;
+  }
+
+  /** Which source produced the given slot's InputFrame on the most
+   *  recent poll()/pollSlot() call -- 'keyboard' before any poll has
+   *  happened (the fallback source keyboardFrame() always resolves to
+   *  when nothing else claims the slot). See InputSourceKind. */
+  lastSourceForSlot(slot: number): InputSourceKind {
+    return this.lastSource[slot] ?? 'keyboard';
+  }
+}

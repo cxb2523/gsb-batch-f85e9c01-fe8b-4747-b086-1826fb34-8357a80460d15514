@@ -1,0 +1,41 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+
+// Source-level pins (no jsdom in this repo). The behaviour being protected:
+// doing nothing at the end of a match should lead back into a match, and a
+// player who is reading the standings must be able to stop that.
+const read = (rel: string): string => readFileSync(new URL(rel, import.meta.url), 'utf8');
+const auto = read('../src/ui/auto-continue.ts');
+const win = read('../src/ui/win-screen.ts');
+const timed = read('../src/ui/timed-brawl-end-screen.ts');
+const main = read('../src/main.ts');
+
+test('the countdown is cancelled by any interaction outside the button', () => {
+  assert.match(auto, /addEventListener\('pointerdown', this\.cancelOnInteraction\)/);
+  assert.match(auto, /addEventListener\('keydown', this\.cancelOnInteraction\)/);
+  assert.match(auto, /if \(event\.target instanceof Node && this\.button\.contains\(event\.target\)\) return;/);
+});
+
+test('both end screens start the countdown on show and cancel it on hide', () => {
+  for (const [name, src] of [['win', win], ['timed brawl', timed]] as const) {
+    assert.match(src, /if \(this\.autoContinueEnabled\) this\.autoContinue\.start\(\(\) => this.onRematch\(true\)\);/, name);
+    const hideBody = src.slice(src.indexOf('hide('));
+    assert.ok(
+      hideBody.indexOf('this.autoContinue.cancel();') < hideBody.indexOf("classList.add('hidden')"),
+      `${name}: hide() must cancel before hiding`,
+    );
+  }
+});
+
+test('only an online match the player actually played rolls into another one on its own', () => {
+  assert.match(main, /const playerWasActive = \(netMatch\?\.localInputTicks\(\) \?\? 1\) > 0;/);
+  assert.match(main, /timedBrawlEndScreen\.autoContinueEnabled = playerWasActive;/);
+  assert.match(main, /winScreen\.autoContinueEnabled = playerWasActive;/);
+  assert.match(main, /winScreen\.autoContinueEnabled = false;\s*\n\s*winScreen\.show\(winnerIndex, 0,/);
+});
+
+test('leftover match taps right after the end screen opens do not cancel the countdown', () => {
+  assert.match(auto, /CANCEL_GRACE_MS = 1500/);
+  assert.match(auto, /Date\.now\(\) - this\.startedAt < CANCEL_GRACE_MS\) return;/);
+});

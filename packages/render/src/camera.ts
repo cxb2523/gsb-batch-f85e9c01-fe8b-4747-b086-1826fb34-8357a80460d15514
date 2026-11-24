@@ -1,0 +1,567 @@
+// Frames the arena. The baseline view always shows the whole arena
+// (derived from whatever StageBounds/blast-zone data it is given, never a
+// hardcoded size) so a match reads as "a fight in an arena" even when
+// fighters are standing still near center; it only zooms in tighter when
+// fighters spread further apart than the arena's own footprint, and never
+// zooms out past maxScale even if a fighter is flying toward the blast
+// zone. Same function will frame 2 fighters on today's stage or 20 on a
+// much bigger one — it only ever reads positions + bounds, no fighter
+// count or stage size baked in.
+import { FIGHTER_WORLD_HEIGHT, MIN_FIGHTER_PX } from './fighter-scale.ts';
+
+export interface CameraView {
+  centerX: number;
+  centerY: number;
+  scale: number; // pixels per world unit
+  /** True when the min-fighter-size legibility floor (see
+   * applyMinFighterSizeFloor below) overrode the fit-everyone framing for
+   * this view. Optional and absent/false on every pre-existing call site's
+   * output -- added only for callers (the metrics script, tests) that want
+   * to report which path was taken; nothing reads it to change behaviour. */
+  minSizeFollow?: boolean;
+}
+
+export interface ArenaBounds {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+}
+
+export interface CameraConfig {
+  viewWidth: number;
+  /** Dev/QA override for the min-fighter-size legibility floor, in screen
+   * pixels. Omitted everywhere in normal play, where MIN_FIGHTER_PX applies.
+   * It exists because the floor only ever engages on viewports narrower or
+   * shorter than any real browser I can drive (the tooling refuses widths
+   * below 1024px and cannot initialise WebGL under phone emulation), so
+   * without it the follow path could only ever be verified in unit tests.
+   * The app wires it from ?minFighterPx= . */
+  minFighterPx?: number;
+  viewHeight: number;
+  minScale: number;
+  maxScale: number;
+  paddingWorld: number;
+  /** Full arena footprint (typically the blast zone) — the camera never
+   * frames tighter than this by default. */
+  arena: ArenaBounds;
+  /** True world edges the camera must never show dead space beyond
+   * (normally the live blast rect). Defaults to `arena` when omitted, so
+   * existing callers/tests keep their exact old behaviour.
+   *
+   * `arena` above is a *minimum zoom* floor -- on stages where the
+   * jump/fall headroom padding and the aspect-ratio correction in
+   * framing.ts's computeFramingFloor() make that floor's own box taller
+   * (or wider) than the fighters actually need, using `arena` for the
+   * *centering* clamp too forces the frame's center onto the padded
+   * floor box's own midpoint instead of following the fighters -- on a
+   * wide, short arena
+   * (e.g. battle-royale-20) this pins a ground-hugging 20-fighter pack
+   * to the bottom few percent of the screen, because the floor's
+   * vertical midpoint sits well above the ground where nothing is
+   * happening. Clamping against the true blast rect instead only ever
+   * prevents the frame from wandering past where a fighter could
+   * actually be, never forces it toward empty headroom. */
+  clampBounds?: ArenaBounds;
+}
+
+// Reduced-motion camera damping (issue #24). The existing "Reduce screen
+// shake" setting (packages/render/src/effects.ts) only suppressed hit
+// shake; it never touched the camera's own pan/zoom motion as the
+// collapsing arena shrinks or the framing box grows/shrinks with the
+// fighter spread, which can still be a fast, disorienting move for
+// motion-sensitive players. computeCamera() is called fresh every
+// render frame with no memory of the previous frame's view (it is a
+// pure function of the current positions/bounds), so damping has to
+// live here as module state: when enabled, each call is blended toward
+// the freshly computed "raw" target by a fixed fraction instead of
+// jumping straight to it, clamping the *rate* of pan/zoom change rather
+// than the value itself. This is a client-side rendering/easing change
+// only -- it never reads or writes any Sim state, so it cannot affect
+// determinism.
+let cameraReducedMotion = false;
+let smoothedView: CameraView | null = null;
+
+
+/** Time constants for the camera's follow damping, in milliseconds: the
+ * time it takes to close ~63% of the distance to a new target.
+ *
+ * Damping used to apply *only* when the reduced-motion setting was on;
+ * everyone else got a camera that jumped straight to a fresh target every
+ * frame. With twenty fighters that target is anything but stable -- the
+ * frame is derived from the outermost fighters, so every elimination,
+ * every fighter launched toward a blast zone and every scatter changes
+ * both the centre and the zoom discontinuously. The first real player
+ * feedback we ever received led with it: "Camera jerks around too much,
+ * like it has no idea who it should follow ... I had no idea what was
+ * going on." Damping is not an accessibility nicety here, it is the
+ * baseline. Reduced motion stays calmer still. */
+// Fraction of the half-view below the view centre at which the lowest
+// fighter is anchored (0.35 puts the ground ~65% down the screen); also the
+// lowest the followed local fighter may sit when a clamp pushes the view.
+const GROUND_BIAS = 0.35;
+const FOLLOW_TAU_MS = 90;
+const REDUCED_MOTION_TAU_MS = 260;
+/** A jump this large (in fractions of the view) is a cut, not a move: a
+ * new match, a stage change or a spectator switching whom they watch.
+ * Easing across it would look like a long, wrong slide. */
+const SNAP_DISTANCE_VIEWS = 1.5;
+
+/** Forget where the camera was, so the next frame starts exactly on its
+ * target instead of gliding in from a stale position. Call this whenever
+ * the thing being watched changes discontinuously. */
+export function resetCameraSmoothing(): void {
+  smoothedView = null;
+}
+
+export function setCameraReducedMotion(reduced: boolean): void {
+  cameraReducedMotion = reduced;
+  // Drop any in-progress smoothing state so re-enabling later starts
+  // fresh from wherever the camera actually is, rather than blending
+  // from a stale, possibly far-away point.
+  smoothedView = null;
+}
+
+export function isCameraReducedMotion(): boolean {
+  return cameraReducedMotion;
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
+}
+
+export function computeCamera(
+  positions: readonly { x: number; y: number }[],
+  cfg: CameraConfig,
+  dtMs = 1000 / 60,
+  localPlayerPos?: { x: number; y: number } | null,
+): CameraView {
+  const raw = computeRawCamera(positions, cfg, localPlayerPos);
+  if (smoothedView === null) {
+    smoothedView = raw;
+    return raw;
+  }
+  // Frame-rate independent easing: the same wall-clock time constant
+  // whether the device is managing 60fps or 15. A per-frame fraction
+  // (what the reduced-motion damping used to use) makes the camera crawl
+  // on a slow phone, which is exactly the device that can least afford
+  // a camera lagging behind the fight.
+  const tau = cameraReducedMotion ? REDUCED_MOTION_TAU_MS : FOLLOW_TAU_MS;
+  const dt = Math.max(0, Math.min(250, dtMs));
+  const t = 1 - Math.exp(-dt / tau);
+  const jumpX = Math.abs(raw.centerX - smoothedView.centerX) * raw.scale;
+  const jumpY = Math.abs(raw.centerY - smoothedView.centerY) * raw.scale;
+  if (
+    jumpX > cfg.viewWidth * SNAP_DISTANCE_VIEWS ||
+    jumpY > cfg.viewHeight * SNAP_DISTANCE_VIEWS
+  ) {
+    smoothedView = raw;
+    return raw;
+  }
+  smoothedView = containFighters(
+    {
+      centerX: lerp(smoothedView.centerX, raw.centerX, t),
+      centerY: lerp(smoothedView.centerY, raw.centerY, t),
+      scale: lerp(smoothedView.scale, raw.scale, t),
+    },
+    positions,
+    cfg,
+    raw.minSizeFollow ? (cfg.minFighterPx ?? MIN_FIGHTER_PX) / FIGHTER_WORLD_HEIGHT : undefined,
+  );
+  return raw.minSizeFollow ? { ...smoothedView, minSizeFollow: true } : smoothedView;
+}
+
+/**
+ * Smoothing must never hide a fighter.
+ *
+ * `computeRawCamera` returns the minimal frame that holds every living
+ * fighter, so easing toward it means that while the ease is in flight the
+ * frame can be *tighter* or *offset* from what the fight needs -- and a
+ * fighter, including your own, gets cut off at the screen edge. That was
+ * visible in production on 2026-09-14: the local fighter sat half outside
+ * the right edge with its name label clipped while the camera was still
+ * catching up.
+ *
+ * So the eased view is only a suggestion: the smooth centre is kept, and the
+ * zoom is pulled back by exactly as much as it takes for every fighter to
+ * still be inside the frame from where the camera currently sits. Lag costs
+ * a little zoom, never a fighter.
+ */
+function containFighters(
+  eased: CameraView,
+  positions: readonly { x: number; y: number }[],
+  cfg: CameraConfig,
+  /** Set when the raw target this frame is following the min-fighter-size
+   * legibility floor (computeRawCamera's applyMinFighterSizeFloor). Without
+   * this, containFighters zooms back out to keep every fighter on screen --
+   * exactly the framing the floor exists to override -- which would make
+   * the floor flicker in and out as soon as damping kicks in one frame
+   * after the initial snap. */
+  minSizeFloorScale?: number,
+): CameraView {
+  if (positions.length === 0) return eased;
+  const halfW = cfg.viewWidth / 2;
+  const halfH = cfg.viewHeight / 2;
+  // The fighters themselves plus room for the parts of them that are not
+  // the position point: a body is about two padding units tall and its
+  // name label sits above it and reads wider than the body, and deliberately far less than the raw camera's full
+  // framing rect. Containing that whole rect instead would be the same as
+  // having no damping at all: raw is the minimal frame at this aspect
+  // ratio, so demanding it be covered pins the eased view onto it exactly.
+  let needMinX = Infinity;
+  let needMaxX = -Infinity;
+  let needMinY = Infinity;
+  let needMaxY = -Infinity;
+  for (const p of positions) {
+    needMinX = Math.min(needMinX, p.x - cfg.paddingWorld * 1.5);
+    needMaxX = Math.max(needMaxX, p.x + cfg.paddingWorld * 1.5);
+    needMinY = Math.min(needMinY, p.y - cfg.paddingWorld * 2);
+    needMaxY = Math.max(needMaxY, p.y + cfg.paddingWorld * 2);
+  }
+
+  // Keep the eased centre -- that smooth pan is the whole point -- and buy
+  // the room it needs by zooming out just enough that everybody is still
+  // inside the frame from where the camera currently is. When the ease
+  // catches up, the required extent shrinks again and the zoom eases back
+  // in with it, so this shows up as the camera pulling back slightly during
+  // a fast reframe rather than as a cut or a clipped fighter.
+  const centerX = eased.centerX;
+  const centerY = eased.centerY;
+  const needHalfW = Math.max(centerX - needMinX, needMaxX - centerX);
+  const needHalfH = Math.max(centerY - needMinY, needMaxY - centerY);
+  // The floor here must match computeRawCamera's own floor, not a bare
+  // cfg.minScale. computeRawCamera legitimately zooms out past minScale
+  // (down to arenaFitScale) on any arena wider/taller than minScale would
+  // show, so the whole arena reads as "a fight in an arena" rather than a
+  // tight crop -- see computeRawCamera's `floor` line. Using cfg.minScale
+  // here instead re-clamped every damped frame after the first back up to
+  // minScale, discarding that wider fit: on battle-royale-20 (arenaFitScale
+  // ~0.87 at 1080x720, below minScale 1.6) the raw camera correctly framed
+  // the whole floor at scale 1.125, but containFighters forced every eased
+  // frame back to scale 1.6 -- a tighter zoom that no longer matched the
+  // vertical span the ground-anchor bias was computed against, pinning the
+  // fight into a band near the bottom edge. (Found by playing production
+  // and comparing against scripts/camera-framing-metrics.mjs -- see wiki
+  // "Camera Framing: Ground Anchor and Jump-Space Bias 2026-09-14".)
+  const arenaSpanX = Math.max(1, cfg.arena.maxX - cfg.arena.minX);
+  const arenaSpanY = Math.max(1, cfg.arena.maxY - cfg.arena.minY);
+  const arenaFitScale = Math.min(cfg.viewWidth / arenaSpanX, cfg.viewHeight / arenaSpanY);
+  const scaleFloor = Math.max(Math.min(cfg.minScale, arenaFitScale), minSizeFloorScale ?? 0);
+  const scale = Math.max(
+    scaleFloor,
+    Math.min(
+      eased.scale,
+      needHalfW > 0 ? halfW / needHalfW : eased.scale,
+      needHalfH > 0 ? halfH / needHalfH : eased.scale,
+    ),
+  );
+  return { centerX, centerY, scale };
+}
+
+/** The un-damped camera computation (previous `computeCamera` body,
+ * unchanged). Always call through `computeCamera` in render code so
+ * reduced-motion damping applies; this is exported only so tests can
+ * assert the raw target camera separately from the damped output. */
+/** The fit-everyone frame, before the min-fighter-size legibility floor
+ * (applyMinFighterSizeFloor) can override it. Exported so tests and
+ * scripts/camera-framing-metrics.mjs can report the "before" number
+ * separately from computeRawCamera's own (floor-applied) output --
+ * production code should call computeRawCamera, not this. */
+export function computeFitEveryoneCamera(
+  positions: readonly { x: number; y: number }[],
+  cfg: CameraConfig,
+): CameraView {
+  // Fighter-only bounding box (with padding). This — not a blend with the
+  // arena bounds — is what the camera centers on. Blending fighter
+  // positions into the arena's own min/max (the old approach) meant a
+  // single fighter near one edge only ever pushed that one side out,
+  // while the untouched side stayed pinned to the arena bound: the
+  // resulting center was dragged off the fighters' actual middle,
+  // producing an asymmetric, off-center frame on any stage where the
+  // arena itself isn't symmetric around the fighters (see the-spire).
+  let fMinX = Infinity;
+  let fMaxX = -Infinity;
+  let fMinY = Infinity;
+  let fMaxY = -Infinity;
+  for (const p of positions) {
+    fMinX = Math.min(fMinX, p.x - cfg.paddingWorld);
+    fMaxX = Math.max(fMaxX, p.x + cfg.paddingWorld);
+    fMinY = Math.min(fMinY, p.y - cfg.paddingWorld);
+    fMaxY = Math.max(fMaxY, p.y + cfg.paddingWorld * 1.5); // headroom for jumps
+  }
+  if (positions.length === 0) {
+    fMinX = cfg.arena.minX;
+    fMaxX = cfg.arena.maxX;
+    fMinY = cfg.arena.minY;
+    fMaxY = cfg.arena.maxY;
+  }
+
+  const fCenterX = (fMinX + fMaxX) / 2;
+  const fCenterY = (fMinY + fMaxY) / 2;
+  const fSpanX = Math.max(1, fMaxX - fMinX);
+  const fSpanY = Math.max(1, fMaxY - fMinY);
+
+  const arenaSpanX = Math.max(1, cfg.arena.maxX - cfg.arena.minX);
+  const arenaSpanY = Math.max(1, cfg.arena.maxY - cfg.arena.minY);
+  // The view must never be *smaller* than what the arena floor needs, so
+  // a couple of fighters standing close together still read as "a fight
+  // in an arena" rather than a tight, disorienting zoom. This is a size
+  // floor only — it does not pull the center toward the arena's own
+  // midpoint.
+  //
+  // ARENA-FLOOR OVERREACH CAP (empty-sky-at-20 pass, 2026-09-15): at a
+  // full/near-full lobby the fighters' own spread already reads as "a
+  // fight in a big arena" -- the floor exists for the *opposite* case
+  // (a couple of fighters clustered near the middle of a much bigger
+  // stage), which the population-aware shrink in framing.ts already
+  // handles by scaling the floor itself down as the count drops. On
+  // battle-royale-20 with 20 living fighters the un-shrunk floor (from
+  // the solid ground's own footprint, ~960 world units) is still ~24%
+  // wider than the actual 20-spawn spread (~774 units with padding) --
+  // dead margin nobody occupies, forced onto the *whole* screen because
+  // spanX/Y is a plain max(). That margin is a big deal specifically on
+  // a narrow phone viewport (measured: fighterPx 14.6 -> 17.6+ once
+  // removed, see scripts/camera-framing-metrics.mjs), where every extra
+  // world-unit of forced span comes straight out of on-screen fighter
+  // pixels. Capping the floor's contribution to a fixed multiple of the
+  // fighters' *own* spread -- only once the lobby is large enough that
+  // the fighters' spread is itself already arena-sized -- removes that
+  // unused margin without touching the low-population "still look like
+  // an arena" behaviour at all (small lobbies/endgames are below
+  // ARENA_FLOOR_SLACK_MIN_COUNT and keep the full, unslacked floor).
+  const ARENA_FLOOR_SLACK_MIN_COUNT = 12;
+  const ARENA_FLOOR_SLACK_FACTOR = 1.05;
+  // X-ONLY, on purpose (2026-09-15 follow-up): fSpanY reflects the
+  // fighters' *current* vertical spread, which is ~0 for a ground-
+  // hugging pack and only grows when someone actually jumps. Capping
+  // the Y floor the same way as X would tie JUMP_HEADROOM_WORLD/
+  // FALL_HEADROOM_WORLD's pre-reserved room (deliberately reserved so a
+  // jump doesn't cause a visible zoom/lurch, see framing.ts and "Camera
+  // Framing: Ground Anchor and Jump-Space Bias") to whatever the
+  // fighters happen to be doing this frame -- to the letter, it would
+  // shrink cappedArenaSpanY to ~fSpanY*1.05 (tens of world units)
+  // whenever the whole lobby is grounded, discarding the reserved
+  // headroom and inviting exactly the jump-triggered camera lurch that
+  // pass fixed. The X axis has no such headroom concept to protect --
+  // fighters don't need pre-reserved horizontal running room the way
+  // they need vertical jump room -- so only X is capped.
+  const cappedArenaSpanX =
+    positions.length >= ARENA_FLOOR_SLACK_MIN_COUNT
+      ? Math.min(arenaSpanX, fSpanX * ARENA_FLOOR_SLACK_FACTOR)
+      : arenaSpanX;
+  const spanX = Math.max(fSpanX, cappedArenaSpanX);
+  const spanY = Math.max(fSpanY, arenaSpanY);
+
+  const scaleX = cfg.viewWidth / spanX;
+  const scaleY = cfg.viewHeight / spanY;
+  let scale = Math.min(scaleX, scaleY);
+  const arenaFitScale = Math.min(cfg.viewWidth / arenaSpanX, cfg.viewHeight / arenaSpanY);
+  const floor = Math.min(cfg.minScale, arenaFitScale);
+  scale = Math.max(floor, Math.min(cfg.maxScale, scale));
+
+  // Center on the fighters, then clamp so the frame doesn't wander past
+  // the arena bounds and show dead space beyond them (e.g. show empty
+  // blast zone past the edge when the fighters are clustered near it).
+  const halfViewWorldX = cfg.viewWidth / 2 / scale;
+  const halfViewWorldY = cfg.viewHeight / 2 / scale;
+  let centerX = fCenterX;
+  // Vertical framing is deliberately NOT centered on the fighters' own
+  // midpoint. A platform fighter's action lives mostly above the floor
+  // (jump arcs, aerials, knockback, recoveries) -- only the pit below
+  // the floor matters, and only as somewhere fighters fall into, not
+  // somewhere play happens. Centering equally split the viewport and
+  // read as a big void below the fighters and (after the ground-anchor
+  // fix above) a merely-adequate amount of jump room above -- see
+  // GROUND_BIAS below.
+  //
+  // GROUND_BIAS pulls the center toward the *top* of the range that
+  // still keeps every fighter on screen, anchored on the lowest fighter
+  // (fMinY, i.e. the floor these fighters are standing/falling near)
+  // rather than the fighters' vertical midpoint. At GROUND_BIAS=0.4 the
+  // floor lands at roughly 70% down the viewport when the fighters are
+  // a ground-hugging pack with plenty of vertical slack to spare
+  // (derivation: groundFraction = 0.5 + GROUND_BIAS). The clamp two
+  // lines down into [fMaxY - halfViewWorldY, fMinY + halfViewWorldY] is
+  // exactly the same "never crop a living fighter" range the old
+  // fCenterY-based code used (that range's own midpoint IS fCenterY) --
+  // biasing only changes *where inside that always-safe range* the
+  // center sits, so it can never re-introduce the bottom-pinning bug
+  // (which came from a completely different clamp, against cfg.arena's
+  // own midpoint) and it automatically yields to full centering as
+  // fSpanY grows toward filling the viewport, because the safe range
+  // itself shrinks toward that single fCenterY point.
+  // DEAD-SPACE-BELOW-FLOOR PASS (2026-09-14): raised from 0.5 to 0.75,
+  // which pinned the ground line to ~87.5% down the viewport.
+  //
+  // EMPTY-SKY-AT-20 FOLLOW-UP (2026-09-15): 0.75 fixed the *below*-floor
+  // waste but over-corrected into a different complaint -- with the
+  // arena-floor/spawn-spread trims above already doing the real work of
+  // making fighters bigger, pinning the ground line at 87.5% down still
+  // read as "figures stuck along the bottom edge of a mostly empty
+  // screen" once fighters were actually large enough to judge the
+  // composition by (see the owner's review of after_desktop.png). The
+  // vertical *window* size itself (viewHeight/scale) doesn't change with
+  // this constant -- only where within that window the ground sits --
+  // so this cannot make fighters bigger or smaller, only better or
+  // worse *centered*. 0.35 lands the ground line at ~62-66% down instead
+  // (measured on battle-royale-20, both 1280x720 and 390x844) --
+  // fighters sit in roughly the lower-middle third with visible room on
+  // both sides of them, rather than jammed against one edge, while still
+  // leaving more room above than below (jumps go up, not down). Still
+  // picks a point *inside* the same never-crop-a-fighter safe range
+  // documented below -- changing this constant cannot by itself
+  // introduce cropping, jitter, or a second competing clamp.
+  // With no fighters at all (e.g. a spectator view before anyone has
+  // spawned) fMinY/fMaxY fall back to the whole arena above, and the
+  // "whole arena" framing should stay plainly centered rather than
+  // biased -- there is no ground-hugging pack to bias toward.
+  let centerY: number;
+  if (positions.length === 0) {
+    centerY = fCenterY;
+  } else {
+    const groundAnchoredCenterY = fMinY + GROUND_BIAS * halfViewWorldY;
+    centerY = Math.min(Math.max(groundAnchoredCenterY, fMaxY - halfViewWorldY), fMinY + halfViewWorldY);
+  }
+  // Only pull the center away from the fighters when the arena is
+  // actually too small to let it sit freely (the view would otherwise
+  // show dead space beyond the arena edge). When the arena fits inside
+  // the view on an axis, keep centering on the fighters themselves --
+  // forcing the center to the arena's own midpoint here (the previous
+  // behaviour) is what produced a large empty band on stages whose
+  // floor is wider than it is tall relative to the screen: the X axis
+  // picks the binding scale, which leaves Y with slack, and snapping
+  // to the arena's vertical midpoint then frames empty sky above a
+  // field of fighters clustered on the ground instead of the ground
+  // itself.
+  // Use >= (not strictly >) here: when the arena's own span exactly
+  // matches what the view can show (the common "camera holds the whole
+  // arena, no zoom-in" case -- e.g. a few fighters standing near the
+  // ground on a stage whose asymmetric fall/jump headroom box is exactly
+  // the view's own size), the valid center range collapses to a single
+  // point: the arena box's own center. With a strict >, that boundary
+  // case fell through to raw fighter-centroid centering instead, which
+  // ignores the asymmetric fall:jump headroom split framingFloor()
+  // deliberately built (arena boxes lean toward jump headroom above the
+  // ground, since jumps need more warning room than falls) and instead
+  // centers on the fighters' own (near-ground) mean position -- showing
+  // far more empty space below the ground than above it. This is what
+  // produced the "empty bottom third" dead-space defect on stages like
+  // the-foundry: the ground-hugging fighter cluster's centroid sits well
+  // below the arena box's own vertical middle.
+  const clamp = cfg.clampBounds ?? cfg.arena;
+  if (clamp.maxX - clamp.minX >= halfViewWorldX * 2) {
+    centerX = Math.min(Math.max(centerX, clamp.minX + halfViewWorldX), clamp.maxX - halfViewWorldX);
+  }
+  if (clamp.maxY - clamp.minY >= halfViewWorldY * 2) {
+    centerY = Math.min(Math.max(centerY, clamp.minY + halfViewWorldY), clamp.maxY - halfViewWorldY);
+    if (positions.length > 0) {
+      // A blast rect closed in just below the ground would otherwise push
+      // the view bottom up against it and park the ground on the screen's
+      // bottom edge; showing a little void beyond the rect is harmless.
+      centerY = Math.min(centerY, Math.max(fMinY + GROUND_BIAS * halfViewWorldY, fMaxY - halfViewWorldY));
+    }
+  }
+
+  return { centerX, centerY, scale };
+}
+
+export function computeRawCamera(
+  positions: readonly { x: number; y: number }[],
+  cfg: CameraConfig,
+  /** The local player's own position, so the min-fighter-size legibility
+   * floor below (MIN_FIGHTER_PX) can follow them specifically instead of
+   * the whole scattered pack once fit-everyone framing goes below it.
+   * `null`/omitted means spectating -- floor centers on the living
+   * centroid instead. Every existing call site omits this and keeps the
+   * exact fit-everyone behaviour whenever that framing is already at or
+   * above MIN_FIGHTER_PX (the default on desktop). */
+  localPlayerPos?: { x: number; y: number } | null,
+): CameraView {
+  const fitEveryone = computeFitEveryoneCamera(positions, cfg);
+  return applyMinFighterSizeFloor(fitEveryone, cfg, positions, localPlayerPos);
+}
+
+// MIN-FIGHTER-SIZE LEGIBILITY FLOOR (2026-09-19): fit-everyone framing
+// (everything above) is right for the common case, but with a full
+// 20-fighter lobby spread across an arena on a narrow/short phone
+// viewport it drives the scale down far enough that a fighter renders
+// only ~12.5-17.6px tall (measured by scripts/camera-framing-metrics.mjs;
+// desktop 1280x720 measures 41-58px on the same stages -- fine). Two real
+// players rated camera readability 1/5. Below MIN_FIGHTER_PX, fitting
+// everyone stops being the goal: raise the scale to exactly the minimum
+// legible size and follow the local player (or, when spectating, the
+// living centroid) instead, accepting that some fighters fall outside
+// the frame. This never changes GROUND_BIAS, the arena floor, or any
+// existing constant above -- it only ever overrides their *output* when
+// that output would be unreadably small, which is why desktop (already
+// well above the floor) is completely unaffected.
+function applyMinFighterSizeFloor(
+  fitEveryone: CameraView,
+  cfg: CameraConfig,
+  positions: readonly { x: number; y: number }[],
+  localPlayerPos?: { x: number; y: number } | null,
+): CameraView {
+  const minSizeScale = (cfg.minFighterPx ?? MIN_FIGHTER_PX) / FIGHTER_WORLD_HEIGHT;
+  if (positions.length === 0 || fitEveryone.scale >= minSizeScale) return fitEveryone;
+
+  const scale = minSizeScale;
+  let centerX: number;
+  let centerY: number;
+  if (localPlayerPos) {
+    centerX = localPlayerPos.x;
+    centerY = localPlayerPos.y;
+  } else {
+    // Spectating (no local player): center on the living fighters'
+    // centroid rather than any one of them.
+    let sumX = 0;
+    let sumY = 0;
+    for (const p of positions) {
+      sumX += p.x;
+      sumY += p.y;
+    }
+    centerX = sumX / positions.length;
+    centerY = sumY / positions.length;
+  }
+
+  // Same clamp this whole function's caller already used above, at the
+  // new (larger) scale -- the raised-scale view must never show anything
+  // outside the stage blast rect either.
+  const clamp = cfg.clampBounds ?? cfg.arena;
+  const halfViewWorldX = cfg.viewWidth / 2 / scale;
+  const halfViewWorldY = cfg.viewHeight / 2 / scale;
+  if (clamp.maxX - clamp.minX >= halfViewWorldX * 2) {
+    centerX = Math.min(Math.max(centerX, clamp.minX + halfViewWorldX), clamp.maxX - halfViewWorldX);
+  } else {
+    centerX = (clamp.minX + clamp.maxX) / 2;
+  }
+  if (clamp.maxY - clamp.minY >= halfViewWorldY * 2) {
+    centerY = Math.min(Math.max(centerY, clamp.minY + halfViewWorldY), clamp.maxY - halfViewWorldY);
+  } else {
+    centerY = (clamp.minY + clamp.maxY) / 2;
+  }
+
+  // The blast-rect clamp is only about not showing void; it must not park
+  // the followed fighter on the bottom row when the rect has closed in
+  // just below the ground.
+  if (localPlayerPos) {
+    const subjectY = Math.min(Math.max(localPlayerPos.y, clamp.minY), clamp.maxY);
+    centerY = Math.min(centerY, subjectY - cfg.paddingWorld + GROUND_BIAS * halfViewWorldY);
+  }
+
+  return { centerX, centerY, scale, minSizeFollow: true };
+}
+
+/** Convert a world point (Y-up) to screen pixels (Y-down) given a camera
+ * and the render surface size. */
+export function worldToScreen(
+  x: number,
+  y: number,
+  cam: CameraView,
+  viewWidth: number,
+  viewHeight: number,
+): { x: number; y: number } {
+  return {
+    x: viewWidth / 2 + (x - cam.centerX) * cam.scale,
+    y: viewHeight / 2 - (y - cam.centerY) * cam.scale,
+  };
+}

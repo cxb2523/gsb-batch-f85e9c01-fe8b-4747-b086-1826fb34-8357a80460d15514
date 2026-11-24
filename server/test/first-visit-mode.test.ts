@@ -1,0 +1,156 @@
+// First-time-visitor mode rule (2026-09-20): a fresh match created for a
+// joining human who did NOT arrive via auto-requeue always runs Timed
+// Brawl (timedKO), because Battle Royale often eliminates a newcomer in
+// well under a minute and ends their session, while Timed Brawl respawns
+// them for the whole match. A requeued join ("Play again") keeps the
+// normal rotation. See mode-rotation.ts (decideMatchModeForJoin) and
+// rooms.ts (joinLobby).
+//
+// No server/websocket/port needed here: decideMatchModeForJoin is pure,
+// and the RoomManager tests below drive joinLobby() in-process exactly
+// like mode-rotation.test.ts's existing RoomManager test.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { decideMatchModeForJoin, decideMatchMode, FIRST_MATCH_TIME_LIMIT_TICKS } from '../src/mode-rotation.ts';
+import { RoomManager } from '../src/rooms.ts';
+import { rookieScaleForMatchesPlayed, ROOKIE_KNOCKBACK_SCALE } from '@bash-fighter/sim/src/index.ts';
+
+test('decideMatchModeForJoin: a non-requeued (first-time) join forces timedKO regardless of rotation position', () => {
+  for (let matchNumber = 1; matchNumber <= 8; matchNumber++) {
+    const decision = decideMatchModeForJoin(matchNumber, false);
+    assert.equal(decision.winCondition, 'timedKO');
+    assert.equal(decision.timeLimitTicks, FIRST_MATCH_TIME_LIMIT_TICKS);
+  }
+});
+
+test('decideMatchModeForJoin: a requeued join follows the normal rotation, unchanged', () => {
+  for (let matchNumber = 1; matchNumber <= 8; matchNumber++) {
+    assert.deepEqual(decideMatchModeForJoin(matchNumber, true), decideMatchMode(matchNumber));
+  }
+});
+
+test('decideMatchModeForJoin: forcing timedKO for one matchNumber does not shift what other matchNumbers get', () => {
+  // matchNumber 3 is naturally timedKO already in the default rotation;
+  // matchNumber 1 is naturally battleRoyale. Forcing #1 via a non-requeued
+  // join must not change what #2, #3, #4... decide -- decideMatchMode is
+  // pure over matchNumber alone, so a requeued lookup afterwards must
+  // match the untouched rotation exactly.
+  decideMatchModeForJoin(1, false);
+  decideMatchModeForJoin(1, false);
+  decideMatchModeForJoin(1, false);
+  const modes = Array.from({ length: 8 }, (_, i) => decideMatchModeForJoin(i + 1, true).winCondition);
+  assert.deepEqual(modes, [
+    'battleRoyale', 'battleRoyale', 'timedKO', 'stocks',
+    'battleRoyale', 'battleRoyale', 'timedKO', 'stocks',
+  ]);
+});
+
+test('decideMatchModeForJoin: the rotation kill switch (env-disabled) overrides the first-time-visitor rule', () => {
+  // disabled=true pins every match to battleRoyale, including a
+  // non-requeued first-time join -- the operator's explicit override wins.
+  for (let matchNumber = 1; matchNumber <= 5; matchNumber++) {
+    const decision = decideMatchModeForJoin(matchNumber, false, undefined, true);
+    assert.equal(decision.winCondition, 'battleRoyale');
+    assert.equal(decision.timeLimitTicks, undefined);
+  }
+});
+
+test('RoomManager: a fresh match created for a non-requeued join runs Timed Brawl', () => {
+  const noopEvents = () => ({ onSnapshot: () => {}, onEliminated: () => {} });
+  const manager = new RoomManager(noopEvents, /* capacity */ 2, /* minimum */ 2);
+  const first = manager.joinLobby('a', undefined, false, undefined, false);
+  const second = manager.joinLobby('b', undefined, false, undefined, false);
+  assert.equal(first.match.id, second.match.id);
+  assert.equal(first.match.winCondition, 'timedKO');
+  // First-match knockout boost: both non-requeued humans are rookies.
+  assert.deepEqual(first.match.getClientSettings()?.rookieSlots, [0, 1]);
+  first.match.stop();
+});
+
+test('RoomManager: a fresh match created for a requeued join follows the rotation (battleRoyale first)', () => {
+  const noopEvents = () => ({ onSnapshot: () => {}, onEliminated: () => {} });
+  const manager = new RoomManager(noopEvents, /* capacity */ 2, /* minimum */ 2);
+  const first = manager.joinLobby('a', undefined, false, undefined, true);
+  const second = manager.joinLobby('b', undefined, false, undefined, true);
+  assert.equal(first.match.id, second.match.id);
+  assert.equal(first.match.winCondition, 'battleRoyale');
+  assert.deepEqual(first.match.getClientSettings()?.rookieSlots, []);
+  first.match.stop();
+});
+
+test('RoomManager: matchesPlayed=1 tapers the rookie scale below the first-match boost', () => {
+  // Tapered first-matches knockout boost (2026-09-26): a seat reporting
+  // one prior match gets the tapered step, not the 2.6x
+  // first-match value and not the 1.0x cliff match 2 used to get.
+  const noopEvents = () => ({ onSnapshot: () => {}, onEliminated: () => {} });
+  const manager = new RoomManager(noopEvents, /* capacity */ 2, /* minimum */ 2);
+  const first = manager.joinLobby('a', undefined, false, undefined, true, undefined, 1);
+  manager.joinLobby('b', undefined, false, undefined, true, undefined, 1);
+  const settings = first.match.getClientSettings();
+  assert.deepEqual(settings?.rookieSlots, [0, 1]);
+  const expected = rookieScaleForMatchesPlayed(1);
+  assert.notEqual(expected, ROOKIE_KNOCKBACK_SCALE);
+  assert.notEqual(expected, 1 << 16);
+  assert.deepEqual(settings?.rookieScales, [expected, expected]);
+  first.match.stop();
+});
+
+test('RoomManager: garbage matchesPlayed is clamped/ignored, falling back to requeued-based behaviour', () => {
+  // The client field is sanitised in protocol.ts before it ever reaches
+  // here, so joinLobby only ever sees a clean int or undefined -- this
+  // documents that an out-of-range value the sanitiser lets through
+  // unclamped (defensive: rookieScaleForMatchesPlayed itself clamps) still
+  // resolves to the fully-decayed 1.0x scale rather than throwing or
+  // indexing out of bounds.
+  const noopEvents = () => ({ onSnapshot: () => {}, onEliminated: () => {} });
+  const manager = new RoomManager(noopEvents, /* capacity */ 2, /* minimum */ 2);
+  const first = manager.joinLobby('a', undefined, false, undefined, false, undefined, 99999);
+  manager.joinLobby('b', undefined, false, undefined, false, undefined, 99999);
+  const settings = first.match.getClientSettings();
+  assert.deepEqual(settings?.rookieScales, [1 << 16, 1 << 16]);
+  first.match.stop();
+});
+
+test('RoomManager: only the requesting join matters, not who else is already in the lobby', () => {
+  // A lobby is already "filling" when the second joiner (non-requeued)
+  // arrives -- joinLobby only decides the mode when it creates a FRESH
+  // match, on the first joiner into that match. This documents that: the
+  // second joiner's requeued flag is irrelevant once the match already
+  // exists.
+  const noopEvents = () => ({ onSnapshot: () => {}, onEliminated: () => {} });
+  const manager = new RoomManager(noopEvents, /* capacity */ 3, /* minimum */ 3);
+  const first = manager.joinLobby('a', undefined, false, undefined, true); // requeued: rotation -> battleRoyale
+  const second = manager.joinLobby('b', undefined, false, undefined, false); // not requeued, but lobby already exists
+  const third = manager.joinLobby('c', undefined, false, undefined, false);
+  assert.equal(first.match.id, second.match.id);
+  assert.equal(first.match.id, third.match.id);
+  assert.equal(first.match.winCondition, 'battleRoyale');
+  first.match.stop();
+});
+
+test('RoomManager: a re-queued newcomer (fewer than 3 matches played) still gets Timed Brawl', () => {
+  const noopEvents = () => ({ onSnapshot: () => {}, onEliminated: () => {} });
+  for (const played of [1, 2]) {
+    const manager = new RoomManager(noopEvents, 2, 2);
+    const { match } = manager.joinLobby('a', undefined, false, undefined, true, undefined, played);
+    manager.joinLobby('b', undefined, false, undefined, true, undefined, played);
+    assert.equal(match.plannedWinCondition, 'timedKO', `matchesPlayed=${played}`);
+    match.stop();
+  }
+});
+
+test('RoomManager: a fresh visitor\'s first match fills to 8 fighters, a normal room to 20', () => {
+  const noopEvents = () => ({ onSnapshot: () => {}, onEliminated: () => {} });
+  const manager = new RoomManager(noopEvents);
+  const first = manager.joinLobby('newcomer', undefined, false, undefined, false, undefined, 0);
+  assert.equal(first.match.capacity, 8);
+  manager.startNow(first.match);
+  assert.equal(first.match.filledSlots, 8);
+  first.match.stop();
+
+  const normal = manager.joinLobby('regular', undefined, false, undefined, true, undefined, 5);
+  assert.equal(normal.match.capacity, 20);
+  manager.startNow(normal.match);
+  assert.equal(normal.match.filledSlots, 20);
+  normal.match.stop();
+});
