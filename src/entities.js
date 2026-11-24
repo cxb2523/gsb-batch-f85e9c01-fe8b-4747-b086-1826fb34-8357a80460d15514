@@ -271,6 +271,10 @@ export class Enemy {
         this.size = type.size;
         this.maxHp = type.hp * hpMult;
         this.hp = this.maxHp;
+        // iter-21: explicit lifecycle flag. takeDamage flips this at hp <= 0
+        // so weapon/spatial candidate filters can reject corpses before the
+        // main loop splices them from `game.enemies`.
+        this.dead = false;
         this.speed = type.speed;
         this.damage = type.damage * dmgMult;
         this.expValue = type.exp;
@@ -441,6 +445,9 @@ export class Enemy {
     }
 
     takeDamage(damage) {
+        // iter-21: corpses no longer absorb follow-up damage from the delayed
+        // nova pulse, chain hops or additional same-frame collisions.
+        if (this.dead) return;
         let dmg = damage;
         if (this.shielded && this.shieldHp > 0) {
             const reduction = this.type.damageReduction ?? 0.5;
@@ -453,6 +460,10 @@ export class Enemy {
         }
         this.hp -= dmg;
         this.flashTimer = 0.08;
+        if (this.hp <= 0) {
+            this.hp = 0;
+            this.dead = true;
+        }
     }
 
     render(ctx) {

@@ -29,11 +29,18 @@ export class SpatialHash {
         /** @type {Map<string, Array<object>>} */
         this.map = new Map();
         this._size = 0;
+        // iter-21: remembers which bucket an item was inserted into so
+        // `remove(item)` can drop the stale reference in O(bucket) even after
+        // the item's `.x/.y` have moved (the tracked key still points at the
+        // bucket that physically owns the reference).
+        /** @type {WeakMap<object, string>} */
+        this._keys = new WeakMap();
     }
 
     /** Empty every bucket. Cheap and allocation-free. */
     clear() {
         this.map.clear();
+        this._keys = new WeakMap();
         this._size = 0;
     }
 
@@ -57,13 +64,192 @@ export class SpatialHash {
             this.map.set(k, bucket);
         }
         bucket.push(item);
+        this._keys.set(item, k);
         this._size++;
     }
 
     /** Bulk-insert after a `clear()`. */
     insertAll(items) {
         this.clear();
+        if (!items || typeof items[Symbol.iterator] !== 'function') return;
         for (const it of items) this.insert(it);
+    }
+
+    /**
+     * iter-21: remove one item reference from the index. Safe to call after
+     * the item has already moved — the insertion key tracked in `_keys`
+     * identifies the bucket that physically contains the reference. Also
+     * scrubs the bucket at the item's *current* coordinates as a fallback
+     * for indexes built/mutated by older code paths.
+     *
+     * Accepts either `remove(item)` or the coordinate-first
+     * `remove(x, y, item)` form for compatibility with other grid-hash APIs.
+     *
+     * @returns {boolean} true when at least one reference was removed.
+     */
+    remove(itemOrX, maybeY, maybeItem) {
+        let item = itemOrX;
+        if (
+            (itemOrX === null || typeof itemOrX !== 'object') &&
+            maybeItem &&
+            typeof maybeItem === 'object'
+        ) {
+            // remove(x, y, item) calling convention.
+            item = maybeItem;
+        }
+        if (!item || typeof item !== 'object') return false;
+
+        const keys = new Set();
+        const tracked = this._keys.get(item);
+        if (tracked !== undefined) keys.add(tracked);
+        keys.add(this._key(item.x, item.y));
+        if (typeof itemOrX === 'number' && typeof maybeY === 'number') {
+            keys.add(this._key(itemOrX, maybeY));
+        }
+
+        let removed = 0;
+        for (const k of keys) removed += this._removeFromBucket(item, k);
+        this._keys.delete(item);
+        return removed > 0;
+    }
+
+    /** Remove every strict-equal occurrence of `item` from one bucket. */
+    _removeFromBucket(item, k) {
+        const bucket = this.map.get(k);
+        if (!bucket) return 0;
+        let removed = 0;
+        for (let i = bucket.length - 1; i >= 0; i--) {
+            if (bucket[i] === item) {
+                bucket.splice(i, 1);
+                removed++;
+                this._size--;
+            }
+        }
+        if (bucket.length === 0) this.map.delete(k);
+        return removed;
+    }
+
+    /**
+     * iter-21: re-index an item after its `.x/.y` changed. Equivalent to
+     * `remove(item); insert(item)`. Items not currently indexed are inserted.
+     * Numeric extra arguments are treated as new coordinates:
+     * `update(item, x, y)` assigns them before re-indexing.
+     */
+    update(item, x, y) {
+        if (!item || typeof item !== 'object') return;
+        if (Number.isFinite(x)) item.x = x;
+        if (Number.isFinite(y)) item.y = y;
+        this.remove(item);
+        this.insert(item);
+    }
+
+    /** Alias for {@link SpatialHash.update} used by movement code. */
+    move(item, x, y) {
+        this.update(item, x, y);
+    }
+
+    /**
+     * Drop every entry for which `shouldRemove(item)` is truthy. Returns the
+     * number of removed references. `retain(isLive)` is the inverse filter.
+     */
+    prune(shouldRemove) {
+        if (typeof shouldRemove !== 'function') return 0;
+        let removed = 0;
+        for (const [k, bucket] of this.map) {
+            for (let i = bucket.length - 1; i >= 0; i--) {
+                const item = bucket[i];
+                let stale = false;
+                try {
+                    stale = !!shouldRemove(item);
+                } catch {
+                    stale = true;
+                }
+                if (stale) {
+                    bucket.splice(i, 1);
+                    this._size--;
+                    this._keys.delete(item);
+                    removed++;
+                }
+            }
+            if (bucket.length === 0) this.map.delete(k);
+        }
+        return removed;
+    }
+
+    /** Keep only entries for which `isLive(item)` is truthy. */
+    retain(isLive) {
+        if (typeof isLive !== 'function') return 0;
+        return this.prune((item) => !isLive(item));
+    }
+
+    /**
+     * Rebuild the index from `items` (alias of `insertAll`) and return `this`
+     * for fluent call sites that want `hash.sync(enemies).queryRect(...)`.
+     */
+    sync(items) {
+        this.insertAll(items || []);
+        return this;
+    }
+
+    /** Alias of {@link SpatialHash.sync}. */
+    rebuild(items) {
+        this.insertAll(items || []);
+        return this;
+    }
+
+    /** @alias remove */
+    delete(itemOrX, maybeY, maybeItem) {
+        return this.remove(itemOrX, maybeY, maybeItem);
+    }
+
+    /** @alias remove */
+    removeItem(item) {
+        return this.remove(item);
+    }
+
+    /** @alias remove (enemy-lifecycle naming used by the game loop) */
+    removeEnemy(item) {
+        return this.remove(item);
+    }
+
+    /** Insert a single enemy-shaped item. @alias insert */
+    insertEnemy(item) {
+        return this.insert(item);
+    }
+
+    /** @alias update */
+    updateItem(item, x, y) {
+        this.update(item, x, y);
+    }
+
+    /** @alias update (enemy-lifecycle naming used by the game loop) */
+    updateEnemy(item, x, y) {
+        this.update(item, x, y);
+    }
+
+    /** @alias update */
+    moveItem(item, x, y) {
+        this.update(item, x, y);
+    }
+
+    /** @alias update */
+    relocate(item, x, y) {
+        this.update(item, x, y);
+    }
+
+    /** @alias update */
+    reindex(item, x, y) {
+        this.update(item, x, y);
+    }
+
+    /**
+     * Polymorphic refresh: `refresh(itemsArray)` rebuilds from a roster,
+     * while `refresh(item)` re-indexes a single moved item.
+     */
+    refresh(target, x, y) {
+        if (Array.isArray(target)) return this.sync(target);
+        this.update(target, x, y);
+        return undefined;
     }
 
     /** @deprecated alias kept for backwards compatibility with v2.x callers. */

@@ -17,6 +17,103 @@
 
 import { Mine, OrbitShard, Projectile } from './entities.js';
 
+/**
+ * iter-21: decide whether a spatial-hash candidate is still a valid target.
+ * The broad-phase index is a performance structure, not the authoritative
+ * roster: after an enemy dies / is spliced from `game.enemies` (or simply
+ * flagged dead pending removal) its reference can linger in a bucket for a
+ * frame or in hand-built test indexes. Every weapon damage path funnels
+ * through this guard so stale references can never absorb damage or emit
+ * hit particles.
+ *
+ * @param {object} e candidate enemy-like object.
+ * @param {Set<object>|null} [roster] set built from the CURRENT
+ *     `game.enemies`; when present, reference membership is required.
+ * @returns {boolean}
+ */
+export function isActiveEnemy(e, roster = null) {
+    if (!e || typeof e !== 'object') return false;
+    // Explicit lifecycle flags used across the codebase / test doubles.
+    if (e.dead === true || e.removed === true || e.shouldRemove === true || e._removed === true) {
+        return false;
+    }
+    if (e.alive === false || e.active === false) return false;
+    if (typeof e.isDead === 'function' && e.isDead()) return false;
+    if (typeof e.isAlive === 'function' && e.isAlive() === false) return false;
+    // Enemy.takeDamage leaves dead foes at hp <= 0 until the main loop
+    // splices them; never damage the corpse a second time.
+    if (Number.isFinite(e.hp) && e.hp <= 0) return false;
+    if (roster && !roster.has(e)) return false;
+    return true;
+}
+
+/**
+ * Build a Set of the current enemy roster, or `null` when the game exposes
+ * no array (defensive — unit scaffolds sometimes provide only a hash).
+ */
+function buildRoster(game) {
+    return game && Array.isArray(game.enemies) ? new Set(game.enemies) : null;
+}
+
+/**
+ * Resolve the validated broad-phase candidates around `(x, y)`: queries
+ * `game.spatial` when available, otherwise scans `game.enemies`. Every result
+ * is filtered through {@link isActiveEnemy} against the CURRENT roster and
+ * de-duplicated (a reference can occur twice if a caller double-indexed).
+ *
+ * The exact range check is still the caller's responsibility — queryRect is
+ * a broad phase and may return neighbours outside the requested radius.
+ *
+ * @returns {object[]} fresh array of valid enemy references.
+ */
+export function queryActiveEnemies(game, x, y, radius) {
+    const roster = buildRoster(game);
+    const hasRoster = Array.isArray(game?.enemies);
+    let candidates;
+    const hash = game?.spatial;
+    // A present-but-completely-empty index paired with a non-empty roster
+    // means the broad phase was never populated (minimal unit scaffolds).
+    // Fall back to the authoritative roster instead of hiding every target.
+    const indexUnpopulated =
+        hash &&
+        typeof hash.queryRect === 'function' &&
+        typeof hash.size === 'number' &&
+        hash.size === 0 &&
+        hasRoster &&
+        game.enemies.length > 0;
+    if (hash && typeof hash.queryRect === 'function' && !indexUnpopulated) {
+        candidates = hash.queryRect(x, y, radius);
+    } else {
+        candidates = hasRoster ? game.enemies : [];
+    }
+    const out = [];
+    const seen = new Set();
+    for (const e of candidates) {
+        if (!isActiveEnemy(e, roster)) continue;
+        if (seen.has(e)) continue;
+        seen.add(e);
+        out.push(e);
+    }
+    return out;
+}
+
+/**
+ * Roster/liveness-safe equivalent of `spatial.findNearestEnemy(...)`.
+ * Returns the closest valid enemy strictly within `maxRange`, or `null`.
+ */
+function findActiveNearestEnemy(game, x, y, maxRange) {
+    let best = null;
+    let bestD = maxRange;
+    for (const e of queryActiveEnemies(game, x, y, maxRange)) {
+        const d = Math.hypot(e.x - x, e.y - y);
+        if (d < bestD) {
+            bestD = d;
+            best = e;
+        }
+    }
+    return best;
+}
+
 export class Weapon {
     constructor(def) {
         this.def = def;
@@ -152,10 +249,9 @@ export class Weapon {
         // sweep instead of walking every enemy. With 200 enemies on screen
         // the linear scan was ~200 hypot calls per fire — the hash trims it
         // to whatever lives in the overlapping cells (typically <30 in a
-        // forest spawn cluster).
-        const candidates = game?.spatial
-            ? game.spatial.queryRect(player.x, player.y, Math.max(range, 40))
-            : game.enemies;
+        // forest spawn cluster). iter-21: results are roster/liveness
+        // validated so stale hash references cannot be hit after death.
+        const candidates = queryActiveEnemies(game, player.x, player.y, Math.max(range, 40));
         for (const enemy of candidates) {
             const dx = enemy.x - player.x;
             const dy = enemy.y - player.y;
@@ -185,7 +281,8 @@ export class Weapon {
         if (this.isEvolved() && this.id === 'knife') count = Math.max(count, 5);
         if (this.isEvolved() && this.id === 'magic_wand') count += 2;
         const spreadDeg = count > 1 ? (this.isEvolved() ? 24 : 14) : 0;
-        const target = game.spatial.findNearestEnemy(player.x, player.y, this.getRange(player));
+        // iter-21: never seed a projectile from a stale spatial reference.
+        const target = findActiveNearestEnemy(game, player.x, player.y, this.getRange(player));
         if (!target) return;
         const base = Math.atan2(target.y - player.y, target.x - player.x);
         for (let i = 0; i < count; i++) {
@@ -210,9 +307,8 @@ export class Weapon {
         const baseDmg = this.getDamage(player);
         // iter-16 perf: spatial probe + materialise into an array (we still
         // need indexed access for the random-pick loop and the chain hops).
-        const candIter = game?.spatial
-            ? game.spatial.queryRect(player.x, player.y, range)
-            : game.enemies;
+        // iter-21: validated against the current roster/liveness.
+        const candIter = queryActiveEnemies(game, player.x, player.y, range);
         const targets = [];
         for (const e of candIter) {
             if (Math.hypot(e.x - player.x, e.y - player.y) < range) targets.push(e);
@@ -247,10 +343,9 @@ export class Weapon {
                     // a per-hop spatial probe of the same radius is the
                     // exact set we want. Drops chain cost from O(C × N) to
                     // O(C × cells_in_180px) which is small-constant on
-                    // even the densest waves.
-                    const hopCands = game?.spatial
-                        ? game.spatial.queryRect(current.x, current.y, 180)
-                        : game.enemies;
+                    // even the densest waves. iter-21: stale references are
+                    // filtered before they can absorb chain damage.
+                    const hopCands = queryActiveEnemies(game, current.x, current.y, 180);
                     for (const e of hopCands) {
                         if (chained.has(e)) continue;
                         const d = Math.hypot(e.x - current.x, e.y - current.y);
@@ -275,9 +370,8 @@ export class Weapon {
         const dmg = this.getDamage(player);
         // iter-16 perf: cells overlapping the aura radius only. Aura is
         // called every cooldown tick (~1s default) so the savings stack up.
-        const candidates = game?.spatial
-            ? game.spatial.queryRect(player.x, player.y, range)
-            : game.enemies;
+        // iter-21: roster/liveness validated like every other query path.
+        const candidates = queryActiveEnemies(game, player.x, player.y, range);
         for (const enemy of candidates) {
             const d = Math.hypot(enemy.x - player.x, enemy.y - player.y);
             if (d < range) enemy.takeDamage(dmg);
@@ -329,10 +423,10 @@ export class Weapon {
         // iter-16 perf: spatial probe instead of a full enemy walk. Nova has
         // a fairly wide range (~range+nova default), so several cells are
         // visited each fire — but in dense waves this still shaves >70%
-        // of the per-enemy hypot() calls.
-        const candidates = game?.spatial
-            ? game.spatial.queryRect(player.x, player.y, range)
-            : game.enemies;
+        // of the per-enemy hypot() calls. iter-21: candidates are validated
+        // against the current roster/liveness so stale buckets cannot hit
+        // dead/removed enemies.
+        const candidates = queryActiveEnemies(game, player.x, player.y, range);
         for (const enemy of candidates) {
             const d = Math.hypot(enemy.x - player.x, enemy.y - player.y);
             if (d < range) {
@@ -354,19 +448,41 @@ export class Weapon {
             const r = range;
             const d2 = baseDmg * 0.6;
             game.effects?.schedule?.(0.4, () => {
-                if (!game.player || game.player.dead) return;
-                // iter-16 perf: spatial probe for the delayed pulse too —
-                // by the time it fires the enemy roster may have grown,
-                // and the linear scan was the dominant cost on tundra
-                // when the player held an evolved nova during a heavy wave.
-                const cands = game?.spatial
-                    ? game.spatial.queryRect(player.x, player.y, r)
-                    : game.enemies;
-                for (const e of cands) {
-                    const d = Math.hypot(e.x - player.x, e.y - player.y);
-                    if (d < r) e.takeDamage(d2);
+                // Requirement: if the hero died during the delay window the
+                // follow-up never executes (no damage, no particles). Check
+                // both the authoritative `dead` flag and hp <= 0 for scaffolds
+                // that simulate lethal damage without flipping the flag.
+                if (!game || !game.player || game.player.dead === true || game.player.hp <= 0) {
+                    return;
                 }
-                game.createParticles(player.x, player.y, '#88ccff', 16);
+
+                // Re-resolve candidates AT TRIGGER TIME from the current
+                // enemy set. Rebuild the broad-phase index from the live
+                // roster first so movement across cells and deaths/removals
+                // since the main pulse cannot leave stale buckets behind.
+                // Full rebuild is O(n) and runs at most once per 0.4s pulse.
+                if (game.spatial && typeof game.spatial.insertAll === 'function') {
+                    if (Array.isArray(game.enemies)) game.spatial.insertAll(game.enemies);
+                }
+
+                const hits = [];
+                for (const e of queryActiveEnemies(game, player.x, player.y, r)) {
+                    const d = Math.hypot(e.x - player.x, e.y - player.y);
+                    if (d < r) hits.push(e);
+                }
+                if (hits.length === 0) return;
+
+                for (const e of hits) {
+                    e.takeDamage(d2);
+                    // Hit feedback is emitted only for validated, current
+                    // targets — a dead/removed reference never reaches here.
+                    // `createParticles` is the weapon-layer spark pool and
+                    // `effects.hit` feeds the effects-layer HitBursts; both are
+                    // optional so minimal unit scaffolds stay silent.
+                    game.createParticles?.(e.x, e.y, '#88ddff', 6);
+                    game.effects?.hit?.(e.x, e.y, '170,221,255');
+                }
+                game.createParticles?.(player.x, player.y, '#88ccff', 16);
             });
         }
         game.audio?.shoot?.();
@@ -383,9 +499,9 @@ export class Weapon {
         const steal = this.def.lifestealPct ?? 0.25;
         const targetCount = this.isEvolved() ? 2 : 1;
         const targets = [];
-        // Pick nearest N enemies within range.
-        const nearby = game.enemies
-            .filter((e) => Math.hypot(e.x - player.x, e.y - player.y) < range)
+        // Pick nearest N enemies within range. iter-21: skip dead/removed.
+        const nearby = (Array.isArray(game.enemies) ? game.enemies : [])
+            .filter((e) => isActiveEnemy(e) && Math.hypot(e.x - player.x, e.y - player.y) < range)
             .sort(
                 (a, b) =>
                     Math.hypot(a.x - player.x, a.y - player.y) -

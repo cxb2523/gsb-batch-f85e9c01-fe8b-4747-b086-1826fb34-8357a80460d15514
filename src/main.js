@@ -557,6 +557,9 @@ export class Game {
         this.gameTime = 0;
         this.kills = 0;
         this.enemies = [];
+        // iter-21: drop prior-run references from the broad-phase index until
+        // the first update() rebuilds it from the fresh roster.
+        this.spatial?.clear();
         this.projectiles = [];
         this.enemyProjectiles = [];
         this.expOrbs = [];
@@ -1104,6 +1107,14 @@ export class Game {
             this._renderTutorialBanner();
         }
 
+        // iter-21: rebuild the spatial index from the CURRENT roster BEFORE
+        // player weapons query it. The previous frame's `_updateEnemies` has
+        // already moved/spliced enemies, so this guarantees weapon fire never
+        // sees a reference that died or was removed and also picks up the
+        // latest positions. `_updateEnemies` then incrementally re-indexes
+        // movement/removals for the downstream projectile/mine queries.
+        this.spatial.insertAll(this.enemies);
+
         this.player.update(dt, this);
         if (this.player.dead) {
             this.gameOver();
@@ -1124,8 +1135,8 @@ export class Game {
             }
         }
 
-        // Spatial hash rebuild BEFORE anyone queries it.
-        this.spatial.insertAll(this.enemies);
+        // Spatial hash was rebuilt before `player.update`; `_updateEnemies`
+        // keeps it incrementally consistent as enemies move and get removed.
 
         this._updateEnemies(dt, hpMult, dmgMult);
         this._updateProjectiles(dt);
@@ -1235,6 +1246,10 @@ export class Game {
         for (let i = this.enemies.length - 1; i >= 0; i--) {
             const e = this.enemies[i];
             e.update(dt, this);
+            // iter-21: track movement in the broad-phase index so queries
+            // made after enemy movement (projectile/mine collision) cannot
+            // miss an enemy that crossed a cell boundary.
+            this.spatial?.update?.(e);
 
             const dx = e.x - this.player.x;
             const dy = e.y - this.player.y;
@@ -1252,11 +1267,15 @@ export class Game {
             if (e.hp <= 0) {
                 this._onEnemyKilled(e, hpMult, dmgMult);
                 this.enemies.splice(i, 1);
+                // iter-21: drop the stale bucket reference immediately so no
+                // later query this frame can target the removed enemy.
+                this.spatial?.remove?.(e);
                 continue;
             }
 
             if (d > CONFIG.DESPAWN_RADIUS && !e.boss) {
                 this.enemies.splice(i, 1);
+                this.spatial?.remove?.(e);
             }
         }
     }
@@ -1295,15 +1314,17 @@ export class Game {
                 const n = e.type.splitCount || 2;
                 for (let k = 0; k < n; k++) {
                     const a = (k / n) * Math.PI * 2;
-                    this.enemies.push(
-                        new Enemy(
-                            e.x + Math.cos(a) * 14,
-                            e.y + Math.sin(a) * 14,
-                            childDef,
-                            hpMult,
-                            dmgMult
-                        )
+                    const child = new Enemy(
+                        e.x + Math.cos(a) * 14,
+                        e.y + Math.sin(a) * 14,
+                        childDef,
+                        hpMult,
+                        dmgMult
                     );
+                    this.enemies.push(child);
+                    // iter-21: index split children immediately so projectile
+                    // queries later this same frame can find them.
+                    this.spatial?.insert?.(child);
                 }
             }
         }
@@ -1322,6 +1343,12 @@ export class Game {
             const range = p.size + 32;
             for (const enemy of this.spatial.queryRect(p.x, p.y, range)) {
                 if (p.hitEnemies.has(enemy)) continue;
+                // iter-21: an enemy killed earlier this frame (hp <= 0 but not
+                // spliced until the next _updateEnemies) must not absorb more
+                // projectiles or emit extra hit feedback.
+                if (enemy.dead === true || enemy.shouldRemove === true || enemy.hp <= 0) {
+                    continue;
+                }
                 const d = Math.hypot(p.x - enemy.x, p.y - enemy.y);
                 if (d < enemy.size + p.size) {
                     let dmg = p.damage;

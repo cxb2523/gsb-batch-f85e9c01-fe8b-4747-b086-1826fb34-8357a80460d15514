@@ -124,8 +124,11 @@ test('daily: dailyChallenge is deterministic per date and pins a stage', () => {
 
 test('daily: saveDailyResult persists and prunes old days (>14d)', () => {
     _resetDailyForTests();
+    // Relative to the live UTC clock so the recent entry never ages out of
+    // the 14-day pruning window regardless of when the suite runs.
+    const recent = todayKey();
     saveDailyResult({
-        date: '2026-04-25',
+        date: recent,
         stage: 'forest',
         timeSurvived: 600,
         kills: 500,
@@ -148,7 +151,7 @@ test('daily: saveDailyResult persists and prunes old days (>14d)', () => {
         seed: 1
     });
     const h = loadDailyHistory();
-    assert.ok(h['2026-04-25-forest'], 'today entry should be present');
+    assert.ok(h[`${recent}-forest`], 'recent entry should be present');
     assert.equal(h[`${ancient}-forest`], undefined, 'entries older than 14 days should be pruned');
 });
 
