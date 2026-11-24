@@ -1,0 +1,51 @@
+import { VideoController } from './videoController';
+
+// The native browser video controller.
+export class NativeVideoController extends VideoController {
+    //#region Control
+
+    public create() {
+        // The controls in Chrome are higher than in Firefox.
+        const controlHeight = window.chrome ? 70 : 40;
+
+        this.createVideoControlBackground();
+        this.adjustVideoControlHeight(controlHeight);
+        this.updateControlBarVisibility();
+
+        // Re-enable pointer events on the video element
+        if (this.videoElement) {
+            this.videoElement.style.pointerEvents = 'all';
+        }
+    }
+
+    public remove() {
+        super.remove();
+
+        if (this.videoElement) {
+            this.videoElement.style.pointerEvents = '';
+        }
+    }
+
+    //#endregion Control
+
+    //#region Events
+
+    public override onPlay() {}
+    public override onPause() {}
+    public override onTimeUpdate() {}
+    public override onVolumeChange() {}
+    public override onPlaybackSpeedChange() {}
+    public override onFullscreenChange() {}
+    public override onPictureInPictureChange() {}
+
+    public onUpdateSettings() {
+        this.updateControlBarVisibility();
+    }
+
+    protected setVisibility(visibility: boolean) {
+        if (!this.videoElement) return;
+        this.videoElement.controls = visibility;
+    }
+
+    //#endregion Events
+}

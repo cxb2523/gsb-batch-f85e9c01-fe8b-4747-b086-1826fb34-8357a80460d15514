@@ -1,0 +1,169 @@
+.ivc-controls {
+    background: linear-gradient(
+        0deg,
+        rgba(0, 0, 0, 0.5) 0%,
+        rgba(0, 0, 0, 0) 100%
+    );
+
+    position: absolute;
+    height: 32px;
+    left: 0;
+    right: 0;
+    bottom: 0;
+
+    /* Allow click-through for the control bar, so the user can access the video context menu between the elements.  */
+    pointer-events: none;
+}
+
+.ivc-controls.ivc-reel {
+    background: rgba(0, 0, 0, 0.35);
+}
+
+.ivc-controls.ivc-story {
+    background: rgba(38, 38, 38, 0.6);
+}
+
+.ivc-controls-content {
+    display: flex;
+    flex-direction: row;
+
+    /* Limit the with and center the controls for full screen */
+    max-width: 640px;
+    margin: 0 auto;
+
+    height: 100%;
+    padding: 0 4px;
+
+    opacity: 100%;
+    transition: opacity 0.2s ease-in-out;
+}
+
+.ivc-controls.hidden .ivc-controls-content {
+    opacity: 0;
+}
+
+.ivc-control-element {
+    position: relative;
+    margin: 4px 0;
+
+    /* Enable pointer events for the elements again. */
+    pointer-events: initial;
+}
+
+.ivc-icon-button {
+    background: transparent;
+    border: none;
+    outline: none;
+
+    color: #ffffff;
+    text-shadow: 0 0 2px rgba(0, 0, 0, 0.5);
+    font-weight: bold;
+
+    cursor: pointer;
+    padding: 2px 4px;
+}
+
+.ivc-icon-button img {
+    width: 20px;
+    height: 20px;
+}
+
+.ivc-control-text {
+    flex: 0 0 80px;
+    margin: 8px 0;
+    text-align: center;
+    font-size: 0.9em;
+
+    color: #ffffff;
+    text-shadow: 0 0 2px rgba(0, 0, 0, 0.5);
+}
+
+.ivc-control-bar {
+    padding: 10px 5px;
+
+    cursor: pointer;
+
+    overflow: hidden;
+    transition-property: flex-basis, padding, margin;
+    transition-duration: 0.2s;
+    transition-timing-function: ease-in-out;
+}
+
+.ivc-control-bar.hidden {
+    flex-basis: 0;
+    padding-left: 0;
+    padding-right: 0;
+    margin-right: 0;
+    margin-left: 0;
+}
+
+.ivc-control-bar-background {
+    background: rgba(0, 0, 0, 0.2);
+    box-shadow: 0 0 2px rgba(255, 255, 255, 0.5);
+
+    border-radius: 4px;
+    box-sizing: border-box;
+    width: 100%;
+    height: 100%;
+}
+
+.ivc-control-bar-progress {
+    background: rgba(255, 255, 255, 0.8);
+
+    width: 0;
+    height: 100%;
+
+    border-radius: 4px;
+}
+
+.ivc-seek-bar {
+    flex: 1;
+}
+
+.ivc-volume-bar {
+    flex: 0 0 48px;
+}
+
+.ivc-control-dropdown {
+    position: absolute;
+    bottom: 100%;
+    left: 50%;
+    transform: translate(-50%, 0);
+
+    max-height: 250px;
+    overflow-y: hidden;
+
+    padding: 2px;
+    z-index: 9999;
+
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(5px);
+
+    text-align: center;
+    font-weight: lighter;
+    font-size: 0.8em;
+
+    transition-property: max-height, padding;
+    transition-duration: 0.2s;
+    transition-timing-function: ease-in-out;
+}
+
+.ivc-control-dropdown.hidden {
+    max-height: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+}
+
+.ivc-control-dropdown li {
+    padding: 2px 6px;
+    border-radius: 4px;
+}
+
+.ivc-control-dropdown li.active {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.ivc-control-dropdown li:hover {
+    background: rgba(255, 255, 255, 0.2);
+}

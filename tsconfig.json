@@ -1,0 +1,15 @@
+{
+    "compilerOptions": {
+        "target": "ES2022",
+        "module": "CommonJS",
+        "rootDir": "./src/ts/",
+        "outDir": "./dist/js/",
+        "sourceMap": true,
+        "types": ["chrome", "firefox-webext-browser"],
+        "typeRoots": ["./node_modules/@types", "./src/ts/types"],
+        "esModuleInterop": true,
+        "forceConsistentCasingInFileNames": true,
+        "strict": true,
+        "skipLibCheck": true
+    }
+}
