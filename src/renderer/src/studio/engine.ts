@@ -200,7 +200,6 @@ export class StudioEngine implements StudioEngineApi {
   private mode: PlayMode = 'loop'
   private cycle: CycleRange | null = null
   private songStart = 0
-  private songPlaybackStart = 0
   private bpm = 120
   private swing = 0
   private metronome = false
@@ -717,12 +716,23 @@ export class StudioEngine implements StudioEngineApi {
   }
 
   setMode(mode: PlayMode): void {
+    // stop() tears down any queued song-end task, so a switch mid-playback can
+    // never fire onSongEnd from the mode we are leaving.
     if (this.playingFlag) this.stop()
     this.mode = mode
   }
 
   setCycle(cycle: CycleRange | null): void {
     this.cycle = cycle
+    if (!this.ctx || !this.playingFlag || this.mode !== 'song') return
+    // A cycle turned on mid-playback must cancel a pending end; a cycle turned
+    // off must re-evaluate the timeline and re-arm an end if we are already at
+    // (or past) the last audible clip. Recomputing from scratch keeps exactly
+    // one end task alive.
+    this.clearSongEndTimeout()
+    this.scheduledSteps.length = 0
+    this.nextStepTime = Math.max(this.nextStepTime, this.ctx.currentTime + 0.02)
+    this.schedulerTick()
   }
 
   seek(step: number): void {
@@ -730,10 +740,11 @@ export class StudioEngine implements StudioEngineApi {
     if (!this.ctx || !this.playingFlag || this.mode !== 'song') return
     this.allNotesOff()
     this.stopChops()
+    // Drop every task queued for the old position — including a pending song
+    // end — so the recomputed timeline is the only source of callbacks.
     this.clearStepTimeouts()
     this.scheduledSteps.length = 0
     this.nextStep = this.songStart
-    this.songPlaybackStart = this.songStart
     this.nextStepTime = this.ctx.currentTime + 0.05
     this.schedulerTick()
   }
@@ -757,9 +768,11 @@ export class StudioEngine implements StudioEngineApi {
     void this.ctx.resume()
     this.playingFlag = true
     this.nextStep = this.mode === 'loop' ? 0 : this.songStart
-    this.songPlaybackStart = this.nextStep
     this.nextStepTime = this.ctx.currentTime + 0.05
     this.scheduledSteps.length = 0
+    // Always begin a run with no leftover end task; the end is recomputed
+    // against the current project, mode, cycle and playhead below.
+    this.clearSongEndTimeout()
     this.schedulerTick()
     this.schedulerTimer = setInterval(() => this.schedulerTick(), LOOKAHEAD_MS)
   }
@@ -778,6 +791,14 @@ export class StudioEngine implements StudioEngineApi {
   private clearStepTimeouts(): void {
     for (const timeout of this.stepTimeouts) clearTimeout(timeout)
     this.stepTimeouts.clear()
+    this.songEndTimeout = null
+  }
+
+  /** Cancel only a pending song-end task, leaving scheduled step callbacks alone. */
+  private clearSongEndTimeout(): void {
+    if (this.songEndTimeout === null) return
+    clearTimeout(this.songEndTimeout)
+    this.stepTimeouts.delete(this.songEndTimeout)
     this.songEndTimeout = null
   }
 
@@ -810,12 +831,17 @@ export class StudioEngine implements StudioEngineApi {
         step = ((step % LOOP_STEPS) + LOOP_STEPS) % LOOP_STEPS
       } else {
         const cycle = this.validCycle()
-        if (cycle && step >= cycle.end) step = cycle.start
-        const audibleTime = this.nextStepTime + (step % 2 === 1 ? this.swing * stepDuration : 0)
-        const songEnd = this.getSongEnd()
-        if (!cycle && step >= songEnd && this.songPlaybackStart < songEnd) {
-          this.scheduleSongEnd(audibleTime)
-          return
+        if (cycle) {
+          // CYCLE owns the boundary: wrap inside the range forever and never end.
+          if (step >= cycle.end) step = cycle.start
+        } else {
+          const songEnd = this.getSongEnd()
+          if (step >= songEnd) {
+            // No audible content from here: stop at the next step boundary (or
+            // immediately, on the first tick of an empty / fully-trimmed song).
+            this.scheduleSongEnd(this.nextStepTime)
+            return
+          }
         }
       }
       const audibleTime = this.nextStepTime + (step % 2 === 1 ? this.swing * stepDuration : 0)
@@ -832,11 +858,16 @@ export class StudioEngine implements StudioEngineApi {
       : null
   }
 
+  /**
+   * Step after which nothing is audible: the largest end of a clip that can
+   * actually sound. Zero-length or fully-trimmed clips schedule nothing, so
+   * they are ignored — an empty project ends at 0 instead of idling forever.
+   */
   private getSongEnd(): number {
     const clips = Array.isArray(this.project?.clips) ? this.project.clips : []
     let end = 0
     for (const clip of clips) {
-      if (!Number.isFinite(clip?.start) || !Number.isFinite(clip?.length)) continue
+      if (!Number.isFinite(clip?.start) || !Number.isFinite(clip?.length) || clip.length <= 0) continue
       end = Math.max(end, clip.start + clip.length)
     }
     return end
