@@ -1,58 +1,49 @@
-import { useEffect, useRef } from 'react';
+import { useEffect } from 'react';
 import { audioManager } from '../lib/audio';
-
-const CODE_MAP: Record<string, { key: string }> = {
-  'KeyA': { key: 'a' },
-  'KeyS': { key: 's' },
-  'KeyD': { key: 'd' },
-  'KeyF': { key: 'f' },
-  'Space': { key: ' ' },
-  'KeyJ': { key: 'j' },
-  'KeyK': { key: 'k' },
-  'KeyL': { key: 'l' },
-  'Semicolon': { key: ';' },
-};
+import { inputManager } from '../lib/inputManager';
+import { CODE_TO_GAME_KEY } from '../lib/keyMap';
 
 /**
- * A global hook to handle keyboard audio feedback for the 9 game keys.
- * This should be mounted once at the root of the application.
+ * Plays the note for a key whenever that key becomes (truly) pressed and
+ * releases it when the last source lets go.
+ *
+ * Mounted once at the root: listening to the shared input manager (instead of
+ * raw keyboard events) means touch presses are audible too, and a key held by
+ * both touch and keyboard only sounds until both have released it.
  */
 export function useGlobalAudio() {
-  const pressedKeys = useRef(new Set<string>());
-
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const keyInfo = CODE_MAP[e.code];
-      // Ignore repeated events from holding a key down
-      if (keyInfo === undefined || pressedKeys.current.has(e.code)) return;
-      
-      e.preventDefault();
-      pressedKeys.current.add(e.code);
-      
-      // Initialize audio on first key press if not already done
-      if (!audioManager.isInitialized()) {
-        audioManager.start();
+    const unsubscribe = inputManager.subscribe((code, pressed) => {
+      const gameKey = CODE_TO_GAME_KEY[code];
+      if (!gameKey) return;
+
+      if (pressed) {
+        if (!audioManager.isInitialized()) {
+          // Kicks off initialization when needed; playNote also stores the
+          // intent so the note is not lost if the context is still warming up.
+          void audioManager.start();
+        }
+        audioManager.playNote(gameKey.note);
+      } else {
+        audioManager.releaseNote(gameKey.note);
       }
-      
-      audioManager.playNote(keyInfo.key);
-    };
-
-    const handleKeyUp = (e: KeyboardEvent) => {
-      const keyInfo = CODE_MAP[e.code];
-      if (keyInfo === undefined) return;
-
-      e.preventDefault();
-      pressedKeys.current.delete(e.code);
-      audioManager.releaseNote(keyInfo.key);
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
+    });
 
     return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
-      audioManager.releaseAll(); // Stop any sound when the app unmounts
+      unsubscribe();
+      audioManager.releaseAll();
     };
-  }, []); // Empty dependency array ensures this runs only once
+  }, []);
+
+  // Some browsers only unlock audio from a user gesture; warm the context up on
+  // the first tap/click. Key presses do this as well.
+  useEffect(() => {
+    const warmUp = () => {
+      void audioManager.start();
+    };
+    window.addEventListener('pointerdown', warmUp, { passive: true });
+    return () => {
+      window.removeEventListener('pointerdown', warmUp);
+    };
+  }, []);
 }

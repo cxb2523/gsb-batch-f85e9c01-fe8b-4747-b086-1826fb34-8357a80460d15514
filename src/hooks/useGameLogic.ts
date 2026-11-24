@@ -1,5 +1,5 @@
 import { useEffect, useCallback, useRef } from 'react';
-import { useAtom, useSetAtom, useAtomValue } from 'jotai';
+import { useSetAtom, useAtomValue, useStore } from 'jotai';
 import {
   screenAtom,
   currentLevelAtom,
@@ -7,126 +7,120 @@ import {
   currentStepAtom,
   startTimeAtom,
   finalTimeAtom,
-  gameActiveAtom,
 } from '../atoms/gameAtoms';
-import { audioManager } from '../lib/audio';
-
-const CODE_MAP: Record<string, { index: number, key: string }> = {
-  'KeyA': { index: 0, key: 'a' },
-  'KeyS': { index: 1, key: 's' },
-  'KeyD': { index: 2, key: 'd' },
-  'KeyF': { index: 3, key: 'f' },
-  'Space': { index: 4, key: ' ' },
-  'KeyJ': { index: 5, key: 'j' },
-  'KeyK': { index: 6, key: 'k' },
-  'KeyL': { index: 7, key: 'l' },
-  'Semicolon': { index: 8, key: ';' },
-};
+import { inputManager } from '../lib/inputManager';
+import { CODE_TO_GAME_KEY, createEmptyKeyState } from '../lib/keyMap';
+import { isSessionResetting, resetGameSession } from '../lib/gameSession';
 
 export function useGameLogic() {
-  const pressedKeys = useRef(new Set<string>());
+  const store = useStore();
   const setScreen = useSetAtom(screenAtom);
   const currentLevel = useAtomValue(currentLevelAtom);
   const setPlayerState = useSetAtom(playerStateAtom);
-  const [currentStep, setCurrentStep] = useAtom(currentStepAtom);
-  const [startTime, setStartTime] = useAtom(startTimeAtom);
+  const setCurrentStep = useSetAtom(currentStepAtom);
+  const setStartTime = useSetAtom(startTimeAtom);
   const setFinalTime = useSetAtom(finalTimeAtom);
-  const gameActive = useAtomValue(gameActiveAtom);
 
-  // Use refs to hold the latest state for use in event handlers
-  // This avoids re-creating handlers on every state change
+  // Mirror of the values the (non-React) input callbacks need. Updated
+  // synchronously wherever they change, so rapid key events cannot observe a
+  // stale step / level.
   const stateRef = useRef({
     currentLevel,
-    currentStep,
-    startTime,
-    gameActive,
+    currentStep: 0,
+    startTime: 0,
+    playerState: createEmptyKeyState(),
   });
 
   useEffect(() => {
-    stateRef.current = {
-      currentLevel,
-      currentStep,
-      startTime,
-      gameActive,
-    };
-  }, [currentLevel, currentStep, startTime, gameActive]);
+    stateRef.current.currentLevel = currentLevel;
+  }, [currentLevel]);
+
+  const applyPlayerState = useCallback((nextState: number[]) => {
+    stateRef.current.playerState = nextState;
+    setPlayerState(nextState);
+  }, [setPlayerState]);
 
   const resetGameState = useCallback(() => {
-    audioManager.releaseAll();
-    pressedKeys.current.clear();
-    setPlayerState([0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    resetGameSession();
+    stateRef.current.currentStep = 0;
+    stateRef.current.startTime = 0;
+    applyPlayerState(createEmptyKeyState());
     setCurrentStep(0);
     setStartTime(0);
-  }, [setPlayerState, setCurrentStep, setStartTime]);
+  }, [applyPlayerState, setCurrentStep, setStartTime]);
 
   const checkWinCondition = useCallback((currentState: number[]) => {
     const { currentLevel: level, currentStep: step, startTime: time } = stateRef.current;
     if (!level) return;
 
     const targetPattern = level.patterns[step];
-    const match = currentState.every((val, index) => val === targetPattern[index]);
+    if (!targetPattern) return;
 
-    if (match) {
-      if (step < level.patterns.length - 1) {
-        setCurrentStep(step + 1);
-      } else {
-        audioManager.releaseAll();
-        pressedKeys.current.clear();
-        setPlayerState([0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        const endTime = Date.now();
-        setFinalTime(endTime - time);
-        setScreen('result');
-      }
+    const match = currentState.every((val, index) => val === targetPattern[index]);
+    if (!match) return;
+
+    if (step < level.patterns.length - 1) {
+      const nextStep = step + 1;
+      stateRef.current.currentStep = nextStep;
+      setCurrentStep(nextStep);
+    } else {
+      // Level finished: silence everything and hand over to the result screen.
+      const endTime = Date.now();
+      stateRef.current.playerState = createEmptyKeyState();
+      resetGameSession();
+      setPlayerState(createEmptyKeyState());
+      setFinalTime(endTime - time);
+      setScreen('result');
     }
   }, [setCurrentStep, setFinalTime, setScreen, setPlayerState]);
 
+  // Every input path (keyboard, touch, ...) ends up in the input manager, so
+  // there is exactly one place that drives `playerState`.
+  const handleKeyTransition = useCallback((code: string, pressed: boolean) => {
+    const gameKey = CODE_TO_GAME_KEY[code];
+    if (!gameKey) return;
+
+    const state = stateRef.current;
+    const resetting = isSessionResetting();
+    // Read the live screen/level from the store/ref: always up to date even
+    // inside a reset triggered by a screen change, and false while the level
+    // data is still loading so those presses are not recorded.
+    const gameActive =
+      store.get(screenAtom) === 'game' && state.currentLevel !== null;
+    const wasPressed = state.playerState[gameKey.index] === 1;
+
+    if (pressed) {
+      if (resetting || !gameActive || wasPressed) return;
+
+      if (state.startTime === 0) {
+        state.startTime = Date.now();
+        setStartTime(state.startTime);
+      }
+
+      const nextState = [...state.playerState];
+      nextState[gameKey.index] = 1;
+      applyPlayerState(nextState);
+      checkWinCondition(nextState);
+    } else {
+      // Always apply releases so a session reset can clear any leftover key
+      // state; only run gameplay logic while the game is actually active.
+      if (!wasPressed) return;
+
+      const nextState = [...state.playerState];
+      nextState[gameKey.index] = 0;
+      applyPlayerState(nextState);
+
+      if (!resetting && gameActive) {
+        checkWinCondition(nextState);
+      }
+    }
+  }, [applyPlayerState, checkWinCondition, setStartTime, store]);
+
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const keyInfo = CODE_MAP[e.code];
-      if (keyInfo === undefined || !stateRef.current.gameActive || pressedKeys.current.has(e.code)) return;
+    return inputManager.subscribe(handleKeyTransition);
+  }, [handleKeyTransition]);
 
-      e.preventDefault();
-      pressedKeys.current.add(e.code);
-
-      setStartTime((prevStartTime) => {
-        if (prevStartTime === 0) {
-          return Date.now();
-        }
-        return prevStartTime;
-      });
-      
-      setPlayerState(prevPlayerState => {
-        const newState = [...prevPlayerState];
-        newState[keyInfo.index] = 1;
-        checkWinCondition(newState);
-        return newState;
-      });
-    };
-
-    const handleKeyUp = (e: KeyboardEvent) => {
-      const keyInfo = CODE_MAP[e.code];
-      if (keyInfo === undefined || !stateRef.current.gameActive) return;
-
-      e.preventDefault();
-      pressedKeys.current.delete(e.code);
-
-      setPlayerState(prevPlayerState => {
-        const newState = [...prevPlayerState];
-        newState[keyInfo.index] = 0;
-        checkWinCondition(newState);
-        return newState;
-      });
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
-
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
-    };
-  }, [checkWinCondition, setPlayerState, setStartTime]); // Dependencies are now stable
-
+  // A new level (or returning to the same one) always starts from scratch.
   useEffect(() => {
     resetGameState();
   }, [currentLevel, resetGameState]);
