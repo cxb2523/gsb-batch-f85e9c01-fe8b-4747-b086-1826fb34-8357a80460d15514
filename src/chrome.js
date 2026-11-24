@@ -74,20 +74,26 @@ export async function launchChrome({ chromePath, extraArgs = [] }) {
     '--window-size=1920,1080', ...extraArgs, 'about:blank',
   ], { stdio: ['ignore', 'ignore', 'pipe'] });
 
-  const wsUrl = await new Promise((ok, no) => {
-    let err = '';
-    const timer = setTimeout(() => no(new Error('Chrome did not open a DevTools port within 30 s')), 30000);
-    proc.stderr.on('data', d => {   // keep draining stderr for the whole run so the pipe never fills
-      if (err.length < 20000) err += d;
-      const m = /DevTools listening on (ws:\/\/\S+)/.exec(err);
-      if (m) { clearTimeout(timer); ok(m[1]); }
+  // A launch that fails before `live` gains the process must still kill it and drop its profile, or a busy
+  // machine (where the 30 s below is short) fills up with Chrome processes that nothing closes.
+  const kill = () => { try { proc.kill(); } catch {} try { rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch {} };
+  let ws;
+  try {
+    const wsUrl = await new Promise((ok, no) => {
+      let err = '';
+      const timer = setTimeout(() => no(new Error('Chrome did not open a DevTools port within 30 s')), 30000);
+      proc.stderr.on('data', d => {   // keep draining stderr for the whole run so the pipe never fills
+        if (err.length < 20000) err += d;
+        const m = /DevTools listening on (ws:\/\/\S+)/.exec(err);
+        if (m) { clearTimeout(timer); ok(m[1]); }
+      });
+      proc.once('exit', code => { clearTimeout(timer); no(new Error(`Chrome exited early (code ${code}): ${err.slice(0, 400)}`)); });
+      proc.once('error', e => { clearTimeout(timer); no(e); });
     });
-    proc.once('exit', code => { clearTimeout(timer); no(new Error(`Chrome exited early (code ${code}): ${err.slice(0, 400)}`)); });
-    proc.once('error', e => { clearTimeout(timer); no(e); });
-  });
 
-  const ws = new WebSocket(wsUrl);
-  await new Promise((ok, no) => { ws.onopen = ok; ws.onerror = () => no(new Error('could not connect to Chrome DevTools')); });
+    ws = new WebSocket(wsUrl);
+    await new Promise((ok, no) => { ws.onopen = ok; ws.onerror = () => no(new Error('could not connect to Chrome DevTools')); });
+  } catch (e) { kill(); throw e; }
 
   let nextId = 0, closed = false;
   const pending = new Map(), listeners = new Map();

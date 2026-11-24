@@ -4,6 +4,11 @@ Changes are listed by release, newest first. The sections dated before 0.1.0 rec
 
 ## Unreleased
 
+### Fixed
+
+- A cancelled or failed project render no longer pollutes the scene-part cache that `--only` reuses. A part now renders into the temp folder and enters the cache only after it has been written out and checked whole (the mp4 lands by rename, its manifest last), where before it rendered straight into the cache and was renamed into place before the output check ran, so a stopped render could leave a half part or an entry that did not match its manifest for the next render to pick up. A finished render also clears the remains of stopped ones (scratch files and half entries), and the final output is still written as `.part` first — now renamed only after the output check passes. `test/part-cache.test.js` covers it: a full render's parts are reused by `--only`, a render cancelled while a scene waits for `ready` leaves the cache as it was and the next render succeeds, a scene whose `ready` fails does not enter the cache, a part that fails in parallel leaves nothing the one-at-a-time retry could reuse, and a truncated cached part is rendered again instead of joined.
+- A Chrome launch that failed — the DevTools port did not open in 30 s, or the browser exited at once — leaked the Chrome process and its profile dir, because only a successful launch was registered for cleanup. On a busy machine, where the 30 s is short, the leaked processes piled up and made the next launch slower still. A failed launch now kills the process and removes the profile. `test/chrome.test.js` checks that a failed launch leaves no profile dir behind.
+
 ### Changed
 
 - motlab is under MIT OR Apache-2.0, the user's choice, instead of MIT alone. `LICENSE` is split into `LICENSE-MIT` and `LICENSE-APACHE` (the standard Apache 2.0 text), both are in the npm package, and `package.json` says `MIT OR Apache-2.0`. The three people who had contributed code agreed in issue #44. The gl-transitions shaders stay under their own MIT licence (`THIRD_PARTY_NOTICES.md`). A new pull request comes under both licences (CONTRIBUTING.md).

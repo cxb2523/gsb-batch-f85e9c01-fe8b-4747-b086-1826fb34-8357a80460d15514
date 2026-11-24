@@ -6,7 +6,7 @@
 // An audio entry may also be a video file (its sound is used), with optional "from" (seconds into the file) and "duration".
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { freemem, availableParallelism, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { finalize, probeVideo, run } from './ffmpeg.js';
@@ -109,11 +109,21 @@ export async function renderProject({ dir, out, scale, only, parallel, qp, codec
         suffix = ' (no cached part, rendering it)';
       }
       log(label + suffix);
+      // The part renders into the temp folder and enters the cache only whole: the checked mp4 is copied to a
+      // scratch name in the cache folder and renamed, then its manifest the same way. A render cancelled or
+      // failed before this point leaves the cache as it was, and one reading the cache never sees a half part,
+      // because the manifest that vouches for the mp4 lands last. The scratch name holds the pid so two motlab
+      // processes rendering the same project do not write the same file.
       const summary = await render();
       try {
         mkdirSync(cacheRoot, { recursive: true });
-        writeFileSync(join(cacheRoot, k + '.json'), JSON.stringify({ key: k, codec: summary.codec, hw: summary.hw, fullRange: summary.fullRange,
+        const scratch = join(cacheRoot, `${k}.${process.pid}.tmp`);
+        copyFileSync(summary.out, scratch);
+        renameSync(scratch, join(cacheRoot, k + '.mp4'));
+        writeFileSync(scratch, JSON.stringify({ key: k, codec: summary.codec, hw: summary.hw, fullRange: summary.fullRange,
           width: summary.width, height: summary.height, frames: summary.frames, pageFrames: summary.pageFrames, duration: summary.duration }));
+        renameSync(scratch, join(cacheRoot, k + '.json'));
+        summary.out = join(cacheRoot, k + '.mp4');   // the join below reads the cached copy, like a reused part does
       } catch (e) { log(`(could not save the cached part: ${e.message})`); }
       return summary;
     };
@@ -128,7 +138,7 @@ export async function renderProject({ dir, out, scale, only, parallel, qp, codec
       if (jobs[j].kind === 'scene') {
         const k = key({ kind: 'scene', file: scene.file, hash: hashes[i], fps: p.fps, scale, qp, codec, version: VERSION, head: transitionHead(into), tail: transitionTail(next) });
         const part = await getPart(k, !only || only.includes(i + 1), `\nScene ${i + 1}/${scenes.length}: ${scene.file}`, log, () => renderVideo({ page: join(dir, scene.file), root: dir,
-          out: join(cacheRoot, k + '.mp4'), fps: p.fps, scale, qp, codec, log, signal, progress, head: transitionHead(into), tail: transitionTail(next), ...same() }));
+          out: join(tmp, 'parts', k + '.mp4'), fps: p.fps, scale, qp, codec, log, signal, progress, head: transitionHead(into), tail: transitionTail(next), ...same() }));
         // a stream copy join of parts with different sizes makes an MP4 that changes resolution partway through
         if (parts[0] && (part.width !== parts[0].width || part.height !== parts[0].height))
           throw Object.assign(new Error(`${scene.file} is ${part.width}x${part.height} but ${scenes[0].file} is ${parts[0].width}x${parts[0].height}. All scenes in a project must have the same canvas size`), { final: true });
@@ -140,7 +150,7 @@ export async function renderProject({ dir, out, scale, only, parallel, qp, codec
       const query = new URLSearchParams({ from: scene.file, to: scenes[i + 1].file, offset: (from.pageFrames - transitionTail(next)) / p.fps, frames: next.n,
         fps: p.fps, ...(next.layer ? { layer: next.layer } : { type: next.type, ease: next.ease, params: JSON.stringify(next.params) }) });
       return getPart(tk, !only || only.includes(i + 1) || only.includes(i + 2), `\nTransition ${i + 1} to ${i + 2}: ${next.layer ? `layer ${next.layer}` : next.type}, ${next.n} frames`, log,
-        () => renderVideo({ url: '__motlab/transition.html', query: String(query), root: dir, out: join(cacheRoot, tk + '.mp4'),
+        () => renderVideo({ url: '__motlab/transition.html', query: String(query), root: dir, out: join(tmp, 'parts', tk + '.mp4'),
           fps: p.fps, scale, qp, codec, log, signal, progress, ...same() }));
     };
     // Runs the parts that have no result yet, `width` at a time. When one fails the others are stopped, and the parts
@@ -201,11 +211,19 @@ export async function renderProject({ dir, out, scale, only, parallel, qp, codec
     await finalize({ inputs: parts.map(s => s.out), codec: parts[0].codec, fps: p.fps, audio, out: partial, duration, tmp, signal, fullRange: parts[0].fullRange });
     rmSync(out, { force: true }); renameSync(partial, out);
     // Parts from earlier edits that this render did not use would pile up: one scene edited three times leaves
-    // three versions of its part. A finished render clears out the ones it did not use.
+    // three versions of its part. A finished render clears out the ones it did not use, and with them the remains
+    // of stopped renders: a scratch file from a cache write that never finished, or an mp4 whose manifest (or a
+    // manifest whose mp4) never made it, which a cache read would pass over anyway.
     let pruned = 0;
     try {
-      const stale = [...new Set(readdirSync(cacheRoot).map(f => f.match(/^([0-9a-f]{64})\.(mp4|json)$/)?.[1]).filter(Boolean))].filter(k => !used.has(k));
-      for (const k of stale) { rmSync(join(cacheRoot, k + '.mp4'), { force: true }); rmSync(join(cacheRoot, k + '.json'), { force: true }); pruned++; }
+      const files = readdirSync(cacheRoot);
+      const keys = new Set(files.map(f => f.match(/^([0-9a-f]{64})\.(mp4|json)$/)?.[1]).filter(Boolean));
+      for (const k of keys) {
+        if (!used.has(k) || !files.includes(k + '.mp4') || !files.includes(k + '.json')) {
+          rmSync(join(cacheRoot, k + '.mp4'), { force: true }); rmSync(join(cacheRoot, k + '.json'), { force: true }); pruned++;
+        }
+      }
+      for (const f of files) if (f.endsWith('.tmp') || f.endsWith('.part')) rmSync(join(cacheRoot, f), { force: true });
     } catch {}
     if (pruned) log(`(removed ${pruned} unused cached part${pruned === 1 ? '' : 's'})`);
     log(`\nSAVED ${out} (${scenes.length} scenes${parts.length > scenes.length ? `, ${parts.length - scenes.length} transitions` : ''}, ${duration.toFixed(3)} s${audio ? `, ${p.audio.length} audio files` : ''})`);

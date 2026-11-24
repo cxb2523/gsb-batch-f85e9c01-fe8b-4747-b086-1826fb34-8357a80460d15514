@@ -142,9 +142,8 @@ export async function renderVideo(o) {
       res = await attempt('raw');
     }
     if (o.progress !== false && process.stdout.isTTY) process.stdout.write('\r');
-    rmSync(out, { force: true }); renameSync(part, out);
-
-    const v = await probeVideo(out), wantDur = frames / fps;
+    // The .part file is checked before it becomes the output, so a failed or stopped render leaves no bad file at out.
+    const v = await probeVideo(part), wantDur = frames / fps;
     const muxLabel = `${res.mux === 'raw' ? 'raw bitstream' : 'Mediabunny in the page'}, then ffmpeg -c copy${ranges.length > 1 ? ` (concat of ${ranges.length} parts)` : ''}${o.audio ? ' with audio' : ''}`;
     const summary = { out, frames: v.frames, expectedFrames: frames, pageFrames, duration: v.duration, width, height, fps, gpu: info.gpu.renderer, encoder: label(enc), codec: enc.codec, hw: enc.hw,
       rate: rate(enc), mux: muxLabel, fullRange: res.fullRange, workers: ranges.length, encodeSeconds: res.encodeMs / 1000, totalSeconds: (Date.now() - started) / 1000, size: v.size,
@@ -152,6 +151,7 @@ export async function renderVideo(o) {
     log(`Mux: ${muxLabel}`);
     log(`Colour tags: ${v.color_space || 'none'} / ${v.color_range || 'none'} (primaries ${v.color_primaries || 'none'}, transfer ${v.color_transfer || 'none'})`);
     if (v.frames !== frames || Math.abs(v.duration - wantDur) > 0.5 / fps) throw new Error(`output check failed: ${v.frames} frames, ${v.duration} s; expected ${frames} frames, ${wantDur} s (${out})`);
+    rmSync(out, { force: true }); renameSync(part, out);
     log(`SAVED ${out} (${v.frames} frames, ${v.duration.toFixed(3)} s, ${(v.size / 1e6).toFixed(1)} MB; encode ${summary.encodeSeconds.toFixed(1)} s = ${(frames / summary.encodeSeconds).toFixed(1)} fps, total ${summary.totalSeconds.toFixed(1)} s)`);
     return summary;
   } finally {

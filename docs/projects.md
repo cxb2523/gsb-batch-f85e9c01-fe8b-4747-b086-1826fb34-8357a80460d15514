@@ -69,7 +69,7 @@ To change one scene without rendering the rest again, pass `--only` with its num
 
 How it works:
 
-- Each scene is rendered to its own MP4, and ffmpeg joins them with `-c copy`. A full render also leaves each part in the cache, so `--only` can reuse it later.
+- Each scene is rendered to its own MP4, and ffmpeg joins them with `-c copy`. A full render also leaves each part in the cache, so `--only` can reuse it later. A part lands in the cache only after it has rendered and checked out whole, so a cancelled or failed render leaves the cache as it was (parts that finished may stay), and a finished render clears the remains of stopped ones.
 - The first scene picks the encoder, and every later scene is forced to the same encoder and codec, because a stream copy join is only safe when codec, encoder and resolution match.
 - Scenes are joined with hard cuts, unless a scene has a transition. A transition is rendered as a part of its own between the two scenes, and their own parts leave out those frames.
 - ffmpeg mixes the audio into one WAV first (`adelay`, `volume`, `amix`), and the final pass muxes it in as AAC.
