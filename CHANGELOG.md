@@ -4,6 +4,10 @@ All notable changes to bind-manager are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Fixed
+
+- **Gamepad actions no longer get stuck or swallow presses when the button mapping changes or the controller reconnects.** Editing the active profile mapping (`setProfileMappingEntry()`, `removeProfileMappingEntry()`, `resetProfileMapping()`) now converges the pad's logical state with the same contract as opening the modal: every logical input that had fired `pressed` under the old mapping gets `released`, every active analog action gets one final `0`, and then the hardware is re-read through the new mapping with every input still physically held latched until the player releases and presses it again, so an old-mapping press can never survive as a new-mapping `held` without a `pressed`. Reconnects follow the same rule: the runtime tracks which `Gamepad.id` owns each slot, so another pad taking a slot (even without a `gamepaddisconnected` event in between) or the same pad disconnecting and reconnecting settles the slot first — all per-slot state, caches and latches are forgotten, an in-progress capture is cancelled — and the new pad's already-held inputs are a silent baseline until released. Mapping edits and reconnects made while gameplay is suppressed obey the same rules and never produce a `held` without a `pressed` when gameplay resumes. Event fields, thresholds and public method signatures are unchanged.
+
 ## [0.2.4] - 2026-11-22
 
 ### Fixed

@@ -226,6 +226,14 @@ export class GamepadRuntime {
     this._analogActive = new Map();
     /** @type {Map<number, any>} */
     this._resolvedProfileByGamepadIndex = new Map();
+    /**
+     * The Gamepad.id of the device each slot currently holds runtime state for.
+     * A different id at the same index means the slot was re-homed (another
+     * pad taking the slot, or a disconnect/connect pair) and its state must be
+     * settled before the new device is adopted.
+     * @type {Map<number, string | null>}
+     */
+    this._gamepadIdByIndex = new Map();
     /** @type {Map<string, { type: 'profile', key: string } | { type: 'family', family: string }>} */
     this._profileOverrides = loadProfileOverrides(options.profileOverrides);
     /** @type {Map<string, any>} */
@@ -573,6 +581,7 @@ export class GamepadRuntime {
       this._profileDefinitionOverrides.set(identityKey, editable);
     }
     this._resolvedProfileByGamepadIndex.delete(gp.index);
+    this._convergeInputsForMappingChange(gp);
     this._emitProfileChange(gp);
     return true;
   }
@@ -602,6 +611,7 @@ export class GamepadRuntime {
     for (const key of getGamepadIdentityKeys(gp.id)) deleted = this._profileDefinitionOverrides.delete(key) || deleted;
     if (!deleted) return false;
     this._resolvedProfileByGamepadIndex.delete(gp.index);
+    this._convergeInputsForMappingChange(gp);
     this._emitProfileChange(gp);
     return true;
   }
@@ -643,27 +653,20 @@ export class GamepadRuntime {
   // ── Private ───────────────────────────────────────────────────────────────
 
   _handleConnect(e) {
-    // Resolve through the override- and edit-aware path, so in-memory mapping
-    // edits keep applying after a reconnect.
-    this._resolvedProfileByGamepadIndex.delete(e.gamepad.index);
-    this._getResolvedProfileForGamepad(e.gamepad);
+    // Adopt the pad through the override- and edit-aware path, so in-memory
+    // mapping edits keep applying after a reconnect. Settling the slot first
+    // guarantees the previous device's pressed/analog/latch state (and the
+    // profile cache) can never bleed onto the new one, and anything the new
+    // pad already holds is latched until the player releases it.
+    this._settleSlot(e.gamepad.index);
+    this._adoptGamepad(e.gamepad);
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('bm-gamepad-connected', { detail: e.gamepad }));
     }
   }
 
   _handleDisconnect(e) {
-    this._releaseActiveInputs(e.gamepad.index);
-    this._curState.delete(e.gamepad.index);
-    this._latched.delete(e.gamepad.index);
-    this._pressedCodes.delete(e.gamepad.index);
-    this._analogActive.delete(e.gamepad.index);
-    this._resolvedProfileByGamepadIndex.delete(e.gamepad.index);
-    if (this._captureCallback) {
-      const cb = this._captureCallback;
-      this._captureCallback = null;
-      cb(null);
-    }
+    this._settleSlot(e.gamepad.index);
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('bm-gamepad-disconnected', { detail: e.gamepad }));
     }
@@ -679,6 +682,17 @@ export class GamepadRuntime {
   }
 
   _processGamepad(gamepad) {
+    // A different device on a slot without a disconnect event (a real pad
+    // appearing while a simulated one holds the slot, or any index reuse):
+    // settle the old device before adopting the new one, so inputs already
+    // held on the new pad are a baseline and stay silent until released.
+    const gamepadId = typeof gamepad.id === 'string' ? gamepad.id : null;
+    if (this._gamepadIdByIndex.has(gamepad.index) && this._gamepadIdByIndex.get(gamepad.index) !== gamepadId) {
+      this._settleSlot(gamepad.index);
+      this._adoptGamepad(gamepad);
+      return;
+    }
+
     const hasPrev = this._curState.has(gamepad.index);
     const prev = this._curState.get(gamepad.index) ?? {
       buttons: new Array(GP_BUTTON_COUNT).fill(false),
@@ -689,6 +703,7 @@ export class GamepadRuntime {
     const cur = this._snapshotLogicalState(gamepad);
 
     this._curState.set(gamepad.index, cur);
+    this._gamepadIdByIndex.set(gamepad.index, gamepadId);
 
     // ── Capture mode ─────────────────────────────────────────────────────────
     if (this._captureCallback) {
@@ -812,6 +827,83 @@ export class GamepadRuntime {
       if (val > this._analogThreshold) codes.push(`GP_A${a}P`);
     }
     return codes;
+  }
+
+  /**
+   * Converge the logical input state of a gamepad whose profile mapping just
+   * changed (setProfileMappingEntry / removeProfileMappingEntry /
+   * resetProfileMapping), with the same contract as opening the modal:
+   * every code that fired 'pressed' gets 'released' and every active analog
+   * action gets one final 0 under the old mapping; then the pad is re-read
+   * through the new mapping and every input still physically held is latched
+   * until released, so no old-mapping press carries over as a new-mapping
+   * held-without-pressed.
+   *
+   * Safe while gameplay is suppressed: the releases still fire (they do on
+   * suppression too), the fresh baseline keeps suppressed polls quiet, and
+   * the latches take effect when gameplay resumes.
+   * @param {Gamepad} gamepad
+   * @private
+   */
+  _convergeInputsForMappingChange(gamepad) {
+    const gamepadIndex = gamepad.index;
+    this._releaseActiveInputs(gamepadIndex);
+    // Re-read the hardware through the new mapping: from now on this frame is
+    // the baseline, so edges are computed against the new mapping.
+    const cur = this._snapshotLogicalState(gamepad);
+    this._curState.set(gamepadIndex, cur);
+    this._gamepadIdByIndex.set(
+      gamepadIndex,
+      typeof gamepad.id === 'string' ? gamepad.id : null,
+    );
+    // Anything still physically held under the new mapping must not emit until
+    // the player releases and presses it again.
+    this._latchActiveInputs(gamepadIndex);
+  }
+
+  /**
+   * Adopt a gamepad as the new holder of its slot: resolve its profile, take
+   * its current hardware state as the baseline (so held inputs produce no
+   * edges) and latch every active input until it is released. Latching here,
+   * rather than on the next polled frame, means an input already held when
+   * the pad arrives can never emit even once. Used for an explicit connect
+   * and for a slot taken over without a disconnect event.
+   * @param {Gamepad} gamepad
+   * @private
+   */
+  _adoptGamepad(gamepad) {
+    this._resolvedProfileByGamepadIndex.delete(gamepad.index);
+    this._getResolvedProfileForGamepad(gamepad);
+    const cur = this._snapshotLogicalState(gamepad);
+    this._curState.set(gamepad.index, cur);
+    this._gamepadIdByIndex.set(
+      gamepad.index,
+      typeof gamepad.id === 'string' ? gamepad.id : null,
+    );
+    this._latchActiveInputs(gamepad.index);
+  }
+
+  /**
+   * Settle a slot its current device is leaving: fire 'released' for every
+   * code that fired 'pressed', one final analog 0 per active axis, cancel an
+   * in-progress capture and forget every per-slot cache and latch, so the
+   * state can never bleed onto the next device that takes the slot.
+   * @param {number} gamepadIndex
+   * @private
+   */
+  _settleSlot(gamepadIndex) {
+    this._releaseActiveInputs(gamepadIndex);
+    this._curState.delete(gamepadIndex);
+    this._latched.delete(gamepadIndex);
+    this._pressedCodes.delete(gamepadIndex);
+    this._analogActive.delete(gamepadIndex);
+    this._resolvedProfileByGamepadIndex.delete(gamepadIndex);
+    this._gamepadIdByIndex.delete(gamepadIndex);
+    if (this._captureCallback) {
+      const cb = this._captureCallback;
+      this._captureCallback = null;
+      cb(null);
+    }
   }
 
   /**
