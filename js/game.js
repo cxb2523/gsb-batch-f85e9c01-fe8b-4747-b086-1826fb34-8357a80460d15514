@@ -110,8 +110,14 @@ class Game {
     const h = a.model;
     if (force || h.ragdoll || h.hips.parent !== h.root) {
       // 尸体（布娃娃）留在场景里，由数量上限回收；角色换新模型
-      if (h.ragdoll) { if (force) { h.ragdoll.dispose(); this.ragdolls = this.ragdolls.filter((r) => r !== h.ragdoll); } }
-      else this.scene.remove(h.root);
+      if (h.ragdoll) {
+        if (force) {
+          const r = h.ragdoll;
+          r.dispose();
+          this.ragdolls = this.ragdolls.filter((x) => x !== r);
+          h.ragdoll = null;
+        }
+      } else this.scene.remove(h.root);
       const nh = new Models.Humanoid(a.team);
       if (h.layer) { nh.layer = h.layer; nh.root.traverse((o) => o.layers.set(h.layer)); }
       a.model = nh; this.scene.add(nh.root);
@@ -401,8 +407,25 @@ class Game {
     h.root.visible = true;
     h.ragdoll = new Ragdoll(h, this.scene, this.world, v.vel, imp, group);
     this.ragdolls.push(h.ragdoll);
-    if (this.ragdolls.length > 14) { const r = this.ragdolls.shift(); r.dispose(); }
+    if (this.ragdolls.length > 14) this.disposeRagdoll(this.ragdolls[0]);
     if (hs || Math.random() < 0.4) this.later(1.2, () => { if (!v.alive && h.ragdoll) Effects.bloodPool(h.ragdoll.p[1]); });
+  }
+  // 释放单个布娃娃：幂等，并解开模型上的悬挂引用，避免之后操作已释放对象
+  disposeRagdoll(r) {
+    if (!r || r._disposed) return;
+    r._disposed = true;
+    if (r.h && r.h.ragdoll === r) r.h.ragdoll = null;
+    r.dispose();
+    const i = this.ragdolls.indexOf(r);
+    if (i >= 0) this.ragdolls.splice(i, 1);
+  }
+  clearRagdolls() {
+    for (const r of this.ragdolls) {
+      if (r.h && r.h.ragdoll === r) r.h.ragdoll = null;
+      r._disposed = true;
+      r.dispose();
+    }
+    this.ragdolls.length = 0;
   }
   // 本机玩家阵亡：死亡视角 + 提示
   playerDied(killer, wname, hs, wall) {
@@ -744,13 +767,18 @@ class Game {
   idleCmd() { const c = this.player.cmd; Object.assign(c, newCmd(), { duck: this.crouchToggle && c.duck }); }
 
   // ---------------- 回合清场 / C4（房主与加入者共用） ----------------
+  // 唯一的完整收束入口：特效瞬态、掉落物、手雷、布娃娃、待执行定时器、C4 模型与状态。
+  // 房主调用时额外广播 clr；加入端收到 clr 后也走这里，保证两边场景一致。
   clearRoundFx() {
     Effects.clearRound();
-    for (const d of this.drops) this.scene.remove(d.mesh); this.drops.length = 0;
-    for (const gr of this.grenades) this.scene.remove(gr.mesh); this.grenades.length = 0;
-    for (const r of this.ragdolls) r.dispose(); this.ragdolls.length = 0;
-    if (this.mode.clearBomb) this.mode.clearBomb(); else if (this.mode.clearMesh) this.mode.clearMesh();
+    for (const d of this.drops) this.scene.remove(d.mesh);
+    this.drops.length = 0;
+    for (const gr of this.grenades) this.scene.remove(gr.mesh);
+    this.grenades.length = 0;
+    this.clearRagdolls();
     this.timers.length = 0;
+    if (this.mode.clearBomb) this.mode.clearBomb();
+    else if (this.mode.clearMesh) this.mode.clearMesh();
     this.emit({ t: 'clr' });
   }
   bombModel(pos, yaw) {
@@ -900,10 +928,12 @@ class Game {
   }
 
   dispose() {
-    for (const r of this.ragdolls) r.dispose();
-    for (const a of this.actors) { if (a.model) { if (a.model.ragdoll) a.model.ragdoll.dispose(); this.scene.remove(a.model.root); } }
+    this.timers.length = 0;
+    this.clearRagdolls();
+    for (const a of this.actors) { if (a.model) { if (a.model.ragdoll) { a.model.ragdoll.dispose(); a.model.ragdoll = null; } this.scene.remove(a.model.root); } }
     for (const d of this.drops) this.scene.remove(d.mesh);
-    for (const g of this.grenades) this.scene.remove(g.mesh);
+    for (const gr of this.grenades) this.scene.remove(gr.mesh);
+    this.drops.length = 0; this.grenades.length = 0;
     if (this.mode.dispose) this.mode.dispose();
     if (this.net) this.net.detach();
     Effects.clearAll();
@@ -983,6 +1013,7 @@ class ModeTDM {
     const w = this.score.CT === this.score.T ? null : this.score.CT > this.score.T ? 'CT' : 'T';
     g.center([w ? (w === 'CT' ? '反恐精英获胜！' : '恐怖分子获胜！') : '平局', w ? (w === 'CT' ? 'win-ct' : 'win-t') : '', 9, `${this.score.CT} : ${this.score.T}`]);
     g.sound2d((a) => [w === a.team ? 'round_win' : 'round_lose', 0.6]);
+    g.clearRoundFx();
   }
 }
 
@@ -1039,6 +1070,11 @@ class ModeComp {
     this.startRound();
   }
   defaultPistol(a) { if (!a.inv.secondary) a.inv.secondary = new WeaponInst(a.team === 'T' ? 'glock' : 'usp'); }
+  // C4 的规范初始状态：未安放、未掉落、无携带者。回合重置先回到这里，再指派唯一携带者。
+  initialBomb() {
+    return { carrier: null, dropped: false, planted: false, pos: new THREE.Vector3(), yaw: 0,
+      timer: 40, defuseT: 0, beepT: 0, exploded: false, defused: false, drop: null, site: null, defuser: null };
+  }
   startRound() {
     const g = this.g;
     this.round++;
@@ -1053,9 +1089,15 @@ class ModeComp {
       a.spawnAt(pts[a.team].pop() || g.map.spawns[a.team][0], a.team === 'T' ? 0 : Math.PI);
       a.roundKills = 0;
     }
-    // 炸弹
+    // 炸弹：clearRoundFx 已把它复位成无携带者的初始态，这里再指派唯一一名 T
     const ts = g.actors.filter((a) => a.team === 'T');
-    if (ts.length) { const c = pick(ts); c.inv.c4 = true; this.bomb = { carrier: c, dropped: false, planted: false, pos: new THREE.Vector3(), timer: 40, defuseT: 0, beepT: 0, exploded: false, defused: false }; }
+    if (ts.length) {
+      const c = pick(ts);
+      c.inv.c4 = true;
+      const B = this.bomb && !this.bomb.planted && !this.bomb.dropped && !this.bomb.carrier ? this.bomb : this.initialBomb();
+      B.carrier = c;
+      this.bomb = B;
+    } else this.bomb = this.initialBomb();
     this.phase = 'freeze'; this.t = this.freezeTime; g.frozen = true; g.noFire = true;
     for (const a of g.actors) if (a.isBot) g.botBuy(a);
     this.assignTasks();
@@ -1135,7 +1177,11 @@ class ModeComp {
       if (B.beepT <= 0) {
         B.beepT = B.timer < 2 ? 0.12 : lerp(0.15, 1.0, Math.pow(frac, 1.3));
         g.playAt('beep', B.pos, { vol: 0.8, ref: 4, roll: 0.9, rev: 0.1 });
-        if (this.bombLight) { this.bombLight.material.color.setRGB(8, 0.4, 0.3); setTimeout(() => this.bombLight && this.bombLight.material.color.setRGB(0.6, 0.02, 0.02), 90); }
+        if (this.bombLight) {
+          this.bombLight.material.color.setRGB(8, 0.4, 0.3);
+          if (this._beepFlashT != null) clearTimeout(this._beepFlashT);
+          this._beepFlashT = setTimeout(() => { this._beepFlashT = null; if (this.bombLight) this.bombLight.material.color.setRGB(0.6, 0.02, 0.02); }, 90);
+        }
       }
       // 拆弹
       let defuser = null;
@@ -1239,9 +1285,23 @@ class ModeComp {
     if (this.bombMesh) this.bombMesh.visible = false;
     this.endRound('T', 'bomb');
   }
-  clearBomb() {
+  removeBombMesh() {
+    if (this._beepFlashT != null) { clearTimeout(this._beepFlashT); this._beepFlashT = null; }
+    // bombLight 上的球几何/材质是每次安放单独 new 的，可释放；C4 主体来自模型缓存，不能 dispose
+    if (this.bombLight) { this.bombLight.geometry.dispose(); this.bombLight.material.dispose(); }
     if (this.bombMesh) this.g.scene.remove(this.bombMesh);
-    this.bombMesh = null; this.bombLight = null; this.bomb = null;
+    this.bombMesh = null; this.bombLight = null;
+  }
+  // 清场：移除安放模型，并把同一个 C4 状态对象复位到初始态（未安放/未掉落/无携带者）
+  clearBomb() {
+    this.removeBombMesh();
+    const B = this.bomb;
+    if (B) {
+      B.carrier = null; B.dropped = false; B.planted = false;
+      B.timer = 40; B.defuseT = 0; B.beepT = 0;
+      B.exploded = false; B.defused = false; B.drop = null; B.site = null; B.defuser = null; B.yaw = 0;
+      if (B.pos && B.pos.isVector3) B.pos.set(0, 0, 0); else B.pos = new THREE.Vector3();
+    } else this.bomb = this.initialBomb();
   }
   endRound(winner, reason) {
     const g = this.g;
@@ -1272,6 +1332,8 @@ class ModeComp {
     const w = this.score.CT > this.score.T ? 'CT' : 'T';
     g.center((P) => [P.team === w ? '胜利！' : '失败', w === 'CT' ? 'win-ct' : 'win-t', 9, `${w === 'CT' ? '反恐精英' : '恐怖分子'} ${this.score[w]} : ${this.score[w === 'CT' ? 'T' : 'CT']}`]);
     g.sound2d((a) => [a.team === w ? 'round_win' : 'round_lose', 0.6]);
+    // 对局结束同样是一次完整收束：C4 模型/掉落物/手雷/布娃娃/定时器全部释放，并通知加入端
+    g.clearRoundFx();
   }
   onKill(v, k) { void v; void k; }
   dispose() { this.clearBomb(); }

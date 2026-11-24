@@ -317,6 +317,7 @@ class NetClient {
     if (this.evq.length > 400) this.evq.splice(0, this.evq.length - 400);
     // 找包住渲染时刻的两帧快照
     const S = this.snaps;
+    if (!S.length) return;
     let s0 = S[0], s1 = S[S.length - 1];
     for (let i = S.length - 1; i > 0; i--) if (S[i - 1].ht <= t) { s0 = S[i - 1]; s1 = S[i]; break; }
     const k = s1 === s0 ? 1 : clamp((t - s0.ht) / Math.max(1e-6, s1.ht - s0.ht), 0, 1);
@@ -421,7 +422,14 @@ class NetClient {
         break;
       }
       case 'nade': { const a = A(ev.a); if (a) g.spawnGrenade(ev.id, vn(ev.p), vn(ev.v), a); break; }
-      case 'clr': g.clearRoundFx(); this.drops.clear(); break;
+      case 'clr':
+        // 回合收束：延迟插值队列里那些旧回合的 drop/nade/kill 事件必须一起废弃，
+        // 否则它们会在清场之后才播放，把已经清掉的掉落物/手雷/布娃娃重新“演”出来。
+        // 与 clr 同批、排在 clr 之后的新回合事件在本处理返回后才入队，不受影响。
+        this.evq.length = 0;
+        g.clearRoundFx();
+        this.drops.clear();
+        break;
       case 'c4x': g.c4Fx(vn(ev.p)); break;
       default: break;
     }
@@ -461,13 +469,21 @@ class ModeMirror {
   buyTimeLeft() { return this.bt; }
   timeLeft() { return this.tl; }
   syncBomb(b) {
-    if (!b) { this.bomb = null; this.clearMesh(); return; }
+    if (!b) { this.clearBomb(); return; }
     const B = this.bomb || (this.bomb = { pos: new THREE.Vector3() });
     B.dropped = !!b.d; B.planted = !!b.p; B.exploded = !!b.e; B.defused = !!b.f; vn(b.x, B.pos);
-    if (B.planted && !this.bombMesh) { const m = this.g.bombModel(B.pos, b.y); this.bombMesh = m.group; }
+    if (B.planted && !this.bombMesh) { const m = this.g.bombModel(B.pos, b.y); this.bombMesh = m.group; this.bombLight = m.light; }
+    if (!B.planted && this.bombMesh) this.clearMesh();
     if (B.exploded && this.bombMesh) this.bombMesh.visible = false;
   }
-  clearMesh() { if (this.bombMesh) this.g.scene.remove(this.bombMesh); this.bombMesh = null; }
+  clearMesh() {
+    // 只释放 bombModel 里单独 new 出来的灯光球几何/材质；C4 主体共享模型缓存，不能 dispose
+    if (this.bombLight) { this.bombLight.geometry.dispose(); this.bombLight.material.dispose(); this.bombLight = null; }
+    if (this.bombMesh) this.g.scene.remove(this.bombMesh);
+    this.bombMesh = null;
+  }
+  // 收到 clr：镜像 C4 也要回到“无状态、无模型”，等下一帧快照再同步新炸弹
+  clearBomb() { this.bomb = null; this.clearMesh(); }
   dispose() { this.clearMesh(); }
 }
 
