@@ -145,6 +145,10 @@ src/audio.js     WebAudio 全合成音效（打击/格挡/KO锣声/必杀呼啸�
 | `&freeze=秒` | 推进到指定时刻定格 |
 | `&cycle=N` | 每 9 秒完整重建一局（资源释放压测） |
 | `&select=1&mode=ai&autopick=我,AI` | 自动化选人流程测试 |
+| `&lan=1` + `&pick=N` + `&auto=1` | 局域网联机无人值守测试（首窗为主机，自动选人/驾驶） |
+
+联机回合推进/重赛的权威模型与验证方法见 [`docs/LAN_ROUND_SYNC.md`](docs/LAN_ROUND_SYNC.md)。
+自动化校验：`npm run test:lan`（回合/重赛）、`npm run test:lan:robust`（丢包补发/断线清理）。
 
 </details>
 

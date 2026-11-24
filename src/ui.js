@@ -2,6 +2,8 @@
  * DOM UI：HUD（血条/能量条/回合计时/连击数）、中央公告、结算、选人界面
  */
 
+import { GAME } from './config.js';
+
 const $ = (id) => document.getElementById(id);
 
 export class UI {
@@ -31,6 +33,33 @@ export class UI {
   showOnly(ids) {
     for (const s of ['screen-title', 'screen-select', 'screen-result', 'hud', 'ctrl-hint']) this.hide(s);
     for (const s of ids) this.show(s);
+  }
+
+  /** 一局/重赛归零：清空血条/能量插值视图并强制下一帧重绘，避免残留上一局数值 */
+  resetHud() {
+    this.hpView = { p1: { cur: 1, ghost: 1 }, p2: { cur: 1, ghost: 1 } };
+    this.meterView = { p1: 0, p2: 0 };
+    for (const k of Object.keys(this._last)) {
+      if (k === 'timer') this._last[k] = '';
+      else if (k === 'glow1' || k === 'glow2') this._last[k] = null;
+      else if (k === 'pips1' || k === 'pips2') this._last[k] = 0;
+      else this._last[k] = -1;
+    }
+    const t = this.el.timer;
+    if (t) { t.textContent = String(Math.ceil(GAME.roundTime)); t.style.color = ''; }
+    for (const p of ['p1', 'p2']) {
+      const glow = this.el[`${p}glow`];
+      if (glow) glow.classList.add('hidden');
+      const pips = this.el[`${p}pips`];
+      if (pips) for (const c of pips.children) c.classList.remove('won');
+    }
+  }
+
+  /** 清除中央公告（回标题/重赛时不留上一局文字） */
+  clearAnnounce() {
+    clearTimeout(this.announceTimer);
+    const el = $('announce-text');
+    if (el) { el.classList.remove('slam'); el.style.opacity = 0; el.textContent = ''; }
   }
 
   // ---------- HUD ----------

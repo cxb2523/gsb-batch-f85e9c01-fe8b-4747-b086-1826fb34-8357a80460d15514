@@ -69,11 +69,14 @@ export class NetSession {
   startStateLoop(getState) {
     this._stopTimer('_stateTimer');
     this._getState = getState;
-    this._stateTimer = setInterval(() => {
-      if (this.role !== 'host') return;
-      const data = this._getState();
-      if (data) this.send({ type: 'state', ...data });
-    }, 33);
+    this._stateTimer = setInterval(() => this.flushState(), 33);
+  }
+
+  /** 主机：立即下发一帧快照（回合切换等关键时刻用，不等 33ms 定时器） */
+  flushState() {
+    if (this.role !== 'host' || !this._getState) return;
+    const data = this._getState();
+    if (data) this.send({ type: 'state', ...data });
   }
 
   _stopTimer(key) { if (this[key]) { clearInterval(this[key]); this[key] = null; } }
@@ -84,6 +87,12 @@ export class NetSession {
 
   destroy() {
     this._stopTimers();
-    if (this.ws) { try { this.ws.close(); } catch {} this.ws = null; }
+    this._getState = null; this._getInput = null;
+    if (this.ws) {
+      const ws = this.ws;
+      this.ws = null;
+      try { ws.onclose = null; ws.onmessage = null; ws.close(); } catch {}
+    }
+    this.role = null;
   }
 }

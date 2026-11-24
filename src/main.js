@@ -70,10 +70,17 @@ class Game {
     this.net = null;               // NetSession（局域网）
     this._stageSeq = Math.floor(Math.random() * 3);
     this._stageParam = null;
+    this._activeStage = null;      // 当前舞台 id（主机随开局/重赛同步给客机）
     this.netRole = null;           // 'host' | 'guest'
     this.remoteInput = {};         // 主机收到的客机输入
+    this._prevRemote = {};         // 上一条远端输入（边沿检测）
     this._netLatest = null;        // 客机最新快照
-    this._pendingNetEvts = [];     // 主机待下发的事件
+    this._pendingNetEvts = [];     // 主机待下发的事件（按 id 单调递增，收到 ack 才移除）
+    this._netEvtSeq = 0;           // 事件 id 序列（会话内只增不减）
+    this._netEvtLast = 0;          // 客机：已应用的最大事件 id（去重）
+    this._netAckSent = 0;          // 客机：已向主机确认的最大事件 id
+    this._netGen = 0;              // 对局世代号：主机每开一局 +1，客机跟随
+    this._netGenSeq = 0;           // 主机世代号分配器
     this._isNet = false;
     this._justSnap = { p1: emptyInput(), p2: emptyInput() };   // 待消费按键事件（跨帧保留直到消费）
 
@@ -150,18 +157,25 @@ class Game {
     $('btn-select-back').onclick = () => {
       this._click();
       if (this._isNet) this.net?.send({ type: 'cmd', cmd: 'menu' });
+      this._leaveNet();          // 联机退出必须先释放循环与残留状态
       this.exitToTitle();
     };
     $('btn-rematch').onclick = () => {
       this._click();
-      if (this._isNet) { this.net?.send({ type: 'cmd', cmd: 'rematch' }); return; }   // 双方都会收到回声并各自重开
+      if (this._isNet) {
+        // 重赛由主机权威驱动：主机立即开新局并广播；客机只发请求，等主机快照
+        if (this.mode === 'net-host') this._hostRestartMatch();
+        else this.net?.send({ type: 'cmd', cmd: 'rematch' });
+        return;
+      }
       this.ui.hide('screen-result');
-      this.score = [0, 0]; this.round = 1;
+      this._resetMatchState();
       this.startMatch(this.picks[0], this.picks[1]);
     };
     $('btn-to-menu').onclick = () => {
       this._click();
       if (this._isNet) this.net?.send({ type: 'cmd', cmd: 'menu' });
+      this._leaveNet();
       this.exitToTitle();
     };
   }
@@ -173,16 +187,20 @@ class Game {
     const panel = $('net-panel'), status = $('net-status');
     panel.classList.remove('hidden');
     status.textContent = '正在连接服务器…';
-    $('btn-net-cancel').onclick = () => { this.net?.destroy(); this.net = null; panel.classList.add('hidden'); };
+    $('btn-net-cancel').onclick = () => {
+      this._leaveNet();
+      panel.classList.add('hidden');
+    };
 
     import('./net.js').then(async ({ NetSession }) => {
       try {
-        this.net?.destroy();
+        this._leaveNet();                 // 清掉上一次联机会话的残留（循环/世代/事件）
         this.net = new NetSession(this._netHandlers());
         await this.net.connect();
         status.textContent = '已连接，正在匹配对手…';
         this.net.send({ type: 'join' });
       } catch (e) {
+        this._leaveNet();
         status.textContent = e.message + '（请确认已在项目目录运行 node server.js）';
       }
     });
@@ -232,25 +250,40 @@ class Game {
         this._refreshSelectVisual();
         this._netMaybeStartMatch();
       },
-      // 主机广播：开始比赛 / 重赛
+      // 主机广播：开始比赛 / 重赛 / 回菜单（客机只跟随，不自行决定）
       onStart: (msg) => {
         if (msg.cmd === 'start') {
+          if (this.mode !== 'net-guest') return;
+          // 幂等：同一世代、同一阵容已在局中则不重建
+          if (this.phase !== 'title' && this.fighters.length && msg.gen != null && msg.gen === this._netGen
+              && msg.c1 === this.picks[0] && msg.c2 === this.picks[1]) return;
           this.picks = [msg.c1, msg.c2];
-          this.startMatch(msg.c1, msg.c2);
+          if (msg.gen != null) this._netGen = msg.gen;
+          this.startMatch(msg.c1, msg.c2, { stage: msg.stage, gen: msg.gen });
         } else if (msg.cmd === 'rematch') {
-          this.ui.hide('screen-result');
-          this.score = [0, 0]; this.round = 1;
-          this.startMatch(this.picks[0], this.picks[1]);
+          // 主机收到客机的重赛请求 → 仅当确实处于结算时才重开并广播（防止连点/跨回合误触发）
+          if (this.mode === 'net-host') {
+            if (this.phase === 'result') this._hostRestartMatch();
+          } else if (this.mode === 'net-guest') {
+            // 仅当主机发来的世代号领先时才重建（防止同一 rematch 广播被重复应用）
+            if (msg.gen == null || msg.gen <= this._netGen) return;
+            this.ui.hide('screen-result');
+            this.picks = [msg.c1 ?? this.picks[0], msg.c2 ?? this.picks[1]];
+            this.startMatch(this.picks[0], this.picks[1], { stage: msg.stage, gen: msg.gen });
+          }
         } else if (msg.cmd === 'menu') {
+          this._leaveNet();
           this.exitToTitle();
+        } else if (msg.cmd === 'ack') {
+          this._netApplyAck(msg.g, msg.id);
         }
       },
       onState: (snap) => this._applyNetState(snap),
       onInput: (keys) => { this.remoteInput = keys || {}; },
       onClose: (peerLeft) => {
         const wasInGame = this.phase !== 'title';
+        this._leaveNet();
         this.exitToTitle();
-        this.net?.destroy(); this.net = null; this.netRole = null; this._isNet = false;
         if (wasInGame) this.ui.announce(peerLeft ? '对手已离开' : '与服务器断开', { dur: 1.8, size: 'clamp(28px,5vw,50px)' });
       },
     };
@@ -262,14 +295,41 @@ class Game {
   _netMaybeStartMatch() {
     if (this.phase !== 'select' || this.mode !== 'net-host') return;
     if (this.selectDone[0] && this.selectDone[1]) {
-      this.net?.send({ type: 'cmd', cmd: 'start', c1: this.picks[0], c2: this.picks[1] });
-      this.startMatch(this.picks[0], this.picks[1]);
+      this._hostStartMatch();
     }
+  }
+
+  /** 主机权威开局：分配世代号/舞台，广播 start，再本地开局 */
+  _hostStartMatch() {
+    if (this.phase !== 'select') return;   // 防止双方 ready 在同一帧触发重复开局
+    const gen = ++this._netGenSeq;
+    const c1 = this.picks[0], c2 = this.picks[1];
+    const stage = this._stageParam || this._nextStageId();
+    this.picks = [c1, c2];
+    this.net?.send({ type: 'cmd', cmd: 'start', c1, c2, gen, stage });
+    this.startMatch(c1, c2, { stage, gen });
+  }
+
+  /** 主机权威重赛：清结算、比分归零、广播 rematch，再本地开新局 */
+  _hostRestartMatch() {
+    if (this.phase !== 'result') return;   // 仅在结算态可重赛，防止连点/跨回合误触发
+    const gen = ++this._netGenSeq;
+    const c1 = this.picks[0], c2 = this.picks[1];
+    const stage = this._stageParam || this._nextStageId();
+    this.net?.send({ type: 'cmd', cmd: 'rematch', c1, c2, gen, stage });
+    this.ui.hide('screen-result');
+    this.startMatch(c1, c2, { stage, gen });
+  }
+
+  _nextStageId() {
+    const order = ['sunset', 'night', 'forest'];
+    return order[(this._stageSeq++) % order.length];
   }
 
   exitToTitle() {
     this.phase = 'title';
     this._teardownFighters();
+    this._resetMatchState();
     this.ui.showOnly(['screen-title']);
   }
 
@@ -281,6 +341,39 @@ class Game {
     this.fx.clear();
     this.net?.stopLoops();
     this._pendingNetEvts = [];
+  }
+
+  /** 一局/一回合的公共状态归零（比分、回合、计时、子阶段、胜者、公告、远端输入） */
+  _resetMatchState() {
+    this.round = 1;
+    this.score = [0, 0];
+    this.timer = GAME.roundTime;
+    this.subPhase = 'intro'; this.subT = 0;
+    this._winnerIdx = -1; this._koLoserIdx = -1;
+    this._fightAnnounced = false;
+    this.remoteInput = {}; this._prevRemote = {};
+    this._netLatest = null;
+    this._guestPrev = null;      // 客机快照状态跟踪基线
+    this.ui.resetHud?.();
+    this.ui.clearAnnounce?.();
+  }
+
+  /** 联机会话彻底退出：释放循环/连接，清空待发事件、快照与输入残留 */
+  _leaveNet() {
+    this.net?.destroy();
+    this.net = null;
+    this.netRole = null;
+    this._isNet = false;
+    if (this.mode === 'net-host' || this.mode === 'net-guest') this.mode = 'local';
+    this.remoteInput = {}; this._prevRemote = {};
+    this._netLatest = null;
+    this._pendingNetEvts = [];
+    this._netEvtSeq = 0; this._netEvtLast = 0; this._netAckSent = 0;
+    this._netGen = 0; this._netGenSeq = 0;
+    this._guestPrev = null;
+    this._apAI = null; this._apInp = null;
+    this.aiP1 = null;
+    this._dropSnaps = 0;
   }
 
   // ================= 选人 =================
@@ -397,6 +490,7 @@ class Game {
           this._netMaybeStartMatch();
         } else if (edge(slot, both.cancel, 'x')) {
           this.net?.send({ type: 'cmd', cmd: 'menu' });
+          this._leaveNet();
           this.exitToTitle();
         }
       }
@@ -458,14 +552,19 @@ class Game {
   }
 
   // ================= 比赛 =================
-  startMatch(pick1, pick2) {
+  startMatch(pick1, pick2, opts = {}) {
     this._teardownFighters();
-    // 舞台轮换（可用 &stage=night|forest|sunset 固定）
+    this._resetMatchState();
+    // 舞台：主机权威（开局/重赛都随 start 命令下发）；客机优先采用主机给定舞台
     const order = ['sunset', 'night', 'forest'];
-    const stageId = this._stageParam || order[(this._stageSeq++) % order.length];
+    let stageId;
+    if (opts.stage) stageId = opts.stage;
+    else if (this._stageParam) stageId = this._stageParam;
+    else if (this.mode === 'net-guest') stageId = this._activeStage || order[0];
+    else stageId = order[(this._stageSeq++) % order.length];
+    this._activeStage = stageId;
     this.stageRef?.dispose();
     this.stageRef = buildStage(this.scene, stageId);
-    this.round = 1; this.score = [0, 0];
     const c1 = getChar(CHARACTERS[pick1].id);
     const c2 = getChar(CHARACTERS[pick2].id);
 
@@ -481,7 +580,17 @@ class Game {
     this.ai = this.mode === 'ai' ? new AIController(1) : null;
     this.aiP1 = null;
     this.showcase = null;
-    this.remoteInput = {}; this._prevRemote = {};
+    // 联机：世代号——主机用传入的 gen（或自增兜底），客机必须跟随主机
+    if (this._isNet) {
+      if (opts.gen != null) this._netGen = opts.gen;
+      else if (this.mode === 'net-host') this._netGen = ++this._netGenSeq;
+      this._netEvtLast = 0;
+      this._netAckSent = 0;
+      this._pendingNetEvts = [];
+    }
+    this._resultShown = false;
+    this._guestPrev = null;
+    this._netEvtPlayed = {};   // 本局事件播放计数（验证用，按局重置）
 
     // 联机数据通道
     if (this.net) {
@@ -528,12 +637,24 @@ class Game {
     }
     this.timer = GAME.roundTime;
     this.subPhase = 'intro'; this.subT = 0;
+    this._fightAnnounced = false;
+    this._koLoserIdx = -1;
     this.world.timeScale = 1;
     this.world.hitstop = 0;
     this.ui.setTimer(this.timer);
-    this.ui.announce(`ROUND ${this.round}`, { dur: 1.0 });
-    SFX.roundBell();
-    if (this._isNet) this.netEvt({ k: 'round', n: this.round });   // 转发给客机
+    // 客机的公告/音效完全由主机事件驱动，这里只重置本地状态基线，避免与事件重复播放
+    if (this.mode !== 'net-guest') {
+      this.ui.announce(`ROUND ${this.round}`, { dur: 1.0 });
+      SFX.roundBell();
+    }
+    // 转发给客机：回合号 + 比分 + 双方能量（重建 HUD 所需的最小权威集）
+    if (this._isNet) {
+      this.netEvt({
+        k: 'round', n: this.round, score: [...this.score],
+        meter: [Math.round(f1.meter), Math.round(f2.meter)],
+      });
+      this.net?.flushState();   // 回合切换立即推一帧，客机不必等 33ms 定时器
+    }
   }
 
   _onFighterEvent(type, data) {
@@ -654,8 +775,7 @@ class Game {
           }
         } else {
           const loserIdx = this.fighters[0].state === 'ko' ? 0 : 1;
-          this.netEvt({ k: 'ko', slot: loserIdx });
-          this._onKO();
+          this._handleKo(loserIdx);
         }
       }
     }
@@ -791,40 +911,117 @@ class Game {
     return { held: cur, just };
   }
 
-  /** 主机：构造状态快照 */
+  /** 主机：记录一条待下发事件（带世代号与单调 id，客机按 id 去重） */
+  netEvt(o) {
+    if (!this._isNet || this.mode !== 'net-host') return;
+    this._pendingNetEvts.push({ ...o, g: this._netGen, id: ++this._netEvtSeq, ts: this.simTime });
+    if (this._pendingNetEvts.length > 512) this._pendingNetEvts.shift();
+  }
+
+  /** 主机：清理已确认事件（仅按确认/硬上限，绝不按时间丢弃未确认事件） */
+  _pruneNetEvts() {
+    // 正常路径：客机 ack 时立即移除。这里只做断线兜底的硬上限，不按时间裁剪，
+    // 否则客机短暂卡顿 >N 秒就会永久丢失事件。
+    if (this._pendingNetEvts.length > 512) this._pendingNetEvts.splice(0, this._pendingNetEvts.length - 512);
+  }
+
+  /** 主机：客机确认已消费到 id，移除对应事件（重复下发结束） */
+  _netApplyAck(g, id) {
+    if (this.mode !== 'net-host') return;
+    if (g != null && g !== this._netGen) return;   // 旧世代确认，忽略
+    while (this._pendingNetEvts.length && this._pendingNetEvts[0].id <= id) this._pendingNetEvts.shift();
+  }
+
+  /** 主机：构造状态快照（含完整权威状态 + 未确认事件） */
   _netSnap() {
     if (!this.fighters.length) return null;
+    this._pruneNetEvts();
     const [a, b] = this.fighters;
+    const inResult = this.phase === 'result';
     return {
-      phase: this.phase, sub: this.subPhase,
+      gen: this._netGen,
+      now: +this.simTime.toFixed(3),   // 主机模拟时刻（客机据此判断事件新旧，重建时过滤陈旧特效）
+      phase: this.phase, sub: this.subPhase, st: +this.subT.toFixed(2),
       t: +this.timer.toFixed(2), round: this.round,
       score: [...this.score],
+      ts: +this.world.timeScale.toFixed(3),
+      ko: (this.subPhase === 'koSlow' || this.subPhase === 'roundend') && this._koLoserIdx >= 0
+        ? this._koLoserIdx : null,
+      winner: inResult ? (this._winnerIdx ?? (this.score[0] > this.score[1] ? 0 : 1)) : null,
+      picks: [...this.picks], stage: this._activeStage,
       f: [a.serialize(), b.serialize()],
-      evts: this._pendingNetEvts.splice(0, this._pendingNetEvts.length),
+      evts: this._pendingNetEvts.slice(),   // 未确认的事件重发（客机按 id 去重，不会重复播放）
     };
   }
 
-  netEvt(o) { if (this._isNet) this._pendingNetEvts.push(o); }
-
-  /** 客机：应用主机快照 */
+  /** 客机：应用主机快照（一切回合/比分/计时/胜负以主机为准） */
   _applyNetState(snap) {
-    if (!this.fighters.length || !snap || !snap.f) return;
+    // 测试钩子：模拟断流/丢包（丢弃 N 个后续快照包，用于验证补发与去重）
+    if (this._dropSnaps > 0) { this._dropSnaps--; return; }
+    if (!snap || !snap.f) return;
+    if (this.mode !== 'net-guest') return;
+
+    // 旧世代快照（重赛前的残留）直接丢弃，绝不回滚到上一局
+    if (snap.gen != null && snap.gen < this._netGen) return;
+
+    // 中途加入 / 断线重连 / 错过重赛命令：世代号或角色阵容对不上时按主机快照重建
+    const lineupMismatch = snap.picks && (snap.picks[0] !== this.picks[0] || snap.picks[1] !== this.picks[1]);
+    let rebuilt = false;
+    if (!this.fighters.length || (snap.gen != null && snap.gen > this._netGen) || lineupMismatch) {
+      const prevGen = this._netGen, prevLast = this._netEvtLast;
+      if (snap.picks) this.picks = [...snap.picks];
+      this.startMatch(this.picks[0], this.picks[1], { stage: snap.stage, gen: snap.gen });
+      // 同一世代内重建（罕见）保留已播放游标，避免本局事件重放；跨世代则从 0 重新计
+      if (snap.gen != null && snap.gen === prevGen && prevLast > 0) this._netEvtLast = prevLast;
+      rebuilt = true;
+    }
+
     this._netLatest = snap;
     for (let i = 0; i < 2; i++) this.fighters[i].applySnapshot(snap.f[i]);
-    this.timer = snap.t; this.round = snap.round; this.score = snap.score;
-    if (snap.evts?.length) this._playNetEvts(snap.evts);
-    if (snap.phase === 'result' && this.phase === 'fight') {
-      this.phase = 'result';
-      const wIdx = snap.score[0] >= GAME.roundsToWin ? 0 : 1;
-      const w = this.fighters[wIdx];
-      if (w.state !== 'win') { w.state = 'win'; this._poseState = 'win'; w.model.setPose({ armL: [-0.25, 0, 2.35], foreL: [-0.4, 0, 0], armR: [-0.25, 0, -2.35], foreR: [-0.4, 0, 0], head: [-0.15, 0, 0] }); }
-      this.ui.showResult(w.char.name, w.isP1 ? 'P1' : 'P2', snap.score[0], snap.score[1]);
+
+    // 权威状态镜像
+    this.phase = snap.phase === 'result' ? 'result' : 'fight';
+    this.round = snap.round;
+    this.score = [...snap.score];
+    this.timer = snap.t;
+    this.subPhase = snap.sub || 'live';
+    this.subT = snap.st ?? 0;
+    this.world.timeScale = snap.ts ?? 1;
+    this.world.hitstop = 0;
+    this._koLoserIdx = snap.ko == null ? -1 : snap.ko;
+    if (snap.winner != null) this._winnerIdx = snap.winner;
+
+    if (snap.evts?.length) this._playNetEvts(snap.evts, rebuilt ? snap.now : null);
+
+    // 结算以主机为准（绝不本地推断胜者）
+    if (snap.phase === 'result') {
+      if (!this._resultShown && snap.winner != null) {
+        this._resultShown = true;
+        const w = this.fighters[snap.winner];
+        if (w) this.ui.showResult(w.char.name, w.isP1 ? 'P1' : 'P2', snap.score[0], snap.score[1]);
+        SFX.confirm();
+      }
+    } else {
+      this._resultShown = false;
     }
   }
 
-  /** 客机：播放主机转发的事件（特效/音效/公告） */
-  _playNetEvts(list) {
+  /**
+   * 客机：播放主机转发的事件（按 世代 + id 去重，同一事件只播一次）
+   * @param list 事件列表
+   * @param cutoffSimTime 中途加入/重建时传入主机当前时刻：早于 (now-0.6s) 的瞬时特效（火花等）
+   *        已无意义，只补播关键流程事件（round/fight/ko/winner/timeup），避免"历史特效齐放"。
+   */
+  _playNetEvts(list, cutoffSimTime = null) {
+    let maxId = this._netEvtLast;
+    this._netEvtPlayed = this._netEvtPlayed || {};
+    const CRITICAL = new Set(['round', 'fight', 'ko', 'winner', 'timeup']);
     for (const ev of list) {
+      if (ev.g != null && ev.g !== this._netGen) continue;  // 旧世代残留
+      if (ev.id != null && ev.id <= this._netEvtLast) continue;  // 已播放
+      if (ev.id != null) maxId = Math.max(maxId, ev.id);
+      if (cutoffSimTime != null && ev.ts != null && ev.ts < cutoffSimTime - 0.6 && !CRITICAL.has(ev.k)) continue;
+      this._netEvtPlayed[ev.k] = (this._netEvtPlayed[ev.k] || 0) + 1;   // 验证用计数
       switch (ev.k) {
         case 'sparks':
           this.fx.sparks(new THREE.Vector3(ev.x, ev.y, ev.z), ev.c, ev.big ? 20 : 12, ev.big ? 8 : 5.5);
@@ -834,6 +1031,7 @@ class Game {
         case 'special': {
           SFX.special(); SFX[ev.sfx]?.();
           const f = this.fighters[ev.slot];
+          if (!f) break;
           this.fx.auraBurst(f, ev.slot === 0 ? 0x63c8ff : 0xff7854);
           this.fx.ring(new THREE.Vector3(f.x, 1.2, 0), ev.slot === 0 ? 0x63c8ff : 0xffa030, 1.7, 0.45);
           this.ui.announce(ev.name, { dur: 1.2, size: 'clamp(48px,8vw,110px)' });
@@ -843,7 +1041,7 @@ class Game {
         case 'ko':
           SFX.ko();
           this.fx.flash(0.55);
-          this.fx.ring(new THREE.Vector3(this.fighters[ev.slot].x, 1.3, 0), 0xffd76b, 2.4, 0.55);
+          if (this.fighters[ev.slot]) this.fx.ring(new THREE.Vector3(this.fighters[ev.slot].x, 1.3, 0), 0xffd76b, 2.4, 0.55);
           this.ui.announce('K.O.', { dur: 1.6, size: 'clamp(90px,17vw,240px)' });
           break;
         case 'round':
@@ -853,6 +1051,9 @@ class Game {
         case 'fight':
           this.ui.announce('开打！', { dur: 0.8, size: 'clamp(64px,11vw,150px)' });
           break;
+        case 'timeup':
+          this.ui.announce('TIME UP', { dur: 1.4, size: 'clamp(56px,10vw,130px)' });
+          break;
         case 'winner':
           this.ui.announce(`${ev.label} ${ev.name} 胜`, { dur: 1.4, size: 'clamp(36px,6vw,72px)' });
           break;
@@ -860,9 +1061,15 @@ class Game {
           if (ev.combo) this.ui.showCombo(ev.side, ev.combo);
       }
     }
+    this._netEvtLast = maxId;
+    // 仅当有新消费时才回执，避免 30Hz 无谓上行
+    if (this._netEvtLast > this._netAckSent) {
+      this._netAckSent = this._netEvtLast;
+      this.net?.send({ type: 'cmd', cmd: 'ack', g: this._netGen, id: this._netAckSent });
+    }
   }
 
-  /** 客机主循环：木偶渲染 + HUD 镜像 */
+  /** 客机主循环：木偶渲染 + HUD 镜像（回合推进/胜负全部由主机快照与事件驱动） */
   _tickFightGuest(dt) {
     const [f1, f2] = this.fighters;
     // 自动驾驶（测试）：本地 AI 决策经输入通道上行到主机执行
@@ -873,29 +1080,40 @@ class Game {
     }
     for (const f of this.fighters) f.puppetStep(dt);
     this.fx.update(dt);
-    this.fcam.update(dt, f1, f2, {});
+    // 相机与主机一致：KO 时聚焦倒地者
+    const koFocus = this.subPhase === 'koSlow' && this._koLoserIdx >= 0 ? this.fighters[this._koLoserIdx] : null;
+    this.fcam.update(dt, f1, f2, { koFocus });
     this.ui.updateHud(f1, f2, dt);
     this.ui.setTimer(this.timer);
   }
 
-  _onKO() {
+  /** KO 统一入口：下发事件（供客机播放）并推进主机子阶段（单一来源，避免事件重复） */
+  _handleKo(loserIdx) {
+    this.netEvt({ k: 'ko', slot: loserIdx });
+    this._onKO(loserIdx);
+  }
+
+  _onKO(loserIdx = null) {
     if (this.subPhase !== 'live') return;
-    const loserIdx = this.fighters[0].state === 'ko' ? 0 : 1;
+    if (loserIdx == null) loserIdx = this.fighters[0].state === 'ko' ? 0 : 1;
     this._koLoserIdx = loserIdx;
     this.subPhase = 'koSlow'; this.subT = 0;
     this.world.timeScale = GAME.slowmoKO;
     this.ui.announce('K.O.', { dur: 1.6, size: 'clamp(90px,17vw,240px)' });
+    if (this._isNet) this.net?.flushState();
   }
 
   _onTimeUp() {
     if (this.subPhase !== 'live') return;
     const [f1, f2] = this.fighters;
     this.ui.announce('TIME UP', { dur: 1.4, size: 'clamp(56px,10vw,130px)' });
+    if (this._isNet) this.netEvt({ k: 'timeup' });
     const r1 = f1.hp / f1.maxHp, r2 = f2.hp / f2.maxHp;
     let w = r1 === r2 ? -1 : (r1 > r2 ? 0 : 1);
     if (w >= 0) this.fighters[w].setWinner();
     this.subPhase = 'roundend'; this.subT = 0.9;   // 跳过慢动作等待
     this._finishRound(w);
+    if (this._isNet) this.net?.flushState();
   }
 
   _finishRound(winnerIdx) {
@@ -907,12 +1125,18 @@ class Game {
     }
     if (winnerIdx >= 0) {
       const label = this.fighters[winnerIdx].isP1 ? 'P1' : (this.mode === 'ai' ? 'AI' : 'P2');
-      setTimeout(() => {
-        this.ui.announce(`${label} ${this.fighters[winnerIdx].char.name} 胜`, { dur: 1.4, size: 'clamp(36px,6vw,72px)' });
+      const name = this.fighters[winnerIdx].char.name;
+      const gen = this._netGen, round = this.round;
+      clearTimeout(this._winnerAnnounceTimer);
+      this._winnerAnnounceTimer = setTimeout(() => {
+        // 重赛/回标题/下一回合后不再播放上一回合的胜利公告
+        if (this.phase !== 'fight' || gen !== this._netGen || round !== this.round) return;
+        this.ui.announce(`${label} ${name} 胜`, { dur: 1.4, size: 'clamp(36px,6vw,72px)' });
       }, 200);
-      this.netEvt({ k: 'winner', label: this.fighters[winnerIdx].isP1 ? 'P1' : 'P2', name: this.fighters[winnerIdx].char.name });
+      this.netEvt({ k: 'winner', label: this.fighters[winnerIdx].isP1 ? 'P1' : 'P2', name });
     }
     this._winnerIdx = winnerIdx;
+    if (this._isNet) this.net?.flushState();   // 比分/回合收尾立即同步
   }
 
   _showResult() {
@@ -923,6 +1147,7 @@ class Game {
     if (f.state !== 'win') f.setWinner();
     this.ui.showResult(f.char.name, f.isP1 ? 'P1' : (this.mode === 'ai' ? 'AI' : 'P2'), this.score[0], this.score[1]);
     SFX.confirm();
+    if (this._isNet) this.net?.flushState();   // 结算立即同步，避免客机停在旧回合画面
   }
 }
 
@@ -990,6 +1215,35 @@ function fillPortraitAsync(card, imgEl, charDef, i = 0) {
 window.addEventListener('DOMContentLoaded', () => {
   const game = new Game();
   window.__game = game;
+
+  // 联机测试钩子：供本地自动化验证读取权威状态/强制推进回合（不影响正常游玩）
+  window.__netPing = () => game.net ? { role: game.net.role, tx: game.net.txCount || 0, rx: game.net.rxCount || 0 } : null;
+  window.__netDebug = () => ({
+    role: game.netRole, mode: game.mode, phase: game.phase, sub: game.subPhase, subT: +game.subT.toFixed(3),
+    round: game.round, score: [...game.score], timer: +game.timer.toFixed(2),
+    gen: game._netGen, evtLast: game._netEvtLast, pending: game._pendingNetEvts.length,
+    resultShown: !!game._resultShown, winners: game._winnerIdx, stage: game._activeStage,
+    hp: game.fighters.map(f => Math.round(f.hp)), meter: game.fighters.map(f => Math.round(f.meter)),
+    state: game.fighters.map(f => f.state), roundsWon: game.fighters.map(f => f.roundsWon),
+    announce: ($('announce-text')?.textContent) || '',
+    resultText: $('screen-result') && !$('screen-result').classList.contains('hidden')
+      ? `${$('result-winner')?.textContent} ${$('result-score')?.textContent}` : '',
+    timerText: $('timer')?.textContent || '',
+    played: { ...(game._netEvtPlayed || {}) },
+  });
+  /** 测试专用：把场上某一方打成 KO（走完整真实 KO 流程，仅供 &autotest=1） */
+  window.__forceKO = (loserIdx = 1) => {
+    if (game.phase !== 'fight' || game.subPhase !== 'live') return false;
+    const l = game.fighters[loserIdx];
+    if (!l) return false;
+    l.hp = 0; l.state = 'ko'; l.stateT = 0; l.vx = 0; l.vy = 4.5;
+    game._handleKo(loserIdx);
+    return true;
+  };
+  /** 测试专用：队列中剩余事件（主机） */
+  window.__netPending = () => game._pendingNetEvts.slice();
+  /** 测试专用：模拟客机丢包/断流（丢弃接下来 N 个快照包，验证事件补发与去重） */
+  window.__dropSnaps = (n = 10) => { game._dropSnaps = n; return game._dropSnaps; };
 
   // 标题菜单键盘快捷键（1/2/3）
   window.addEventListener('keydown', (e) => {

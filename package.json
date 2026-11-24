@@ -4,7 +4,9 @@
   "description": "🐂 牛来格斗 NIU LAI FIGHT —— 基于 Three.js 的 3D 双人格斗游戏：本地双人 + 局域网联机，7 名角色、3 大舞台、连招与必杀技系统。A 3D two-player fighting game built with Three.js: local versus & LAN multiplayer, 7 fighters, 3 stages, combos and super moves.",
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test:lan": "node tests/lan-round-sync.mjs",
+    "test:lan:robust": "node tests/lan-robustness.mjs"
   },
   "keywords": [
     "threejs", "webgl", "fighting-game", "3d-game", "browser-game",
@@ -19,5 +21,8 @@
   "dependencies": {
     "three": "^0.170.0",
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.63.0"
   }
 }

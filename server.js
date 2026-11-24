@@ -99,8 +99,11 @@ wss.on('connection', (ws) => {
       case 'input':  // 客户端 → 主机：输入状态
         if (room && ws === room.guest) send(room.host, { type: 'input', keys: msg.keys });
         break;
-      case 'state':  // 主机 → 客户端：权威状态快照
-        if (room && ws === room.host) send(room.guest, { type: 'state', ...msg.data });
+      case 'state':  // 主机 → 客户端：权威状态快照（整体转发，去掉 type）
+        if (room && ws === room.host) {
+          const { type: _t, ...rest } = msg;
+          send(room.guest, { type: 'state', ...rest });
+        }
         break;
       case 'cmd':    // 双向命令（开始/重赛等）—— 透传全部字段
         if (room) {
