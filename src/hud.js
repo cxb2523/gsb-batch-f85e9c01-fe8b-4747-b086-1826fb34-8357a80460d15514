@@ -366,6 +366,9 @@ export function popText(pos, text, color = '#b4ff6a', size = 18) { floats.push({
 
 // ============================================================ Per-frame HUD
 let lastHits = -1, lastScore = -1, lastBombs = -1, lastLives = -1, lastGold = -1, lastLaser = -1, lastShield = -1, lastMax = -1;
+// Bumped whenever the HUD cache is rebuilt (checkpoint respawn): invalidates deferred shield-ghost
+// width writes queued from before the reset, so a stale timer can never stick the bar.
+let hudResetGen = 0;
 const _v = new THREE.Vector3(), _v2 = new THREE.Vector3();
 
 function project(p, out) {
@@ -389,7 +392,10 @@ export function updateHUD(dt, rdt) {
     const f = run.shield / run.maxShield;
     EL.shieldFill.style.width = `calc(${f * 100}% - 4px)`;
     if (sh > lastShield) EL.shieldGhost.style.width = `calc(${f * 100}% - 4px)`;
-    else setTimeout(() => { EL.shieldGhost.style.width = `calc(${f * 100}% - 4px)`; }, 30);
+    else {
+      const gen = hudResetGen;
+      setTimeout(() => { if (gen === hudResetGen) EL.shieldGhost.style.width = `calc(${f * 100}% - 4px)`; }, 30);
+    }
     EL['g-shield'].classList.toggle('low', f < 0.3);
     lastShield = sh; lastMax = run.maxShield;
   }
@@ -412,7 +418,7 @@ export function updateHUD(dt, rdt) {
   drawCanvas(dt, rdt);
 }
 
-export function resetHUDCache() { lastHits = lastScore = lastBombs = lastLives = lastGold = lastLaser = lastShield = lastMax = -1; }
+export function resetHUDCache() { lastHits = lastScore = lastBombs = lastLives = lastGold = lastLaser = lastShield = lastMax = -1; hudResetGen++; }
 
 const pA = { x: 0, y: 0, z: 0 }, pB = { x: 0, y: 0, z: 0 }, pL = { x: 0, y: 0, z: 0 };
 function drawCanvas(dt, rdt) {

@@ -24,7 +24,7 @@ import {
 import {
   initHUD, showScreen, hideScreens, hudVisible, updateHUD, radio, clearRadio, tip, clearTip, banner, hideBanner, warning, bossBar,
   setBossHP, popText, MENU_CB, titlePressed, titleReset, updateMenus, menuBack, refreshTitle, showTitleMenu, setLoading, showResults,
-  updateResults, skipResults, resetHUDCache, setGameOverText, clearMarkers,
+  updateResults, skipResults, resetHUDCache, setGameOverText, clearMarkers, markers,
 } from './hud.js';
 import { AudioSys } from './audio.js';
 
@@ -96,8 +96,11 @@ async function boot() {
   wireEvents();
   enterTitle(true);
   requestAnimationFrame(loop);
-  if (__DEV__) Object.assign(window, {
-    G, BOSS, WING, ship, emit, Input, POST, GFX, THREE,
+  // Regression hooks are exposed in every build: they stay inert unless the page is driven
+  // through __step() or loaded with ?manual, and let external verification run against the
+  // single-file index.html without requiring a separate dev bundle.
+  Object.assign(window, {
+    G, BOSS, WING, ship, emit, Input, POST, GFX, THREE, CAM, markers,
     __jump: (d) => { G.run = G.run || newRun(); hideScreens(); setupStage(d, false); },
     __start: () => startMission(),
     CAMP, progress,
@@ -169,8 +172,8 @@ async function boot() {
 // Pause automatically when the page loses focus mid-mission.
 // (Dev builds: `window.__manual = true` hands every frame to __step/__bot, for repeatable test runs.
 //  `?manual&seed=N` in the URL turns that on from the first frame and seeds Math.random before boot.)
-const manual = () => __DEV__ && window.__manual;
-if (__DEV__) {
+const manual = () => !!window.__manual;
+{
   const q = new URLSearchParams(location.search);
   if (q.has('manual')) window.__manual = true;
   if (q.has('seed')) { const r0 = mulberry32(+q.get('seed') || 1); window.__rc = 0; Math.random = () => { window.__rc++; return r0(); }; }
@@ -454,8 +457,15 @@ function setupStage(d, intro) {
   CUR.onSetup?.(d, G.run);
   resetCamera(ship);
   CAM.override = null;
+  // Drop any screen-space feedback frozen from the death instant before placing the camera.
+  POST.damage = 0; POST.ca = 0.0012; POST.flash = 0; G.shake = 0;
+  // Rebuild the ship transform and chase camera immediately at the checkpoint — never leave
+  // them pointed at the death position for a frame or lerp across the distance.
+  ship.snapToRail();
+  updateCamera(0.016, ship);
   resetHUDCache();
   hudVisible(true);
+  updateHUD(0, 0);
   POST.letterbox = intro ? 1 : 0;
   S.intro = intro ? { t: 0 } : null;
   S.bossCine = null;
@@ -470,6 +480,10 @@ function setupStage(d, intro) {
   if (!intro && G.run.deaths > 0) after(1.2, () => radio('hou', '無理をするな、ランサー1。体勢を立て直せ！', { prio: 1 }));
 }
 
+// Brief spawn protection after a checkpoint respawn: long enough to cover the fade-in and
+// any shots that survived the clear, short enough that the blink never gets "stuck".
+const RESPAWN_INVULN = 2.5;
+
 function respawn(fromMenu) {
   const cp = G.run.checkpoint;
   const d = cp === 0 ? 0 : Math.max(0, cp - 150);
@@ -477,7 +491,12 @@ function respawn(fromMenu) {
   run.shield = run.maxShield = Math.max(100, run.maxShield === 140 ? 140 : 100);
   run.laser = Math.max(0, run.laser - 1);
   run.bombs = Math.max(run.bombs, 3);
-  fadeTo(1, fromMenu ? 0.35 : 0.6, () => setupStage(d, false));
+  fadeTo(1, fromMenu ? 0.35 : 0.6, () => {
+    setupStage(d, false);
+    // Invulnerable (with blink) from the very first frame of the rebuilt run.
+    ship.invuln = RESPAWN_INVULN;
+    ship.blink = 0;
+  });
 }
 
 function pause() {

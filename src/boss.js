@@ -193,7 +193,11 @@ export class Boss {
     this.missileT = 6; this.diveT = 12; this.diving = 0; this.burstT = 4; this.passDone = false;
     this.roared = false; this.reported = false; this.deadT = 0; this.deathIdx = 0;
     this.coreT.hp = 150; this.coreT.alive = true;
-    for (const s of this.segs) if (s.turret) { s.turret.hp = 10; s.turret.alive = true; s.turret.mesh.visible = true; s.turret.target.alive = true; s.turret.flash = 0; }
+    for (const s of this.segs) if (s.turret) {
+      const tr = s.turret;
+      tr.hp = 10; tr.alive = true; tr.mesh.visible = true; tr.target.alive = true; tr.flash = 0;
+      tr.fireT = rand(1.6, 3.2);   // fresh firing cadence from the (re)spawn moment
+    }
     for (const s of this.segs) { s.mesh.visible = true; s.burn = 0; s.dead = false; }
     this.head.visible = true;
     this.mat.userData.tint.value.setRGB(1, 1, 1);

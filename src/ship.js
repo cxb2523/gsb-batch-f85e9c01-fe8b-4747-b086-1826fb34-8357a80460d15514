@@ -293,7 +293,33 @@ export class PlayerShip {
     this.autoPilot = null;
     this.root.visible = true;
     this.model.group.visible = true;
+    // the death sequence hides the blob shadow and trails — make sure a reset shows them again
+    this.blob.visible = true;
+    for (const t of this.trails) t.visible = true;
     this.firstFrame = true;
+  }
+
+  // Re-establish position/orientation immediately at the current rail frame. The checkpoint
+  // respawn calls this after changing G.rail.d so no transform lingers at the death point
+  // for an extra frame (and camera/HUD can be snapped synchronously).
+  snapToRail() {
+    railFrame(G.rail.d, this.railPos, this.railFwd, this.railRight);
+    this.computePos(this.pos);
+    _back.copy(this.railFwd).negate();
+    _m.makeBasis(this.railRight, YUP, _back);
+    _q.setFromRotationMatrix(_m);
+    _e.set(this.pitch, this.yaw, this.bank + this.rollAngle, 'YXZ');
+    _q2.setFromEuler(_e);
+    this.quat.copy(_q).multiply(_q2);
+    this.root.position.copy(this.pos);
+    this.root.quaternion.copy(this.quat);
+    this.fwd.set(0, 0, -1).applyQuaternion(this.quat);
+    this.up.set(0, 1, 0).applyQuaternion(this.quat);
+    this.rightV.set(1, 0, 0).applyQuaternion(this.quat);
+    this.shield.quaternion.identity();
+    // restart trails at the new position instead of stretching them from the death point
+    for (const t of this.trails) { t.visible = true; t.reset(this.pos); }
+    this.firstFrame = false;
   }
 
   get rolling() { return this.rollT > 0; }
@@ -391,7 +417,7 @@ export class PlayerShip {
 
     // ---- invulnerability blink
     if (this.invuln > 0) {
-      this.invuln -= dt;
+      this.invuln = Math.max(0, this.invuln - dt);
       this.blink += dt;
       this.model.group.visible = this.invuln <= 0 || (Math.floor(this.blink * 18) % 2 === 0);
     } else this.model.group.visible = true;
