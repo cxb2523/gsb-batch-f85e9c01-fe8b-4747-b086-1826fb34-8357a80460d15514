@@ -1,8 +1,21 @@
 <template>
   <div id="gamePage">
     <a-row align="space-between">
-      <a-button style="margin-bottom: 8px" @click="doBack"> 返回</a-button>
-      <a-button>块数：{{ clearBlockNum }} / {{ totalBlockNum }}</a-button>
+      <div>
+        <a-button style="margin-bottom: 8px" data-action="back" @click="doBack">
+          返回
+        </a-button>
+        <a-button
+          style="margin-bottom: 8px; margin-left: 8px"
+          data-action="restart"
+          @click="doRestart"
+        >
+          重新开始
+        </a-button>
+      </div>
+      <a-button>
+        块数：{{ clearBlockNum }} / {{ totalBlockNum }}，槽位：{{ currSlotNum }}
+      </a-button>
     </a-row>
     <!-- 胜利 -->
     <a-row align="center">
@@ -71,12 +84,24 @@
     <!-- 技能 -->
     <div class="skill-board">
       <a-space>
-        <a-button size="small" @click="doRevert">撤回</a-button>
-        <a-button size="small" @click="doRemove">移出</a-button>
-        <a-button size="small" @click="doShuffle">洗牌</a-button>
-        <a-button size="small" @click="doBroke">破坏</a-button>
-        <a-button size="small" @click="doHolyLight">圣光</a-button>
-        <a-button size="small" @click="doSeeRandom">透视</a-button>
+        <a-button size="small" data-skill="revert" @click="doRevert">
+          撤回
+        </a-button>
+        <a-button size="small" data-skill="remove" @click="doRemove">
+          移出
+        </a-button>
+        <a-button size="small" data-skill="shuffle" @click="doShuffle">
+          洗牌
+        </a-button>
+        <a-button size="small" data-skill="broke" @click="doBroke">
+          破坏
+        </a-button>
+        <a-button size="small" data-skill="holy-light" @click="doHolyLight">
+          圣光
+        </a-button>
+        <a-button size="small" data-skill="see-random" @click="doSeeRandom">
+          透视
+        </a-button>
       </a-space>
     </div>
   </div>
@@ -99,6 +124,8 @@ const {
   heightUnit,
   totalBlockNum,
   clearBlockNum,
+  currSlotNum,
+  opHistory,
   isHolyLight,
   canSeeRandom,
   doClickBlock,
@@ -109,13 +136,46 @@ const {
   doRevert,
   doHolyLight,
   doSeeRandom,
+  getBoardBlocks,
 } = useGame();
+
+// 仅开发环境暴露游戏实例，便于浏览器端自动化 / 调试校验
+// 生产构建时 import.meta.env.DEV 为 false，该分支会被剔除
+if (import.meta.env.DEV) {
+  (window as any).__game = {
+    gameStatus,
+    levelBlocksVal,
+    randomBlocksVal,
+    slotAreaVal,
+    totalBlockNum,
+    clearBlockNum,
+    currSlotNum,
+    isHolyLight,
+    canSeeRandom,
+    opHistory,
+    getBoardBlocks,
+    doClickBlock,
+    doShuffle,
+    doBroke,
+    doRemove,
+    doRevert,
+    doHolyLight,
+    doSeeRandom,
+  };
+}
 
 /**
  * 回上一页
  */
 const doBack = () => {
   router.back();
+};
+
+/**
+ * 重新开始一局（完整清空上一局状态后重新生成）
+ */
+const doRestart = () => {
+  doStart();
 };
 
 onMounted(() => {
