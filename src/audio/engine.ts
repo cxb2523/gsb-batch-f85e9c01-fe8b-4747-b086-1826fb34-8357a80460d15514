@@ -51,11 +51,23 @@ export class AudioEngine {
   readonly budget = new VoiceBudget(28);
   readonly samples = new SampleBank();
   private graph: Graph | null = null;
+  /** Sticky: there is no usable WebAudio in this browser (or construction threw). Unlike a
+   * disposed context, this can never be recovered, so accessors stay a safe no-op forever. */
   private failed = false;
   private locked = false;
   private offline = false;
   private resumeToken = 0;
-  private unlockArmed = false;
+  /** A `resume()` is in flight; don't stack another one every frame. */
+  private resumePending = false;
+  /** Bumped on every context change, so timers/promises from an old context cannot touch a new one. */
+  private generation = 0;
+  /** Passive creation is allowed. `dispose()` clears it so per-frame `live()` cannot resurrect a
+   * torn-down engine; the next explicit `start()` sets it again. */
+  private lazy = true;
+  private detachUnlock: (() => void) | null = null;
+  /** The context the noise/pluck caches were generated for: AudioBuffers are context-bound and a
+   * buffer made by a closed context cannot be played by a new one. */
+  private bufferContext: AudioContext | null = null;
   private readonly noises = new Map<NoiseColor, AudioBuffer>();
   private readonly plucks = new Map<number, AudioBuffer>();
 
@@ -66,42 +78,121 @@ export class AudioEngine {
 
   /** Create the context after a user gesture (idempotent). Returns the graph, or null. */
   ensure(): Graph | null {
-    if (this.graph) return this.graph;
+    const existing = this.graph;
+    if (existing && existing.ctx.state !== 'closed') return existing;
+    // The browser closed the context underneath us (device change, tab discard): rebuild from scratch.
+    if (existing) this.teardown();
     if (this.failed) return null;
+    // After dispose() only an explicit start() (which re-arms `lazy`) may create a new context.
+    if (!this.lazy) return null;
     if (!this.started && !userHasActivated()) return null;
+    let ctx: AudioContext | null = null;
     try {
       const Constructor = contextConstructor();
       if (!this.options.createContext && !Constructor) { this.failed = true; return null; }
-      const ctx = this.options.createContext ? this.options.createContext() : new Constructor!({ latencyHint: 'interactive' });
-      this.ctx = ctx;
-      this.offline = typeof OfflineAudioContext !== 'undefined' && ctx instanceof OfflineAudioContext;
-      this.graph = this.build(ctx);
-      ctx.onstatechange = () => { if (ctx.state === 'running') this.locked = false; };
-      this.applyRunState();
+      ctx = this.options.createContext ? this.options.createContext() : new Constructor!({ latencyHint: 'interactive' });
+      this.adoptContext(ctx);
+      this.buildInto(ctx);
     } catch {
-      this.failed = true; this.ctx = null; this.graph = null;
+      this.closeContext(ctx);
+      this.teardown();
+      this.failed = true;
     }
     return this.graph;
   }
 
-  /** The graph when sound may play right now, otherwise null. */
+  /** The graph when sound may play right now, otherwise null. After `dispose()` this stays null
+   * (and never lazily recreates a context) until `start()` is called again. */
   live(): Graph | null {
-    const graph = this.graph ?? this.ensure();
-    if (!graph || !this.enabled || this.paused || this.locked || graph.ctx.state === 'closed') return null;
+    if (!this.lazy && !this.graph) return null;
+    let graph = this.graph;
+    if (!graph || graph.ctx.state === 'closed') graph = this.ensure();
+    if (!graph) return null;
+    // A browser may suspend a live context on its own (autoplay policy, audio interruption):
+    // nudge it back rather than staying silent for the rest of the session.
+    if (!this.offline && this.enabled && !this.paused && graph.ctx.state !== 'running') this.requestResume();
+    if (!this.enabled || this.paused || this.locked || graph.ctx.state === 'closed') return null;
     return graph;
+  }
+
+  /** True when new voices may be scheduled now: the context is running (or being rendered
+   * offline). `live()` stays optimistic for one pending resume request; this gate keeps sounds
+   * from being stacked onto a frozen clock and all bursting out the instant the context resumes. */
+  get running(): boolean {
+    const ctx = this.ctx;
+    if (!ctx || !this.graph) return false;
+    return this.offline || ctx.state === 'running';
   }
 
   start(): void {
     this.started = true;
+    this.lazy = true;
     if (this.ensure()) this.applyRunState();
   }
   setEnabled(enabled: boolean): void { this.enabled = enabled; this.applyRunState(); }
   setPaused(paused: boolean): void { this.paused = paused; this.applyRunState(); }
 
+  /** Tear the context down. The engine does not fail permanently: a later `start()` builds a
+   * brand-new context, with a fresh graph, buses, reverb and buffer caches, instead of trying to
+   * reuse nodes or buffers that belonged to the closed one. */
   dispose(): void {
     const ctx = this.ctx;
-    this.graph = null; this.ctx = null; this.failed = true;
-    if (ctx && ctx.state !== 'closed') void ctx.close().catch(() => {});
+    this.lazy = false;
+    this.teardown();
+    this.closeContext(ctx);
+  }
+
+  /** Forget everything tied to the current context. Leaves `enabled` / `paused` / `started` alone
+   * (they are user-facing run state) and leaves `failed` alone (that is a browser capability). */
+  private teardown(): void {
+    this.graph = null;
+    this.ctx = null;
+    this.generation++;
+    this.resumeToken++;
+    this.resumePending = false;
+    this.locked = false;
+    this.budget.reset();
+    this.clearBuffers();
+    this.samples.invalidate();
+    this.detachUnlock?.();
+    this.detachUnlock = null;
+  }
+
+  /** Reset per-context state and remember `ctx` as the one new buffers belong to. */
+  private adoptContext(ctx: AudioContext): void {
+    this.ctx = ctx;
+    this.offline = typeof OfflineAudioContext !== 'undefined' && ctx instanceof OfflineAudioContext;
+    this.generation++;
+    this.resumeToken++;
+    this.resumePending = false;
+    this.locked = false;
+    this.budget.reset();
+    this.clearBuffers();
+    this.samples.invalidate();
+    this.bufferContext = ctx;
+    this.detachUnlock?.();
+    this.detachUnlock = null;
+  }
+
+  private buildInto(ctx: AudioContext): void {
+    this.graph = this.build(ctx);
+    const generation = this.generation;
+    ctx.onstatechange = () => {
+      if (generation !== this.generation || this.ctx !== ctx) return;
+      if (ctx.state === 'running') { this.locked = false; this.resumePending = false; }
+    };
+    this.applyRunState();
+  }
+
+  private clearBuffers(): void {
+    this.noises.clear();
+    this.plucks.clear();
+    this.bufferContext = null;
+  }
+
+  private closeContext(ctx: AudioContext | null): void {
+    if (!ctx || ctx.state === 'closed') return;
+    try { void ctx.close().catch(() => {}); } catch { /* already unusable */ }
   }
 
   /** Reserve budget for one logical sound. Priority: 0 background, 1 normal, 2 essential. */
@@ -117,33 +208,59 @@ export class AudioEngine {
     if (this.offline) return;
     if (this.enabled && !this.paused) { if (ctx.state !== 'running') this.requestResume(); }
     else if (this.paused) void ctx.suspend().catch(() => {});
-    else setTimeout(() => { if (!this.enabled && ctx.state === 'running') void ctx.suspend().catch(() => {}); }, 420);
+    else {
+      const generation = this.generation;
+      setTimeout(() => { if (generation === this.generation && !this.enabled && ctx.state === 'running') void ctx.suspend().catch(() => {}); }, 420);
+    }
   }
 
   private requestResume(): void {
     const ctx = this.ctx;
-    if (!ctx || ctx.state === 'running' || ctx.state === 'closed') return;
+    if (!ctx || this.resumePending || ctx.state === 'running' || ctx.state === 'closed') return;
+    if (this.locked) return; // already waiting for a user gesture; don't hammer the context
+    const generation = this.generation;
     const token = ++this.resumeToken;
-    ctx.resume().then(() => { if (token === this.resumeToken && ctx.state === 'running') this.locked = false; })
-      .catch(() => { this.locked = true; this.armUnlock(); });
+    const current = () => generation === this.generation && token === this.resumeToken;
+    this.resumePending = true;
+    ctx.resume().then(() => {
+      if (!current()) return;
+      this.resumePending = false;
+      if (ctx.state === 'running') this.locked = false;
+    }).catch(() => {
+      if (!current()) return;
+      this.resumePending = false;
+      this.locked = true; this.armUnlock();
+    });
     // Chrome leaves resume() pending without a gesture: stop scheduling until one arrives.
     setTimeout(() => {
-      if (token === this.resumeToken && ctx.state === 'suspended' && this.enabled && !this.paused) { this.locked = true; this.armUnlock(); }
+      if (!current()) return;
+      this.resumePending = false;
+      if (ctx.state !== 'running' && this.enabled && !this.paused) { this.locked = true; this.armUnlock(); }
     }, 450);
   }
 
   private armUnlock(): void {
-    if (this.unlockArmed || typeof window === 'undefined') return;
-    this.unlockArmed = true;
+    if (this.detachUnlock || typeof window === 'undefined') return;
     const events = ['pointerdown', 'keydown', 'touchend'] as const;
+    const generation = this.generation;
     const unlock = () => {
       const ctx = this.ctx;
-      if (!ctx) { remove(); return; }
+      if (!ctx || generation !== this.generation) { remove(); return; }
       void ctx.resume().then(() => {
-        if (ctx.state === 'running') { this.locked = false; remove(); }
+        if (generation === this.generation && ctx.state === 'running') {
+          this.locked = false;
+          this.resumePending = false;
+          this.resumeToken++;
+          remove();
+        }
       }).catch(() => {});
     };
-    const remove = () => { this.unlockArmed = false; for (const name of events) window.removeEventListener(name, unlock, true); };
+    const remove = () => {
+      if (this.detachUnlock !== remove) return;
+      this.detachUnlock = null;
+      for (const name of events) window.removeEventListener(name, unlock, true);
+    };
+    this.detachUnlock = remove;
     for (const name of events) window.addEventListener(name, unlock, true);
   }
 
@@ -189,10 +306,12 @@ export class AudioEngine {
   }
 
   // ---------------------------------------------------------------- buffers
-  /** Shared looping-friendly noise (4 s). Cached per colour. */
+  /** Shared looping-friendly noise (4 s). Cached per colour and per context: the cache is dropped
+   * whenever the context changes, because an AudioBuffer belongs to the context that created it. */
   noise(color: NoiseColor): AudioBuffer | null {
     const ctx = this.ctx;
     if (!ctx) return null;
+    if (this.bufferContext !== ctx) { this.clearBuffers(); this.bufferContext = ctx; }
     const cached = this.noises.get(color);
     if (cached) return cached;
     const length = Math.floor(ctx.sampleRate * 4);
@@ -225,10 +344,11 @@ export class AudioEngine {
     return buffer;
   }
 
-  /** Karplus-Strong plucked string at roughly `frequency` (cached by rounded pitch). */
+  /** Karplus-Strong plucked string at roughly `frequency` (cached by rounded pitch, per context). */
   pluck(frequency: number): AudioBuffer | null {
     const ctx = this.ctx;
     if (!ctx) return null;
+    if (this.bufferContext !== ctx) { this.clearBuffers(); this.bufferContext = ctx; }
     const key = Math.round(frequency);
     const cached = this.plucks.get(key);
     if (cached) return cached;

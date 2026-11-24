@@ -62,7 +62,16 @@ export class GameSound {
   start(): void { this.guard(() => this.engine.start()); }
   setEnabled(enabled: boolean): void { this.guard(() => this.engine.setEnabled(enabled)); }
   setPaused(paused: boolean): void { this.guard(() => this.engine.setPaused(paused)); }
-  dispose(): void { this.guard(() => { this.ambience.stop(this.engine.live()); this.babble.stop(); this.engine.dispose(); }); }
+  /** Tear the audio down. `start()` afterwards builds a completely new context. */
+  dispose(): void {
+    this.guard(() => {
+      // The context is about to close, so there is no point fading the beds; drop them outright.
+      this.ambience.reset();
+      this.babble.stop();
+      this.stepClock = 0;
+      this.engine.dispose();
+    });
+  }
 
   /** Replace a synthesized event with a recording (decoded lazily on first use; synth until ready). */
   registerSample(event: SoundEvent, url: string, options?: SampleOptions): void { this.engine.samples.register(event, url, options); }
@@ -80,7 +89,7 @@ export class GameSound {
   /** Per-frame driver: ambience, footsteps, jump/land, dialogue babble. */
   update(frame: SoundFrame): void {
     this.guard(() => {
-      const g = this.engine.live();
+      const g = this.audible();
       if (!g) { this.stepClock = 0; return; }
       const active = frame.active ?? true;
       this.babble.update(frame.dt, g);
@@ -114,7 +123,7 @@ export class GameSound {
 
   /** Music-box note for step `index` of a thread of `kind` (a pentatonic tune as you walk). */
   threadStep(index: number, kind: ThreadKind): void {
-    this.guard(() => { const g = this.engine.live(); if (g) this.music.threadStep(g, index, kind); });
+    this.guard(() => { const g = this.audible(); if (g) this.music.threadStep(g, index, kind); });
   }
   threadPickup(): void { this.play('thread.pickup', 'sfx', g => this.sfx.pickup(g)); }
   threadReel(): void { this.play('thread.reel', 'sfx', g => this.sfx.reel(g)); }
@@ -124,10 +133,23 @@ export class GameSound {
   chapterComplete(): void { this.play('chapterComplete', 'music', g => this.music.chapterComplete(g)); }
 
   // ---------------------------------------------------------------- internals
+  /** The graph to schedule new voices on, or null when nothing may start right now.
+   *
+   * `engine.live()` is deliberately optimistic for the short window where a resume is in flight
+   * (the context already exists, the browser has just not flipped it to running yet). Scheduling
+   * into that window is exactly what makes a paused or autoplay-locked game fire a whole batch of
+   * queued sounds the instant audio resumes, so scheduling additionally requires the context clock
+   * to be running. Sounds dropped here are simply not queued; the next event plays normally. */
+  private audible(): Graph | null {
+    const g = this.engine.live();
+    if (!g) return null;
+    return this.engine.running ? g : null;
+  }
+
   /** Play a registered sample if one is ready, otherwise run the synth version. */
   private play(event: SoundEvent, bus: 'sfx' | 'music', synth: (g: Graph) => void): void {
     this.guard(() => {
-      const g = this.engine.live();
+      const g = this.audible();
       if (!g) return;
       if (this.engine.samples.has(event) && this.engine.samples.play(g.ctx, g[bus].input, event)) return;
       synth(g);

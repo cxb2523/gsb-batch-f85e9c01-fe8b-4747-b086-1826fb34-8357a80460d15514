@@ -18,6 +18,8 @@ interface Entry { url: string; options: SampleOptions; state: 'idle' | 'loading'
 
 export class SampleBank {
   private readonly entries = new Map<SoundEvent, Entry>();
+  /** Bumped by `invalidate()` so a decode that finishes after a context swap is discarded. */
+  private epoch = 0;
 
   register(event: SoundEvent, url: string, options: SampleOptions = {}): void {
     if (!(SOUND_EVENTS as readonly string[]).includes(event)) throw new Error(`Unknown sound event: ${event}`);
@@ -30,6 +32,17 @@ export class SampleBank {
   /** True once the sample is decoded and will be used instead of the synth. */
   ready(event: SoundEvent): boolean { return this.entries.get(event)?.state === 'ready'; }
 
+  /** Decoded AudioBuffers belong to the context that decoded them, so a new (or torn-down)
+   * context invalidates them. Registrations survive; the samples re-decode lazily on next play,
+   * falling back to the synth until then. */
+  invalidate(): void {
+    this.epoch++;
+    for (const entry of this.entries.values()) {
+      entry.state = 'idle';
+      entry.buffer = undefined;
+    }
+  }
+
   /** Fetch and decode registered samples. Called explicitly; never automatic. */
   async preload(context: BaseAudioContext, events: readonly SoundEvent[] = this.registered()): Promise<void> {
     await Promise.all(events.map(event => this.load(context, event)));
@@ -38,14 +51,17 @@ export class SampleBank {
   private async load(context: BaseAudioContext, event: SoundEvent): Promise<void> {
     const entry = this.entries.get(event);
     if (!entry || entry.state === 'loading' || entry.state === 'ready') return;
+    const epoch = this.epoch;
     entry.state = 'loading';
     try {
       const response = await fetch(entry.url);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      entry.buffer = await context.decodeAudioData(await response.arrayBuffer());
+      const buffer = await context.decodeAudioData(await response.arrayBuffer());
+      if (epoch !== this.epoch) return; // context swapped while decoding: drop this buffer
+      entry.buffer = buffer;
       entry.state = 'ready';
     } catch {
-      entry.state = 'failed';
+      if (epoch === this.epoch) entry.state = 'failed';
     }
   }
 

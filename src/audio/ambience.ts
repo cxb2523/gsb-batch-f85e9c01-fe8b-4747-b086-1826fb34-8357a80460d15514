@@ -21,6 +21,8 @@ const PHRASE_GAP = 1.8;
 
 export class Ambience {
   private beds: Beds | null = null;
+  /** The context the beds (and the recorded loop) were built on; a rebuilt context means new nodes. */
+  private bedsCtx: AudioContext | null = null;
   private chord = 0;
   private chordClock = 0;
   private sparkleClock = 4;
@@ -33,7 +35,9 @@ export class Ambience {
   constructor(private readonly engine: AudioEngine, private readonly music: MusicPlayer) {}
 
   update(frame: SoundFrame, g: Graph): void {
+    if (this.beds && this.bedsCtx !== g.ctx) this.reset();
     const beds = this.beds ?? (this.beds = this.build(g));
+    this.bedsCtx = g.ctx;
     const dt = Math.min(frame.dt, 0.25);
     const life = clamp(frame.life ?? 0);
     const active = frame.active ?? true;
@@ -127,12 +131,15 @@ export class Ambience {
     return { seaGain, foamGain, windGain, windFilter, sources };
   }
 
-  /** Fade the beds out (used on dispose / when the game is torn down). */
-  stop(g: Graph | null): void {
-    if (!g || !this.beds) return;
-    const t = g.ctx.currentTime;
-    this.beds.seaGain.gain.setTargetAtTime(0, t, 0.2);
-    this.beds.foamGain.gain.setTargetAtTime(0, t, 0.2);
-    this.beds.windGain.gain.setTargetAtTime(0, t, 0.2);
+  /** Drop the beds so the next update on a (possibly new) context builds them from scratch.
+   * Used on dispose (the context is closing anyway) and when the engine swaps contexts. */
+  reset(): void {
+    for (const source of this.beds?.sources ?? []) {
+      try { source.stop(); } catch { /* already stopped */ }
+    }
+    try { this.loop?.stop(); } catch { /* already stopped */ }
+    this.loop = null;
+    this.beds = null;
+    this.bedsCtx = null;
   }
 }

@@ -7,6 +7,7 @@ import {
   scaleSemitones, sparkleInterval, threadNoteFreq, threadNoteMidi,
 } from '../src/audio/theory.ts';
 import { SampleBank } from '../src/audio/samples.ts';
+import { fakeContext } from './audio-fake.ts';
 import { SOUND_EVENTS, type UiSound, type Voice } from '../src/audio/types.ts';
 import { THREAD_COLORS, type ThreadKind } from '../src/chapter/data.ts';
 
@@ -216,55 +217,6 @@ test('GameSound is a safe no-op when WebAudio is unavailable', async () => {
 });
 
 // ---------------------------------------------------------------- fake WebAudio context
-function fakeParam() {
-  const param = {
-    value: 0, calls: 0,
-    setValueAtTime() { param.calls++; return param; }, linearRampToValueAtTime() { param.calls++; return param; },
-    exponentialRampToValueAtTime() { param.calls++; return param; }, setTargetAtTime() { param.calls++; return param; },
-    cancelScheduledValues() { return param; },
-  };
-  return param;
-}
-
-/** A permissive stand-in for the WebAudio graph: enough to run every code path in node. */
-function fakeContext() {
-  const created: { kind: string; node: Record<string, unknown> }[] = [];
-  let disconnects = 0;
-  const makeNode = (kind: string) => {
-    const store: Record<string, unknown> = { kind };
-    const node: Record<string, unknown> = new Proxy(store, {
-      get(target, property: string) {
-        if (property === 'connect') return (destination: unknown) => destination;
-        if (property === 'disconnect') return () => { disconnects++; };
-        if (property === 'start' || property === 'stop') return () => {};
-        if (property === 'then') return undefined;
-        if (!(property in target)) target[property] = fakeParam();
-        return target[property];
-      },
-      set(target, property: string, value) { target[property] = value; return true; },
-    });
-    created.push({ kind, node });
-    return node;
-  };
-  const ctx: Record<string, unknown> = {
-    state: 'running', currentTime: 0, sampleRate: 8000, destination: makeNode('destination'),
-    createGain: () => makeNode('gain'), createOscillator: () => makeNode('osc'), createBiquadFilter: () => makeNode('biquad'),
-    createDynamicsCompressor: () => makeNode('compressor'), createDelay: () => makeNode('delay'), createConvolver: () => makeNode('convolver'),
-    createBufferSource: () => makeNode('source'), createStereoPanner: () => makeNode('panner'),
-    createBuffer: (channels: number, length: number, rate: number) => ({
-      duration: length / rate, sampleRate: rate, length, numberOfChannels: channels,
-      getChannelData: () => new Float32Array(length),
-    }),
-    resume: () => Promise.resolve(), suspend: () => Promise.resolve(), close: () => Promise.resolve(),
-  };
-  return {
-    ctx: ctx as unknown as AudioContext,
-    raw: ctx,
-    count: (kind: string) => created.filter(entry => entry.kind === kind).length,
-    endAll: () => { for (const { node } of created) if (typeof node.onended === 'function') (node.onended as () => void)(); },
-    disconnects: () => disconnects,
-  };
-}
 
 test('the ambient beds hold no sustained pad oscillators', () => {
   const fake = fakeContext();
