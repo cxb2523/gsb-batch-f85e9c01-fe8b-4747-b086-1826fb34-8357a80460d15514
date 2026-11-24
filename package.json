@@ -1,0 +1,74 @@
+{
+  "name": "nyxmix",
+  "version": "0.1.0",
+  "description": "Open-source alternative to Adobe Audition for people and AI agents: multitrack audio editor in the browser with MCP, live sessions, spectral repair and loudness mastering.",
+  "mcpName": "io.github.Open-Cosmic-Software/nyxmix",
+  "type": "module",
+  "bin": {
+    "nyxmix": "bin/nyxmix.js"
+  },
+  "main": "server/index.js",
+  "files": [
+    "bin/",
+    "server/",
+    "public/",
+    "models/",
+    "examples/",
+    "docs/",
+    "deploy/",
+    "README.md",
+    "LICENSE",
+    "SKILL.md",
+    "server.json",
+    "!**/__pycache__",
+    "!**/*.pyc",
+    "!docs/img"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node --test test/*.test.mjs"
+  },
+  "keywords": [
+    "audio",
+    "audio-editor",
+    "daw",
+    "multitrack",
+    "mcp",
+    "mcp-server",
+    "ai-agents",
+    "podcast",
+    "web-audio",
+    "loudness",
+    "adobe-audition-alternative",
+    "audition-alternative",
+    "open-source-daw",
+    "audio-restoration",
+    "spectral-editor",
+    "mastering",
+    "ebu-r128"
+  ],
+  "author": "Nyx 🦞 & Fabian Budde (Open Cosmic Software)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Open-Cosmic-Software/nyxmix.git"
+  },
+  "homepage": "https://github.com/Open-Cosmic-Software/nyxmix#readme",
+  "bugs": {
+    "url": "https://github.com/Open-Cosmic-Software/nyxmix/issues"
+  },
+  "dependencies": {
+    "@grame/faustwasm": "^0.19.0",
+    "busboy": "^1.6.0",
+    "express": "^4.22.3",
+    "node-web-audio-api": "^2.2.0",
+    "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "axe-core": "^4.14.0",
+    "playwright": "^1.64.1"
+  }
+}
