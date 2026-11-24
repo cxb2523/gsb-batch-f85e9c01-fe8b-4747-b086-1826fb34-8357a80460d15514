@@ -1,0 +1,38 @@
+.layout {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  height: 100vh;
+}
+
+/* This is so that individual elements can set specific borders to 1px */
+.layout div {
+  border-color: #e5e5e5;
+  border-style: solid;
+}
+@media (prefers-color-scheme: dark) {
+  .layout div {
+    border-color: #505759;
+    border-style: solid;
+  }
+}
+
+.layout .menu {
+  display: flex;
+  flex-direction: column;
+  flex-grow: 0;
+}
+
+.layout .content {
+  display: flex;
+  flex-direction: row;
+  flex-grow: 1;
+}
+
+.layout .content .main {
+  flex: 1 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 200px;
+  max-width: 100%;
+}
