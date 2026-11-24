@@ -228,6 +228,10 @@ export class RaceDirector {
     if (this.state !== 'race' && this.state !== 'countdown') return;
     this.resumeTo = this.state;
     this.state = 'paused';
+    // Freeze the voices first, then duck: pinning the params after the duck
+    // is fine, but freezing after any other transition work would let a few
+    // more scheduled ramp ticks slip through.
+    this.env.audio.freeze();
     this.env.audio.duck(true);
     this.events.onStateChange?.(this.state);
   }
@@ -241,9 +245,25 @@ export class RaceDirector {
     this.events.onStateChange?.(this.state);
   }
 
-  quitToMenu(): void {
-    this.state = 'attract';
+  /**
+   * The single convergence point every exit from live racing runs through.
+   *
+   * The item field (boxes, bananas, rockets, explosion rings) goes back to
+   * its pristine grid and the continuous audio voices return to silence with
+   * the mix ducked, so whatever state comes next - attract or results -
+   * starts from the same known-clean baseline. Cars are NOT touched here:
+   * the caller decides whether the field is rebuilt (quit) or kept rolling
+   * behind the results board.
+   */
+  private settleField(): void {
+    this.items.reset();
+    this.env.audio.standby();
     this.env.audio.duck(true);
+  }
+
+  quitToMenu(): void {
+    this.settleField();
+    this.state = 'attract';
     this.spawnAttractPack();
     this.events.onCountdown?.(null);
     this.events.onStateChange?.(this.state);
@@ -589,6 +609,11 @@ export class RaceDirector {
   }
 
   private showResults(): void {
+    // Settle before entering the state: the slow-motion roll behind the
+    // results board keeps the cars, but leftover bananas, rockets and
+    // explosion rings would otherwise freeze mid-flight in the backdrop,
+    // and the engine would keep howling at finish-line revs.
+    this.settleField();
     this.state = 'results';
     this.recomputeOrder();
     const leaderT = this.order[0].finishTime || this.clock;

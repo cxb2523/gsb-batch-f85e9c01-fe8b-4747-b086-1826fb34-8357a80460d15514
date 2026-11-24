@@ -174,6 +174,20 @@ export class ItemField {
     this.peels.length = 0;
     for (const r of this.rockets) this.env.scene.remove(r.mesh);
     this.rockets.length = 0;
+    // Explosion rings live on the scene as well. A ring caught mid-animation
+    // by a reset would hang in the air indefinitely, because the fx pool is
+    // only stepped while a race is running.
+    for (const f of this.fx) {
+      f.life = 0;
+      f.mesh.visible = false;
+    }
+  }
+
+  /** Debug/verification hook: live-object counts, for headless assertions. */
+  counts(): { boxes: number; peels: number; rockets: number; fxActive: number } {
+    let fxActive = 0;
+    for (const f of this.fx) if (f.life > 0) fxActive++;
+    return { boxes: this.boxes.length, peels: this.peels.length, rockets: this.rockets.length, fxActive };
   }
 
   /** Trailing cars get better rolls, which keeps the field bunched up. */

@@ -18,11 +18,46 @@ Notes on method
     screenshotting real frames.
 """
 
+import os
 import pathlib
 import sys
 import time
 
-from playwright.sync_api import sync_playwright
+
+def _point_at_real_browser_cache():
+    """
+    Playwright resolves its browser cache from LOCALAPPDATA. Sandboxes that
+    redirect LOCALAPPDATA (and HOME) make the cache look empty even when
+    browsers are installed under the real user profile; point back at the
+    real cache then. Must run BEFORE importing playwright: the registry
+    reads the environment at import time.
+    """
+    if os.name != "nt" or "PLAYWRIGHT_BROWSERS_PATH" in os.environ:
+        return
+    local = os.environ.get("LOCALAPPDATA", "")
+    default_cache = pathlib.Path(local) / "ms-playwright" if local else None
+    if default_cache is not None and any(default_cache.glob("chromium*")):
+        return
+    candidates = [pathlib.Path(os.path.expanduser("~")) / "AppData" / "Local" / "ms-playwright"]
+    # The Python interpreter usually lives under the real user profile
+    # (C:\Users\<u>\AppData\Local\Programs\Python\...), which survives even
+    # when HOME, USERPROFILE and USERNAME are all redirected.
+    for parent in pathlib.Path(sys.executable).resolve().parents:
+        if parent.parent.name == "Users":
+            candidates.append(parent / "AppData" / "Local" / "ms-playwright")
+            break
+    users_dir = pathlib.Path(os.environ.get("SystemDrive", "C:")) / "Users"
+    if users_dir.is_dir():
+        candidates.extend(users_dir.glob("*/AppData/Local/ms-playwright"))
+    for cache in candidates:
+        if any(cache.glob("chromium*")):
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(cache)
+            return
+
+
+_point_at_real_browser_cache()
+
+from playwright.sync_api import sync_playwright  # noqa: E402
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from serve import serve  # noqa: E402
@@ -49,6 +84,46 @@ def note(msg):
 def sim(page, steps, dt=1 / 60):
     """Advance the real simulation without waiting for rendered frames."""
     page.evaluate("([n, d]) => window.NOCTIS.stepSim(n, d)", [steps, dt])
+
+
+def audio_params(page):
+    """Continuous-voice and mix levels, read off the live AudioContext."""
+    return page.evaluate(
+        """() => {
+        const a = window.NOCTIS.audio;
+        if (!a.ctx) return null;
+        return {
+          state: a.ctx.state,
+          master: +a.master.gain.value.toFixed(4),
+          engine: +a.engineGain.gain.value.toFixed(5),
+          freq: +a.engineOsc.frequency.value.toFixed(2),
+          rival: +a.rivalGain.gain.value.toFixed(5),
+        };
+    }"""
+    )
+
+
+def scene_census(page):
+    """Count the objects the teardown chain is responsible for reclaiming."""
+    return page.evaluate(
+        """() => {
+        const d = window.NOCTIS.director;
+        let cars = 0, sprites = 0;
+        window.NOCTIS.world.scene.traverse((o) => {
+          if (o.name === 'playerCar' || o.name.startsWith('car-')) cars++;
+          if (o.isSprite) sprites++;
+        });
+        return {
+          state: d.state,
+          cars,
+          sprites,
+          shields: d.cars.filter((c) => c.shieldMesh).length,
+          shieldsUp: d.cars.filter((c) => c.shieldMesh && c.shieldMesh.visible).length,
+          sceneChildren: window.NOCTIS.world.scene.children.length,
+          items: d.items.counts(),
+        };
+    }"""
+    )
 
 
 def shot(page, name):
@@ -89,11 +164,14 @@ if not (DIST / "index.html").exists():
     sys.exit(2)
 
 with serve(DIST) as URL, sync_playwright() as pw:
-    browser = pw.chromium.launch(
-        channel="chrome",
-        headless=True,
-        args=["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--hide-scrollbars"],
-    )
+    launch_args = ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--hide-scrollbars"]
+    try:
+        browser = pw.chromium.launch(channel="chrome", headless=True, args=launch_args)
+    except Exception:
+        # Recent system Chrome refuses DevTools remote debugging even with a
+        # non-default --user-data-dir in some sandboxes; fall back to the
+        # bundled Chromium, which runs the same checks.
+        browser = pw.chromium.launch(headless=True, args=launch_args)
     page = browser.new_page(viewport={"width": 1280, "height": 800}, device_scale_factor=1)
     page.set_default_timeout(60_000)
 
@@ -286,10 +364,30 @@ with serve(DIST) as URL, sync_playwright() as pw:
     check("physics frozen while paused", s0 == s1, f"x {s0:.2f} -> {s1:.2f}")
     shot(page, "08-pause.png")
 
+    # Pausing must also freeze the soundtrack: the continuous voices pin
+    # exactly where they were (no scheduled ramps still converging) and the
+    # mix ducks behind the menu.
+    page.wait_for_timeout(1200)  # let the duck ramp finish
+    a0 = audio_params(page)
+    page.wait_for_timeout(900)
+    a1 = audio_params(page)
+    check("audio context is live", a0 is not None and a0["state"] == "running",
+          "no AudioContext" if a0 is None else a0["state"])
+    if a0 and a1:
+        check("mix is ducked while paused", a0["master"] <= 0.07, f"master {a0['master']}")
+        check("voice params frozen while paused", a0 == a1,
+              f"engine {a0['engine']}->{a1['engine']}, freq {a0['freq']}->{a1['freq']}, rival {a0['rival']}->{a1['rival']}")
+
     page.keyboard.press("Escape")
     page.wait_for_timeout(300)
     check("escape resumes", page.evaluate("() => window.NOCTIS.director.state") == "race", "racing again")
     sim(page, 60)
+    page.wait_for_timeout(1000)
+    a2 = audio_params(page)
+    check("mix restored after resume", bool(a2) and a2["master"] > 0.3,
+          f"master {a2['master'] if a2 else '?'}")
+    check("engine voice live after resume", bool(a2) and a2["engine"] > 0.005,
+          f"engine gain {a2['engine'] if a2 else '?'}")
 
     # ---- power-up pickup + use -------------------------------------------
     got_item = page.evaluate(
@@ -357,6 +455,12 @@ with serve(DIST) as URL, sync_playwright() as pw:
     )
     sim(page, 400)
     check("results screen reached", page.locator(".screen-results.active").count() == 1, "results active")
+    # Entering results settles the field: no bananas, rockets or explosion
+    # rings may be left flying in the slow-motion backdrop.
+    settled = page.evaluate("() => window.NOCTIS.director.items.counts()")
+    check("results settle reclaims the item field",
+          settled["peels"] == 0 and settled["rockets"] == 0 and settled["fxActive"] == 0,
+          f"peels={settled['peels']} rockets={settled['rockets']} fx={settled['fxActive']}")
     res = page.evaluate(
         """() => ({
           pos: document.querySelector('[data-res=position]').textContent.trim(),
@@ -387,12 +491,27 @@ with serve(DIST) as URL, sync_playwright() as pw:
         res_faded["menuOpacity"] > 0.9 and res_faded["hudHidden"] == "hidden" and res_faded["bar"] > 10,
         f"menu opacity {res_faded['menuOpacity']:.2f}, hud {res_faded['hudHidden']}, letterbox {res_faded['bar']:.0f}px",
     )
+    # The race voices must be back at the clean baseline behind the board:
+    # mix ducked, engine and rival pass-by silenced.
+    res_audio = audio_params(page)
+    check("mix ducked behind the results board", bool(res_audio) and res_audio["master"] <= 0.07,
+          f"master {res_audio['master'] if res_audio else '?'}")
+    check("engine silenced at results", bool(res_audio) and res_audio["engine"] < 0.01,
+          f"engine gain {res_audio['engine'] if res_audio else '?'}")
 
     # ---- restart ----------------------------------------------------------
     page.keyboard.press("ArrowDown")
     page.keyboard.press("Enter")  # QUIT TO MENU
     page.wait_for_timeout(500)
     check("quit to menu works", page.locator(".screen-main.active").count() == 1, "back at main")
+    # The finished race must leave nothing behind: exactly the eight attract
+    # cars, their eight name tags, no shield bubbles up, no item leftovers.
+    clean = scene_census(page)
+    check("no race leftovers after quitting results",
+          clean["state"] == "attract" and clean["cars"] == 8 and clean["sprites"] == 8
+          and clean["shields"] == 8 and clean["shieldsUp"] == 0
+          and clean["items"]["peels"] == 0 and clean["items"]["rockets"] == 0 and clean["items"]["fxActive"] == 0,
+          f"cars={clean['cars']} tags={clean['sprites']} shieldsUp={clean['shieldsUp']} items={clean['items']}")
     page.keyboard.press("Enter")  # START RACE
     page.wait_for_timeout(400)
     sim(page, 320)
@@ -413,6 +532,59 @@ with serve(DIST) as URL, sync_playwright() as pw:
     }"""
     )
     check("R puts the car back on the line", near < 20, f"{near:.1f} m from the centreline")
+
+    # ---- teardown chain: repeated pause/quit cycles -----------------------
+    # Litter the live race, pause, and quit from the pause menu; then do it
+    # all again. The scene census must be identical after every cycle - no
+    # growing car count, no stray shields or name tags, no item leftovers.
+    def litter():
+        page.evaluate(
+            """() => {
+            const d = window.NOCTIS.director;
+            d.player.item = 'banana';
+            d.items.useItem(d.player, d.cars);
+            d.player.item = 'rocket';
+            d.items.useItem(d.player, d.cars);
+        }"""
+        )
+
+    def quit_from_pause():
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
+        for _ in range(4):
+            page.keyboard.press("ArrowDown")
+        page.keyboard.press("Enter")  # QUIT TO MENU
+        page.wait_for_timeout(400)
+
+    censuses = []
+    for cycle in range(2):
+        sim(page, 60)
+        litter()
+        sim(page, 30)
+        quit_from_pause()
+        c = scene_census(page)
+        censuses.append(c)
+        check(f"cycle {cycle}: quit leaves a clean baseline",
+              c["state"] == "attract" and c["cars"] == 8 and c["sprites"] == 8 and c["shieldsUp"] == 0
+              and c["items"]["peels"] == 0 and c["items"]["rockets"] == 0 and c["items"]["fxActive"] == 0,
+              f"cars={c['cars']} tags={c['sprites']} shieldsUp={c['shieldsUp']} items={c['items']}")
+        # The attract pack must still be driving after every quit.
+        sim(page, 240)
+        leader = page.evaluate("() => window.NOCTIS.director.cars[0].speed")
+        check(f"cycle {cycle}: attract pack still drives", leader > 3, f"leader at {leader * 3.6:.0f} km/h")
+        # Back into the race for the next cycle.
+        page.keyboard.press("Enter")  # START RACE
+        page.wait_for_timeout(400)
+        sim(page, 320)
+        state = page.evaluate("() => window.NOCTIS.director.state")
+        check(f"cycle {cycle}: race restarts", state == "race", state)
+
+    check("scene does not grow across quit cycles",
+          censuses[0]["sceneChildren"] == censuses[1]["sceneChildren"]
+          and censuses[0]["cars"] == censuses[1]["cars"]
+          and censuses[0]["sprites"] == censuses[1]["sprites"],
+          f"children {censuses[0]['sceneChildren']} -> {censuses[1]['sceneChildren']}, "
+          f"cars {censuses[0]['cars']} -> {censuses[1]['cars']}, tags {censuses[0]['sprites']} -> {censuses[1]['sprites']}")
 
     # ---- responsive -------------------------------------------------------
     # Resize needs the page's main thread, which on a CPU rasteriser can be

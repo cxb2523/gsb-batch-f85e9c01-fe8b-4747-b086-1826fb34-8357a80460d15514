@@ -86,6 +86,51 @@ export class RaceAudio {
     this.master.gain.setTargetAtTime(on ? 0.06 : 0.5, this.ctx.currentTime, 0.15);
   }
 
+  /**
+   * Pin the continuous voices exactly where they are.
+   *
+   * Every updateEngine call schedules exponential ramps with time constants
+   * up to 0.2 s, and those ramps keep converging for about a second after the
+   * last call. Simply not calling updateEngine while paused is therefore NOT
+   * a freeze: the engine note and the rival pass-by keep drifting behind the
+   * pause menu. Cancelling the scheduled events and re-pinning the current
+   * values makes "paused" actually mean paused.
+   */
+  freeze(): void {
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime;
+    const params: (AudioParam | undefined)[] = [
+      this.engineOsc?.frequency,
+      this.engineOsc2?.frequency,
+      this.engineSub?.frequency,
+      this.engineFilter?.frequency,
+      this.engineGain?.gain,
+      this.rivalOsc?.frequency,
+      this.rivalGain?.gain,
+    ];
+    for (const p of params) {
+      if (!p) continue;
+      const v = p.value;
+      p.cancelScheduledValues(t);
+      p.setValueAtTime(v, t);
+    }
+  }
+
+  /**
+   * Silence the continuous race voices (player engine, rival pass-by).
+   *
+   * Nothing outside an active race ever calls updateEngine, so without this
+   * the last racing values persist indefinitely: the engine drones at
+   * finish-line revs behind the results board and hums under the attract
+   * loop for the rest of the session.
+   */
+  standby(): void {
+    if (!this.ctx || !this.enabled) return;
+    const t = this.ctx.currentTime;
+    this.engineGain?.gain.setTargetAtTime(0, t, 0.12);
+    this.rivalGain?.gain.setTargetAtTime(0, t, 0.12);
+  }
+
   updateEngine(car: CarSim, nearest: { dist: number; speed: number } | null, _dt: number): void {
     if (!this.ctx || !this.enabled || !this.engineOsc || !this.engineOsc2 || !this.engineSub) return;
     if (!this.engineFilter || !this.engineGain || !this.rivalGain || !this.rivalOsc) return;

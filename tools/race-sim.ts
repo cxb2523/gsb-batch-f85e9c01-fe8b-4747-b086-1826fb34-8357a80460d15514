@@ -176,6 +176,110 @@ check('no missed-checkpoint spam', notices.filter((n) => n === 'MISSED CHECKPOIN
   }
 }
 
+// ---- results settle: the board appears over a clean baseline -------------
+// The AI used items all race, so at the flag the field can hold bananas,
+// rockets and live explosion rings. Entering the results state must reclaim
+// all of it: nothing outside 'race' ever steps the item field, so anything
+// left behind would freeze mid-flight in the slow-motion backdrop.
+{
+  const c = director.items.counts();
+  check('results settle reclaims the item field', c.peels === 0 && c.rockets === 0 && c.fxActive === 0,
+        `peels=${c.peels} rockets=${c.rockets} fx=${c.fxActive} (boxes=${c.boxes})`);
+}
+
+// ---- teardown chain: pause / resume / quit cycles ------------------------
+// Pause must freeze the simulation, resume must restart it, and quitting -
+// from racing or straight out of the pause menu - must return the cars, the
+// item field and the scene to the same clean baseline every time, no matter
+// how often the player cycles.
+{
+  const scene3 = new THREE.Scene();
+  const env3: SimEnv = { scene: scene3, camera, terrain, track, audio: new RaceAudio(), dust: new Dust(new THREE.Scene()), autopilot: true, menu: null };
+  const d = new RaceDirector(env3);
+  const sceneBaseline = scene3.children.length; // item-field group + fx pool
+
+  d.startRace();
+  for (let i = 0; i < 60 * 8; i++) d.update(DT); // through the countdown
+  check('teardown: race is running', d.state === 'race', d.state);
+
+  // Litter the field: a peel on the track and a rocket still in flight.
+  // Both are registered synchronously by useItem, so assert before stepping -
+  // a homing rocket can legitimately detonate within a second of launch.
+  d.player.item = 'banana';
+  d.items.useItem(d.player, d.cars);
+  d.player.item = 'rocket';
+  d.items.useItem(d.player, d.cars);
+  const litter = d.items.counts();
+  check('teardown: field is littered before the quit', litter.peels > 0 && litter.rockets > 0,
+        `peels=${litter.peels} rockets=${litter.rockets}`);
+  for (let i = 0; i < 60; i++) d.update(DT); // let the live field actually run
+
+  // Pause freezes the simulation; resume restarts it.
+  d.pause();
+  check('teardown: pause engages', d.state === 'paused', d.state);
+  const px = d.player.pos.x;
+  const pz = d.player.pos.z;
+  for (let i = 0; i < 120; i++) d.update(DT);
+  check('teardown: physics frozen while paused', d.player.pos.x === px && d.player.pos.z === pz,
+        `x ${f(px)} -> ${f(d.player.pos.x)}`);
+  d.resume();
+  check('teardown: resume returns to racing', d.state === 'race', d.state);
+  for (let i = 0; i < 60; i++) d.update(DT);
+  check('teardown: physics live again after resume', d.player.pos.x !== px || d.player.pos.z !== pz,
+        `x ${f(px)} -> ${f(d.player.pos.x)}`);
+
+  // Now cycle: pause, quit from the pause menu, race again, quit mid-race.
+  // Cars and item-field objects must not accumulate, and the attract pack
+  // must come back able to drive.
+  let cyclesOk = true;
+  let detail = '';
+  for (let k = 0; k < 3; k++) {
+    if (d.state === 'race' || d.state === 'countdown') d.pause();
+    d.quitToMenu();
+    const c = d.items.counts();
+    if (d.state !== 'attract' || d.cars.length !== CAR_COUNT) {
+      cyclesOk = false;
+      detail = `cycle ${k}: state=${d.state} cars=${d.cars.length}`;
+      break;
+    }
+    if (c.peels !== 0 || c.rockets !== 0 || c.fxActive !== 0 || scene3.children.length !== sceneBaseline) {
+      cyclesOk = false;
+      detail = `cycle ${k}: peels=${c.peels} rockets=${c.rockets} fx=${c.fxActive} scene=${scene3.children.length}/${sceneBaseline}`;
+      break;
+    }
+    // The attract pack must actually drive after every quit. totalDist only
+    // advances under race logic, so measure arc position with wrap, like the
+    // attract sanity check above.
+    const s0 = d.cars.map((car) => car.s);
+    for (let i = 0; i < 300; i++) d.update(DT);
+    let moved = 0;
+    for (let i = 0; i < d.cars.length; i++) {
+      let ds = d.cars[i].s - s0[i];
+      if (ds > track.length / 2) ds -= track.length;
+      if (ds < -track.length / 2) ds += track.length;
+      moved = Math.max(moved, ds);
+    }
+    if (moved < 50) {
+      cyclesOk = false;
+      detail = `cycle ${k}: attract pack moved only ${f(moved, 0)} m in 5 s`;
+      break;
+    }
+    d.startRace();
+    for (let i = 0; i < 60 * 6; i++) d.update(DT);
+    const st: string = d.state;
+    if (st !== 'race') {
+      cyclesOk = false;
+      detail = `cycle ${k}: restart stuck in ${st}`;
+      break;
+    }
+    // Litter again so the next quit has something to reclaim.
+    d.player.item = 'banana';
+    d.items.useItem(d.player, d.cars);
+  }
+  check('teardown: repeated pause/quit cycles stay clean', cyclesOk, detail || '3 cycles, baseline held');
+  d.quitToMenu();
+}
+
 // ---- attract mode sanity -------------------------------------------------
 {
   director.quitToMenu();
