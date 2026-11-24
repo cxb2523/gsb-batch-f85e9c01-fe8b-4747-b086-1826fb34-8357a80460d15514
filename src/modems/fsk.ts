@@ -74,6 +74,10 @@ class AGCProcessor {
       this.currentGain = Math.max(0.1, Math.min(10.0, this.currentGain));
     }
   }
+
+  reset(): void {
+    this.currentGain = 1.0;
+  }
 }
 
 /**
@@ -149,9 +153,9 @@ export class FSKCore extends BaseModulator<FSKConfig> {
     this.frame.syncSamplesBuffer = new RingBuffer(Uint8Array, this.frame.maxSyncBits * this.params.downsampledSamplesPerBit * 1.1);
     this.frame.syncAmplitudeBuffer = new RingBuffer(Float32Array, this.params.downsampledSamplesPerBit * 8);
     
-    // Reset all state
-    this.resetState();
-    
+    // Start from a fully clean demodulation state
+    this.clearDemodulationState();
+
     this.ready = true;
     this.emit('configured');
   }
@@ -179,12 +183,38 @@ export class FSKCore extends BaseModulator<FSKConfig> {
     Object.assign(this.byteState, { current: 0, bitPosition: 0 });
     this.frame.started = false;
     this.silence.sampleCount = 0;
-    
-    // Reset filters and downsampling state
+
+    // Reset filters, AGC and downsampling state
+    this.dsp.agc?.reset();
+    this.dsp.preFilter?.reset();
     this.dsp.iqFilters?.i.reset();
     this.dsp.iqFilters?.q.reset();
     this.dsp.postFilter?.reset();
     Object.assign(this.downsample, { counter: 0, iAccumulator: 0, qAccumulator: 0 });
+  }
+
+  /**
+   * Clear every piece of demodulation state so the next demodulateData()
+   * call starts from a clean frame. Used on half-duplex TX->RX transitions
+   * (modulateData), explicit reset() and reconfiguration.
+   *
+   * Configuration and the ready flag are intentionally preserved: after this
+   * call the instance can immediately modulate or demodulate again.
+   */
+  private clearDemodulationState(): void {
+    this.resetState();
+
+    // Synchronization history (bit samples and amplitude history)
+    this.frame.syncSamplesBuffer?.clear();
+    this.frame.syncAmplitudeBuffer?.clear();
+
+    // Byte assembly state, including bytes not yet returned to the caller
+    Object.assign(this.byteState, { current: 0, bitPosition: 0, buffer: [] });
+
+    // Silence detection starts from its configured default threshold again;
+    // it gets re-adapted from the signal amplitude on the next frame sync
+    this.silence.threshold = 0.01;
+    this.silence.sampleCount = 0;
   }
 
   async demodulateData(samples: Float32Array): Promise<Uint8Array> {
@@ -313,17 +343,33 @@ export class FSKCore extends BaseModulator<FSKConfig> {
 
         const matchRatio = total > 0 ? matched / total : 0;
         if (matchRatio > this.config.syncThreshold) {
-          this.frame.started = true;
-          Object.assign(this.byteState, { current: 0, bitPosition: 0 });
-          Object.assign(this.bitSync, { bitAccumulator: 0, bitAccumCount: 0, bitSampleCounter: 0, nextBitSampleIndex: 0 });
-          this.debug.syncDetections++;
-
-          // Set silence threshold based on average amplitude
+          // Set silence threshold based on average amplitude, using the
+          // preamble history before it is discarded
           let sum = 0;
           for (let i = 0; i < this.frame.syncAmplitudeBuffer.length; i++) {
             sum += this.frame.syncAmplitudeBuffer.get(i);
           }
-          this.silence.threshold = (sum / this.frame.syncAmplitudeBuffer.length) * 0.1;
+          const averageAmplitude = this.frame.syncAmplitudeBuffer.length > 0
+            ? sum / this.frame.syncAmplitudeBuffer.length
+            : 0;
+          this.silence.threshold = averageAmplitude * 0.1;
+
+          this.frame.started = true;
+          if (this.debug.syncDetections === 0) {
+            // First frame sync of this demodulation stream: any history still
+            // buffered belongs to a previous frame (or to silence) and must be
+            // discarded so demodulateData() only returns current-frame bytes.
+            this.frame.syncSamplesBuffer.clear();
+            this.frame.syncAmplitudeBuffer.clear();
+            Object.assign(this.byteState, { current: 0, bitPosition: 0, buffer: [] });
+          } else {
+            // Re-sync while already inside a frame: this is a back-to-back
+            // frame. Completed bytes of the previous frame are kept and only
+            // the in-progress byte assembly is restarted.
+            Object.assign(this.byteState, { current: 0, bitPosition: 0 });
+          }
+          Object.assign(this.bitSync, { bitAccumulator: 0, bitAccumCount: 0, bitSampleCounter: 0, nextBitSampleIndex: 0 });
+          this.debug.syncDetections++;
         }
       }
     } else {
@@ -378,7 +424,12 @@ export class FSKCore extends BaseModulator<FSKConfig> {
     if (!this.ready || !this.config) {
       throw new Error('FSK modulator not configured');
     }
-    
+
+    // Half-duplex TX->RX transition: modulation must not leave any
+    // demodulation residue (sync history, assembled bytes, filters, ...)
+    // that could contaminate the next reception.
+    this.clearDemodulationState();
+
     return this.generateFSKSignal(data);
   }
 
@@ -462,9 +513,9 @@ export class FSKCore extends BaseModulator<FSKConfig> {
   }
 
   reset(): void {
-    this.resetState();
-    this.frame.syncSamplesBuffer?.clear();
-    this.byteState.buffer = [];
+    // Clear all demodulation state while preserving configuration and
+    // the ready flag, so the instance can continue sending/receiving.
+    this.clearDemodulationState();
     Object.assign(this.debug, { syncDetections: 0, demodulationCalls: 0, totalSamples: 0 });
   }
 

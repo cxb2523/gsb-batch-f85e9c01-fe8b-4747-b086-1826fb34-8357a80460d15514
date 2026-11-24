@@ -31,7 +31,14 @@ class MyAbortSignal {
   get aborted() { return this._aborted; }
 
   addEventListener(type: 'abort', listener: () => void) {
-    if (type === 'abort') this.listeners.push(listener);
+    if (type === 'abort') {
+      // A signal that has already aborted must notify new listeners immediately
+      if (this._aborted) {
+        listener();
+      } else {
+        this.listeners.push(listener);
+      }
+    }
   }
 
   removeEventListener(type: 'abort', listener: () => void) {
@@ -40,8 +47,9 @@ class MyAbortSignal {
 
   dispatchEvent() {
     this.onabort?.();
-    this.listeners.forEach(l => l());
+    const pending = this.listeners;
     this.listeners = [];
+    pending.forEach(l => l());
   }
 
   throwIfAborted() {
@@ -98,9 +106,10 @@ export class FSKProcessor extends AudioWorkletProcessor implements IAudioProcess
     await new Promise<void>((resolve, reject) => {
       const handleAbort = () => {
         console.warn(`[FSKProcessor:${this.instanceName}] Modulation aborted`);
+        options?.signal.removeEventListener('abort', handleAbort);
         this.pendingModulation = null;
         this.modulationWaitCallback = () => {};
-        reject(new Error('FSK Processor Modulation aborted'));
+        reject(new DOMException('FSK Processor Modulation aborted', 'AbortError'));
       };
       this.modulationWaitCallback = () => {
         options?.signal.removeEventListener('abort', handleAbort);
@@ -114,32 +123,55 @@ export class FSKProcessor extends AudioWorkletProcessor implements IAudioProcess
       // Return currently buffered demodulated data
       const availableBytes = this.demodulatedBuffer.length;
       if (availableBytes === 0) {
+        options?.signal?.throwIfAborted();
         await new Promise<void>((resolve, reject) => {
+          const onAbort = () => {
+            // Remove the wait slot so later requests can wait again and the
+            // pending Promise rejects with a proper AbortError - nothing may
+            // be left awaiting after the abort.
+            if (this.awaitingCallback === resolve) {
+              this.awaitingCallback = null;
+            }
+            reject(new DOMException('Demodulation aborted', 'AbortError'));
+          };
           this.awaitingCallback = resolve;
-          options?.signal.addEventListener('abort', () => {
-            this.awaitingCallback = null;
-            reject(new Error('Demodulation aborted'));
-          }, { once: true });
+          options?.signal.addEventListener('abort', onAbort, { once: true });
         });
       }
 
       const finalAvailableBytes = this.demodulatedBuffer.length;
       const demodulatedBytes = new Uint8Array(finalAvailableBytes);
-      
+
       for (let i = 0; i < finalAvailableBytes; i++) {
         const byte = this.demodulatedBuffer.remove();
         demodulatedBytes[i] = byte;
       }
-      
+
       return demodulatedBytes;
   }
 
   async reset(): Promise<void> {
       console.log(`[FSKProcessor:${this.instanceName}] Resetting FSKProcessor state`);
-      this.demodulatedBuffer.clear();
-      this.pendingModulation = null;
+
+      // Abort in-flight TX/RX operations first: their signal listeners fire,
+      // pending Promises reject with AbortError and remove themselves, so no
+      // awaiting callback can be left behind.
+      if (this.abortController) {
+        this.abortController.abort();
+        this.abortController = null;
+      }
+
+      // Defensive cleanup of any wait slot that was not signal-backed
       this.awaitingCallback = null;
+
+      // Drop modulation that has not been fully played out
+      this.pendingModulation = null;
       this.modulationWaitCallback = () => {};
+
+      // Clear received data and all FSKCore demodulation/modulation state.
+      // fskCore.reset() keeps the core configured and ready.
+      this.demodulatedBuffer.clear();
+      this.fskCore.reset();
   }
   
   private resetAbortController(): void {
@@ -240,10 +272,10 @@ export class FSKProcessor extends AudioWorkletProcessor implements IAudioProcess
           throw new Error(`Unknown message type: ${type}`);
       }
     } catch (error) {
-      this.port.postMessage({ 
-        id, 
-        type: 'error', 
-        data: { message: error instanceof Error ? error.message : String(error) } 
+      this.port.postMessage({
+        id,
+        type: 'error',
+        data: { message: error instanceof Error ? error.message : String(error) }
       });
     }
   }
@@ -309,11 +341,13 @@ export class FSKProcessor extends AudioWorkletProcessor implements IAudioProcess
         // Store demodulated data
         for (const byte of demodulated) {
           this.demodulatedBuffer.put(byte);
-          
-          if (this.awaitingCallback) {
-            this.awaitingCallback();
-            this.awaitingCallback = null;
-          }
+        }
+
+        // Wake exactly one pending demodulate() request
+        if (this.awaitingCallback) {
+          const callback = this.awaitingCallback;
+          this.awaitingCallback = null;
+          callback();
         }
       }
     } catch (error) {
