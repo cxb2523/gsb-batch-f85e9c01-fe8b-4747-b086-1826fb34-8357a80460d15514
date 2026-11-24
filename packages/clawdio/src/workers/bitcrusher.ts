@@ -30,6 +30,9 @@ class BitcrusherWorklet extends AudioWorkletProcessor {
   worklet: BitcrusherModule | null = null;
   bits = 4;
   normfreq = 0.1;
+  // Tracks params explicitly set via "set-*" messages, so updates that
+  // arrive before the module is initialized win over the init config
+  bitsOverridden = false;
 
   constructor() {
     super();
@@ -49,14 +52,22 @@ class BitcrusherWorklet extends AudioWorkletProcessor {
 
     if (event.type === "init-module") {
       const { bits } = event.data;
-      this.bits = bits;
-      this.worklet = BitcrusherModule.new(bits);
+      // A "set-bits" received before init takes precedence over init config
+      if (!this.bitsOverridden) {
+        this.bits = bits;
+      }
+      this.worklet = BitcrusherModule.new(this.bits);
+      // Sync the Rust module with the latest cached params
+      this.worklet.set_bits(this.bits);
     }
 
     // Setters for internal properties (since we can't mutate this directly)
     if (event.type === "set-bits") {
       this.bits = event.data;
-      // @TODO: Update the underylinng module
+      this.bitsOverridden = true;
+      // Module may not exist yet (WASM still loading) - the cached value
+      // above is applied on "init-module". If it does, update it immediately.
+      this.worklet?.set_bits(this.bits);
     }
     if (event.type === "set-normfreq") {
       this.normfreq = event.data;

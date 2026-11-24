@@ -1,0 +1,18 @@
+{
+  "name": "clawdio-moog",
+  "type": "module",
+  "collaborators": [
+    "Ryosuke Hana"
+  ],
+  "version": "0.1.0",
+  "files": [
+    "clawdio_moog_bg.wasm",
+    "clawdio_moog.js",
+    "clawdio_moog.d.ts"
+  ],
+  "main": "clawdio_moog.js",
+  "types": "clawdio_moog.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

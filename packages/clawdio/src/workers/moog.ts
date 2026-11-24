@@ -30,6 +30,10 @@ class MoogWorklet extends AudioWorkletProcessor {
   worklet: MoogModule | null = null;
   cutoff = 0.065;
   resonance = 3.5;
+  // Tracks params explicitly set via "set-*" messages, so updates that
+  // arrive before the module is initialized win over the init config
+  cutoffOverridden = false;
+  resonanceOverridden = false;
 
   constructor() {
     super();
@@ -49,16 +53,31 @@ class MoogWorklet extends AudioWorkletProcessor {
 
     if (event.type === "init-module") {
       const { cutoff = 0.065, resonance = 3.5 } = event.data;
-      this.worklet = MoogModule.new(cutoff, resonance);
+      // "set-*" messages received before init take precedence over init config
+      if (!this.cutoffOverridden) {
+        this.cutoff = cutoff;
+      }
+      if (!this.resonanceOverridden) {
+        this.resonance = resonance;
+      }
+      this.worklet = MoogModule.new(this.cutoff, this.resonance);
+      // Sync the Rust module with the latest cached params
+      this.worklet.set_cutoff(this.cutoff);
+      this.worklet.set_resonance(this.resonance);
     }
 
     // Setters for internal properties (since we can't mutate this directly)
     if (event.type === "set-cutoff") {
       this.cutoff = event.data;
-      // @TODO: Update the underylinng module
+      this.cutoffOverridden = true;
+      // Module may not exist yet (WASM still loading) - the cached value
+      // above is applied on "init-module". If it does, update it immediately.
+      this.worklet?.set_cutoff(this.cutoff);
     }
     if (event.type === "set-resonance") {
       this.resonance = event.data;
+      this.resonanceOverridden = true;
+      this.worklet?.set_resonance(this.resonance);
     }
   };
 

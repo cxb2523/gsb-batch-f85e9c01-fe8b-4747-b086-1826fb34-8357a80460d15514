@@ -15,6 +15,17 @@ impl BitcrusherModule {
         BitcrusherModule { bits, phaser: 0.0, last: 0.0 }
     }
 
+    /// Update the bit depth used for quantization.
+    /// Takes effect on the next `process`/`process_vec` call
+    /// since the quantization step is derived from `bits` per block.
+    pub fn set_bits(&mut self, bits: usize) {
+        self.bits = bits;
+    }
+
+    pub fn get_bits(&self) -> usize {
+        self.bits
+    }
+
     pub fn process(&mut self, samples: &js_sys::Float32Array, normfreq: f32) -> js_sys::Float32Array {
 
         // console::log_1(&"Processing in Rust".into());

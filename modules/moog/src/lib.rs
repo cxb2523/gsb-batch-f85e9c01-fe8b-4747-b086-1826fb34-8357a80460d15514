@@ -33,6 +33,28 @@ impl MoogModule {
         }
     }
 
+    /// Update the cutoff frequency (normalized).
+    /// Takes effect on the next `process`/`process_vec` call
+    /// since the filter coefficients are derived from `cutoff` per block.
+    pub fn set_cutoff(&mut self, cutoff: f32) {
+        self.cutoff = cutoff;
+    }
+
+    /// Update the resonance.
+    /// Takes effect on the next `process`/`process_vec` call
+    /// since the feedback amount is derived from `resonance` per block.
+    pub fn set_resonance(&mut self, resonance: f32) {
+        self.resonance = resonance;
+    }
+
+    pub fn get_cutoff(&self) -> f32 {
+        self.cutoff
+    }
+
+    pub fn get_resonance(&self) -> f32 {
+        self.resonance
+    }
+
     pub fn process(&mut self, samples: &js_sys::Float32Array) -> js_sys::Float32Array {
         let samples_vec: Vec<f32> = samples.to_vec();
         let output = self.process_vec(samples_vec);
