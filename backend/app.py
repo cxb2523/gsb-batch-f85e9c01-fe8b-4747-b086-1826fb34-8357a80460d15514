@@ -27,20 +27,44 @@ app.add_middleware(
 # Full-track Demucs vocal mapping is the authoritative vocal signal, so stems are
 # ON by default. Slow on CPU, but the analysis cache makes it one-time per track.
 # Override with ?stems=false per-request or AUTODJ_STEMS=0 globally.
-STEMS_DEFAULT = os.environ.get("AUTODJ_STEMS", "1") not in {"0", "false", "no"}
+STEMS_ENV_VAR = "AUTODJ_STEMS"
+
+
+def resolve_stems_default(raw: str | None) -> tuple[bool, str]:
+    """Resolve the default stems mode and where it came from.
+
+    Returns (enabled, source) where source is "env" when AUTODJ_STEMS is set
+    (even if it selects the same value as the built-in default) and "default"
+    when the environment variable is absent.
+    """
+    if raw is None:
+        return True, "default"
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}, "env"
+
+
+STEMS_DEFAULT, STEMS_DEFAULT_SOURCE = resolve_stems_default(os.environ.get(STEMS_ENV_VAR))
 
 # Best-effort on-disk cache so whole-track Demucs runs only once per track.
 CACHE_DIR = Path(os.path.expanduser("~/.cache/par8dj-ai/analysis"))
 
 
 @app.get("/health")
-def health() -> dict[str, Any]:
+def health(stems: bool | None = None) -> dict[str, Any]:
+    # The request can override the configured default; report the value that
+    # would actually take effect for this request and where it came from.
+    if stems is None:
+        stems_on = STEMS_DEFAULT
+        source = STEMS_DEFAULT_SOURCE
+    else:
+        stems_on = stems
+        source = "request"
     return {
         "ok": True,
         "analyzer": ANALYZER_ID,
         "version": ANALYSIS_VERSION,
         "stemsDefault": STEMS_DEFAULT,
-        "stemsOn": STEMS_DEFAULT,
+        "stemsOn": stems_on,
+        "stemsSource": source,
     }
 
 
@@ -85,14 +109,57 @@ def _cache_key(path: str, use_stems: bool) -> str | None:
         return None
 
 
-def _cache_read(key: str | None) -> dict[str, Any] | None:
+def _cache_read(key: str | None, use_stems: bool) -> dict[str, Any] | None:
+    """Return a validated cached result, or None on any miss/failure.
+
+    A cache file is only trusted when its schema version, analyzer id and stems
+    mode all match the current request, and its vocal data is internally
+    consistent. Corrupt JSON, concurrent replacement and stale entries are all
+    treated as misses so callers transparently re-analyze.
+    """
     if not key:
         return None
     try:
         with open(CACHE_DIR / f"{key}.json", encoding="utf-8") as handle:
-            return json.load(handle)
+            payload = json.load(handle)
     except (OSError, ValueError):
         return None
+    if _cache_payload_valid(payload, use_stems):
+        return payload
+    return None
+
+
+def _cache_payload_valid(payload: Any, use_stems: bool) -> bool:
+    """Check every field the cache is trusted to guarantee."""
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("version") != ANALYSIS_VERSION:
+        return False
+    if payload.get("analyzer") != ANALYZER_ID:
+        return False
+    # The on-disk entry records the stems mode it was produced with; a mismatch
+    # (e.g. a heuristic entry served to a stems=true request) is a cache miss.
+    if bool(payload.get("stems")) != use_stems:
+        return False
+    timeline = payload.get("timeline")
+    if not isinstance(timeline, dict) or not isinstance(timeline.get("t"), list):
+        return False
+    n = len(timeline["t"])
+    risk = timeline.get("vocalRisk")
+    if not isinstance(risk, list) or len(risk) != n:
+        return False
+    source = timeline.get("vocalSource")
+    if source not in {"heuristic", "demucs"}:
+        return False
+    if payload.get("vocalSource") != source:
+        return False
+    # Only the Demucs path may carry first/last vocal times. A heuristic entry
+    # must never keep Demucs values left over from a previous analysis run.
+    if source == "heuristic" and (
+        payload.get("firstVocalAt") is not None or payload.get("lastVocalAt") is not None
+    ):
+        return False
+    return True
 
 
 def _cache_write(key: str | None, result: dict[str, Any]) -> None:
@@ -105,13 +172,22 @@ def _cache_write(key: str | None, result: dict[str, Any]) -> None:
             json.dump(result, handle)
         tmp.replace(CACHE_DIR / f"{key}.json")
     except (OSError, ValueError, TypeError):
+        # Unwritable cache dir, disk full, etc. never fail the request itself.
         pass
 
 
 def analyze_file(path: str, use_stems: bool = False) -> dict[str, Any]:
-    """Cached entry point. Whole-track Demucs runs only once per (track, version)."""
+    """Cached entry point. Whole-track Demucs runs only once per (track, version).
+
+    The cache is a verified single source of truth: entries are only returned
+    when version, analyzer and stems mode match. Any cache failure degrades to
+    a fresh analysis instead of raising.
+    """
     key = _cache_key(path, use_stems)
-    cached = _cache_read(key)
+    try:
+        cached = _cache_read(key, use_stems)
+    except Exception:
+        cached = None
     if cached is not None:
         return cached
     result = _analyze_file_uncached(path, use_stems=use_stems)
@@ -154,6 +230,8 @@ def _analyze_file_uncached(path: str, use_stems: bool = False) -> dict[str, Any]
     vocals: dict[str, Any] = {"available": False}
     # Full-track Demucs vocal timeline. When present it is the AUTHORITATIVE
     # vocalRisk (index-aligned with timeline.t); otherwise the heuristic VAD stays.
+    # Initialize the heuristic invariants explicitly so a Demucs fallback can
+    # never leave first/last vocal times from a previous attempt behind.
     timeline["vocalSource"] = "heuristic"
     first_vocal_at: float | None = None
     last_vocal_at: float | None = None
@@ -161,15 +239,17 @@ def _analyze_file_uncached(path: str, use_stems: bool = False) -> dict[str, Any]
         from . import stems as stems_module
 
         vocal_tl = stems_module.vocal_activity_timeline(path, duration, TIMELINE_STEP)
-        if vocal_tl is not None:
-            risk = list(vocal_tl["vocalRisk"])
-            n = len(timeline["t"])
-            if len(risk) < n:
-                risk = risk + [0.0] * (n - len(risk))
-            timeline["vocalRisk"] = risk[:n]
+        if vocal_tl is not None and isinstance(vocal_tl.get("vocalRisk"), list):
+            timeline["vocalRisk"] = _fit_vocal_risk(vocal_tl["vocalRisk"], len(timeline["t"]))
             timeline["vocalSource"] = "demucs"
             first_vocal_at = vocal_tl.get("firstVocalAt")
             last_vocal_at = vocal_tl.get("lastVocalAt")
+        else:
+            # Demucs failed or returned no usable map: the heuristic VAD stays
+            # authoritative and no Demucs vocal timestamps may survive.
+            timeline["vocalSource"] = "heuristic"
+            first_vocal_at = None
+            last_vocal_at = None
 
         vocals = stems_module.analyze_vocals(path, duration)
         # Only the legacy refine path is heuristic-based; skip it once the
@@ -206,6 +286,10 @@ def _analyze_file_uncached(path: str, use_stems: bool = False) -> dict[str, Any]
 
     return {
         "version": ANALYSIS_VERSION,
+        "analyzer": ANALYZER_ID,
+        # Recorded on disk so a cache read can verify the entry matches the
+        # stems mode of the request that would consume it.
+        "stems": bool(use_stems),
         "duration": duration,
         "cueIn": cue_in,
         "cueOut": cue_out,
@@ -256,7 +340,6 @@ def _analyze_file_uncached(path: str, use_stems: bool = False) -> dict[str, Any]
             phrasing,
             candidates.get("introEnd"),
         ),
-        "analyzer": ANALYZER_ID,
     }
 
 
@@ -283,6 +366,24 @@ def waveform(y: np.ndarray, bins: int = 1024) -> dict[str, Any]:
 
 
 TIMELINE_STEP = 1.0  # seconds per timeline window
+
+
+def _fit_vocal_risk(risk: list[Any], n: int) -> list[float]:
+    """Force a Demucs vocalRisk series to exactly the timeline length.
+
+    Short maps are padded with silence (0.0) and long maps are truncated, so the
+    returned series is index-aligned with timeline.t by construction. Non-numeric
+    samples degrade to silence instead of corrupting the timeline.
+    """
+    fitted: list[float] = []
+    for value in list(risk)[:n]:
+        try:
+            fitted.append(float(value))
+        except (TypeError, ValueError):
+            fitted.append(0.0)
+    if len(fitted) < n:
+        fitted.extend([0.0] * (n - len(fitted)))
+    return fitted
 
 
 def build_timeline(y: np.ndarray, sr: int, duration: float) -> dict[str, Any]:

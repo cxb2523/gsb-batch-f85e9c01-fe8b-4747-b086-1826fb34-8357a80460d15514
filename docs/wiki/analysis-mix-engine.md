@@ -66,9 +66,20 @@ Pipeline spiegabile implementata (analysis `version=2`, analyzer
   quando il cantato apre il brano; il `mixPoint` rafforza l'evitamento voce (peso
   `(1-voce)` più alto + forte penalità se voce>0.5) così l'uscita non cade mai su
   una frase cantata (niente cantato su cantato) e l'ingresso resta su zona pulita.
-- Cache analisi su file versionata (`~/.cache/par8dj-ai/analysis/<key>.json`,
-  key = md5 dei byte del file + `ANALYSIS_VERSION` + stems/nostems): Demucs gira
-  una sola volta per brano, scrittura/lettura best-effort (mai fatale).
+  `/health` espone `stemsOn` (valore effettivo per la richiesta, sovrascrivibile
+  con `?stems=`) e `stemsSource` (`"default"` senza env var, `"env"` se il valore
+  arriva da `AUTODJ_STEMS`, `"request"` se sovrascritto dalla query).
+- Cache analisi su file versionata e VALIDATA
+  (`~/.cache/par8dj-ai/analysis/<key>.json`, key = md5 dei byte del file +
+  `ANALYSIS_VERSION` + stems/nostems): ogni entry salva su disco anche `stems` e
+  `analyzer`. In lettura la cache è considerata valida solo se `version`,
+  `analyzer` e modalità `stems` corrispondono alla richiesta, e se i dati vocali
+  sono autoconsistenti (`timeline.vocalRisk` lungo quanto `timeline.t`,
+  `vocalSource` coerente, nessun `firstVocalAt`/`lastVocalAt` Demucs residuo su
+  entry heuristic). JSON corrotto, entry di versione/analyzer/stems diversa,
+  sostituzione concorrente del file o directory non scrivibile degradano sempre a
+  una nuova analisi, senza mai far fallire `/analyze`. Demucs gira una sola volta
+  per brano e modalità; scrittura atomica best-effort (mai fatale).
 - Phrase grid multi-risoluzione (`analysis.phraseGrid`): valuta 16/32/64 beat e
   sceglie la più coerente; restano `firstBeat`/`beatInterval`/`phraseAnchor` per
   retro-compatibilità.
