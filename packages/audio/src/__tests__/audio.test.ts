@@ -89,6 +89,37 @@ function setupAudioMocks() {
 
 // ─── Minimal React ref/effect mock ──────────────────────────────────────────
 
+/**
+ * Replace the fetch mock with one whose arrayBuffer() only resolves when
+ * told to, so tests can control the exact order in which loads complete.
+ */
+function deferFetch() {
+  const pending = new Map<string, Array<() => void>>()
+  // Srcs whose load may complete; checked lazily so resolve() works even when
+  // it runs before fetch's arrayBuffer() has been called.
+  const armed = new Set<string>()
+  ;(globalThis as any).fetch = vi.fn((src: string) => ({
+    arrayBuffer: () =>
+      armed.has(src)
+        ? Promise.resolve(new ArrayBuffer(8))
+        : new Promise<ArrayBuffer>((res) => {
+            const list = pending.get(src) ?? []
+            list.push(() => res(new ArrayBuffer(8)))
+            pending.set(src, list)
+          }),
+  }))
+  return {
+    resolve(src: string) {
+      armed.add(src)
+      const list = pending.get(src) ?? []
+      pending.delete(src)
+      for (const r of list) r()
+    },
+  }
+}
+
+const settle = () => new Promise((r) => setTimeout(r, 10))
+
 let cleanupFns: (() => void)[]
 let effectCallbacks: (() => (() => void) | void)[]
 
@@ -205,8 +236,181 @@ describe('Audio system', () => {
     })
   })
 
-  describe('maxInstances limits concurrent source nodes', () => {
-    it('stops oldest instance when maxInstances exceeded', async () => {
+  describe('crossfade and unmount races', () => {
+    it('releases the mount load when a crossfade wins the race', async () => {
+      const d = deferFetch()
+      const { useSound, _getBufferCache, _getBufferRefCount } = await import('../useSound')
+
+      const controls = useSound('/a.wav')
+      flushEffects() // mount load of /a.wav is still pending
+
+      controls.crossfadeTo('/b.wav', 0.1)
+      d.resolve('/b.wav') // crossfade load finishes first
+      await vi.waitFor(() => expect(_getBufferCache().has('/b.wav')).toBe(true))
+      expect(createdSources.filter((s) => s.start.mock.calls.length > 0).length).toBe(1)
+
+      d.resolve('/a.wav') // stale mount load finishes afterwards
+      await settle()
+
+      // The mount reference must not linger or overwrite the crossfade state.
+      expect(_getBufferRefCount().has('/a.wav')).toBe(false)
+      expect(_getBufferCache().has('/a.wav')).toBe(false)
+      expect(_getBufferRefCount().get('/b.wav')).toBe(1)
+
+      runCleanups()
+      expect(_getBufferRefCount().has('/b.wav')).toBe(false)
+      expect(_getBufferCache().has('/b.wav')).toBe(false)
+    })
+
+    it('a superseded crossfade never releases the buffer the newer one is playing', async () => {
+      const { useSound, _getBufferCache, _getBufferRefCount } = await import('../useSound')
+
+      const controls = useSound('/a.wav')
+      flushEffects()
+      await vi.waitFor(() => expect(_getBufferCache().has('/a.wav')).toBe(true))
+
+      const d = deferFetch()
+      controls.crossfadeTo('/b.wav', 0.1)
+      controls.crossfadeTo('/c.wav', 0.1)
+
+      d.resolve('/c.wav') // newer crossfade finishes first
+      await vi.waitFor(() => expect(_getBufferCache().has('/c.wav')).toBe(true))
+      expect(_getBufferRefCount().has('/a.wav')).toBe(false)
+      expect(_getBufferRefCount().get('/c.wav')).toBe(1)
+
+      d.resolve('/b.wav') // stale crossfade finishes last
+      await settle()
+
+      // /b.wav was released without touching /c.wav, and no extra source started.
+      expect(_getBufferRefCount().has('/b.wav')).toBe(false)
+      expect(_getBufferCache().has('/b.wav')).toBe(false)
+      expect(_getBufferRefCount().get('/c.wav')).toBe(1)
+      expect(_getBufferCache().has('/c.wav')).toBe(true)
+      expect(createdSources.filter((s) => s.start.mock.calls.length > 0).length).toBe(1)
+
+      runCleanups()
+      expect(_getBufferRefCount().has('/c.wav')).toBe(false)
+      expect(_getBufferCache().has('/c.wav')).toBe(false)
+    })
+
+    it('crossfading to the currently held src keeps the ref count balanced', async () => {
+      const { useSound, _getBufferCache, _getBufferRefCount } = await import('../useSound')
+
+      const controls = useSound('/a.wav')
+      flushEffects()
+      await vi.waitFor(() => expect(_getBufferCache().has('/a.wav')).toBe(true))
+
+      controls.crossfadeTo('/a.wav', 0.1)
+      await settle()
+
+      expect(_getBufferRefCount().get('/a.wav')).toBe(1)
+      expect(_getBufferCache().has('/a.wav')).toBe(true)
+
+      runCleanups()
+      expect(_getBufferRefCount().has('/a.wav')).toBe(false)
+      expect(_getBufferCache().has('/a.wav')).toBe(false)
+    })
+
+    it('persistent unmount keeps playing instances but releases the buffer reference', async () => {
+      const { useSound, _getBufferCache, _getBufferRefCount } = await import('../useSound')
+
+      const controls = useSound('/music.ogg', { persistent: true, loop: true })
+      flushEffects()
+      await vi.waitFor(() => expect(_getBufferCache().has('/music.ogg')).toBe(true))
+
+      controls.play()
+      expect(createdSources.length).toBe(1)
+
+      runCleanups()
+
+      // Still playing, but the hook's buffer reference is gone.
+      expect(createdSources[0].stop).not.toHaveBeenCalled()
+      expect(_getBufferRefCount().has('/music.ogg')).toBe(false)
+      expect(_getBufferCache().has('/music.ogg')).toBe(false)
+    })
+
+    it('persistent unmount during a crossfade load starts nothing and releases the new buffer', async () => {
+      const { useSound, _getBufferCache, _getBufferRefCount } = await import('../useSound')
+
+      const controls = useSound('/a.wav', { persistent: true })
+      flushEffects()
+      await vi.waitFor(() => expect(_getBufferCache().has('/a.wav')).toBe(true))
+
+      const d = deferFetch()
+      controls.crossfadeTo('/b.wav', 0.1)
+      runCleanups() // unmount while /b.wav is still loading
+      expect(_getBufferRefCount().has('/a.wav')).toBe(false)
+
+      d.resolve('/b.wav')
+      await settle()
+
+      expect(createdSources.every((s) => s.start.mock.calls.length === 0)).toBe(true)
+      expect(_getBufferRefCount().has('/b.wav')).toBe(false)
+      expect(_getBufferCache().has('/b.wav')).toBe(false)
+    })
+
+    it('persistent unmount after a completed crossfade keeps the new sound playing', async () => {
+      const { useSound, _getBufferCache, _getBufferRefCount } = await import('../useSound')
+
+      const controls = useSound('/a.wav', { persistent: true })
+      flushEffects()
+      await vi.waitFor(() => expect(_getBufferCache().has('/a.wav')).toBe(true))
+
+      controls.crossfadeTo('/b.wav', 0.1)
+      await vi.waitFor(() => expect(_getBufferCache().has('/b.wav')).toBe(true))
+      const crossfadeSource = createdSources[createdSources.length - 1]
+
+      runCleanups()
+
+      // Persistent: the crossfaded instance keeps playing, the ref is released.
+      expect(crossfadeSource.stop).not.toHaveBeenCalled()
+      expect(_getBufferRefCount().has('/b.wav')).toBe(false)
+      expect(_getBufferCache().has('/b.wav')).toBe(false)
+    })
+
+    it('unmount and remount of the same src while the first load is pending leaves no residue', async () => {
+      const d = deferFetch()
+      const { useSound, _getBufferCache, _getBufferRefCount } = await import('../useSound')
+
+      useSound('/a.wav')
+      flushEffects() // first mount, load pending
+      runCleanups() // unmount before the load finishes
+      expect(_getBufferRefCount().has('/a.wav')).toBe(false)
+
+      useSound('/a.wav')
+      flushEffects() // remount shares the in-flight load
+      d.resolve('/a.wav')
+      await vi.waitFor(() => expect(_getBufferCache().has('/a.wav')).toBe(true))
+
+      // Exactly one live reference — not zero (premature free), not two (leak).
+      expect(_getBufferRefCount().get('/a.wav')).toBe(1)
+
+      runCleanups()
+      expect(_getBufferRefCount().has('/a.wav')).toBe(false)
+      expect(_getBufferCache().has('/a.wav')).toBe(false)
+    })
+
+    it('a failed load does not drive the ref count negative on unmount', async () => {
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      ;(globalThis as any).fetch = vi.fn(async () => {
+        throw new Error('network down')
+      })
+      const { useSound, _getBufferCache, _getBufferRefCount } = await import('../useSound')
+
+      useSound('/bad.wav')
+      flushEffects()
+      await settle()
+
+      expect(_getBufferRefCount().has('/bad.wav')).toBe(false)
+      expect(_getBufferCache().has('/bad.wav')).toBe(false)
+
+      runCleanups()
+      expect(_getBufferRefCount().has('/bad.wav')).toBe(false)
+      errSpy.mockRestore()
+    })
+  })
+
+  describe('maxInstances limits concurrent source nodes', () => {    it('stops oldest instance when maxInstances exceeded', async () => {
       const { useSound } = await import('../useSound')
 
       const controls = useSound('/pew.wav', { maxInstances: 2 })

@@ -186,7 +186,12 @@ export function useSound(src: string, opts: SoundOptions = {}): SoundControls {
   const onEndedRef = useRef(opts.onEnded)
   const persistentRef = useRef(opts.persistent ?? false)
   const unmountedRef = useRef(false)
-  const acquiredSrcRef = useRef<string | null>(null)
+  // The src whose buffer reference the hook currently holds (null while the
+  // initial load is in flight or after the reference has been released).
+  const currentSrcRef = useRef<string | null>(null)
+  // Generation counter: only the latest crossfade (and the latest effect
+  // generation) is allowed to take ownership of the playback state.
+  const crossfadeIdRef = useRef(0)
   const maxInstances = Math.max(1, opts.maxInstances ?? 4)
 
   // Keep onEnded ref current without re-running the effect
@@ -195,44 +200,65 @@ export function useSound(src: string, opts: SoundOptions = {}): SoundControls {
 
   useEffect(() => {
     let cancelled = false
+    // Invalidate any crossfade still in flight from a previous effect run.
+    crossfadeIdRef.current += 1
     unmountedRef.current = false
+
+    // This effect owns exactly one buffer reference for `src` (acquired by
+    // loadBuffer below) until it is either transferred to currentSrcRef or
+    // released. Idempotent so every exit path releases it exactly once.
+    let ownsSrcRef = true
+    const releaseOwned = (): void => {
+      if (ownsSrcRef) {
+        ownsSrcRef = false
+        releaseBuffer(src)
+      }
+    }
+
     loadBuffer(src)
       .then((buf) => {
-        if (!cancelled) {
-          bufferRef.current = buf
-          acquiredSrcRef.current = src
+        if (cancelled || currentSrcRef.current) {
+          // Unmounted mid-load, or a crossfade took over before this load
+          // finished: nobody will consume this reference, so release it.
+          releaseOwned()
+          return
         }
+        bufferRef.current = buf
+        currentSrcRef.current = src
+        ownsSrcRef = false // ownership transferred to currentSrcRef
       })
-      .catch(console.error)
+      .catch((err: unknown) => {
+        releaseOwned()
+        console.error(err)
+      })
 
     return () => {
       cancelled = true
       unmountedRef.current = true
-      if (persistentRef.current && acquiredSrcRef.current === src) {
+      if (persistentRef.current) {
         // Leave the instances playing; they clean themselves up when they end.
         activeInstances.current = []
-        bufferRef.current = null
-        acquiredSrcRef.current = null
-        releaseBuffer(src)
-        return
-      }
-      for (const entry of activeInstances.current) {
-        entry.source.onended = null
-        try {
-          entry.source.stop()
-        } catch {
-          /* already stopped */
-        }
-        entry.gain.disconnect()
-        entry.unregister?.()
-      }
-      activeInstances.current = []
-      bufferRef.current = null
-      if (acquiredSrcRef.current) {
-        releaseBuffer(acquiredSrcRef.current)
-        acquiredSrcRef.current = null
       } else {
-        releaseBuffer(src)
+        for (const entry of activeInstances.current) {
+          entry.source.onended = null
+          try {
+            entry.source.stop()
+          } catch {
+            /* already stopped */
+          }
+          entry.gain.disconnect()
+          entry.unregister?.()
+        }
+        activeInstances.current = []
+      }
+      bufferRef.current = null
+      // The hook always releases the buffer reference it holds, even when
+      // persistent playback continues without it.
+      if (currentSrcRef.current) {
+        releaseBuffer(currentSrcRef.current)
+        currentSrcRef.current = null
+      } else {
+        releaseOwned()
       }
     }
   }, [src])
@@ -371,15 +397,17 @@ export function useSound(src: string, opts: SoundOptions = {}): SoundControls {
 
   const crossfadeTo = (newSrc: string, duration: number): void => {
     fadeOut(duration)
+    const id = ++crossfadeIdRef.current
     loadBuffer(newSrc)
       .then((buf) => {
-        if (!buf) return
-        // Unmounted while loading: nothing could stop a source started now, so drop it.
-        if (unmountedRef.current && !persistentRef.current) {
+        // A newer crossfade (or a src change / remount) superseded this one,
+        // or the component unmounted while loading: nothing could stop a
+        // source started now, so just release the reference we hold.
+        if (id !== crossfadeIdRef.current || unmountedRef.current) {
           releaseBuffer(newSrc)
           return
         }
-        const previousSrc = acquiredSrcRef.current
+        const previousSrc = currentSrcRef.current
         const ctx = getAudioCtx()
         if (ctx.state === 'suspended') void ctx.resume()
 
@@ -389,7 +417,9 @@ export function useSound(src: string, opts: SoundOptions = {}): SoundControls {
         entry.source.start()
         activeInstances.current.push(entry)
         bufferRef.current = buf
-        acquiredSrcRef.current = newSrc
+        currentSrcRef.current = newSrc
+        // The old buffer is released only after the new one is playing, so a
+        // sounding source never loses its cached buffer.
         if (previousSrc) releaseBuffer(previousSrc)
       })
       .catch((err: unknown) => {
