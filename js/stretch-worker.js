@@ -10,19 +10,25 @@
 //      quality: 'fast' (default) or 'hq', 5-15x slower (1.5-4 s for a 60-70 s stem in desktop
 //      Chrome). formant: keep a voice's formants in place when pitchRatio != 1. srcRate: the
 //      input's sample rate (default sampleRate, the output's); targetLen counts output samples.
-// Out: { id, channels, quality, formant } with exactly targetLen samples per channel; quality and
-// formant say what was actually done (an hq request that gets 'fast' back got exactly the fast
-// render, as hq would not have been better). The output is itself a seamless loop: the closing
-// splice is crossfaded into the material that precedes the loop start, so the wrap (and bar 1's
-// downbeat) stay clean. Attacks land on the same stretched times on both paths.
+// Out: { id, channels, quality, formant, targetLen, pitchRatio } with exactly targetLen samples
+// per channel; quality and formant say what was actually done (an hq request that gets 'fast'
+// back got exactly the fast render, as hq would not have been better). targetLen and pitchRatio
+// echo the request, so the main thread can match a reply to the submission that asked for it: a
+// reply whose id has expired, or whose echo no longer matches the layer's current parameters, is
+// dropped without touching the cache or the transport. The output is itself a seamless loop: the
+// closing splice is crossfaded into the material that precedes the loop start, so the wrap (and
+// bar 1's downbeat) stay clean. Attacks land on the same stretched times on both paths.
 
 self.onmessage = (e) => {
   const job = e.data;
   try {
     const res = run(job);
-    self.postMessage({ id: job.id, ...res }, [...new Set(res.channels.map((c) => c.buffer))]);
+    self.postMessage({ id: job.id, targetLen: job.targetLen, pitchRatio: job.pitchRatio, ...res },
+      [...new Set(res.channels.map((c) => c.buffer))]);
   } catch (err) {
-    self.postMessage({ id: job.id, error: String((err && err.stack) || err) });
+    // The echo goes back on failure too, so the main thread can tell a stale worker's error from
+    // a live one (the stale one is discarded; only the live one falls back to original speed).
+    self.postMessage({ id: job.id, error: String((err && err.stack) || err), targetLen: job.targetLen, pitchRatio: job.pitchRatio });
   }
 };
 

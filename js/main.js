@@ -16,6 +16,23 @@ const ui = {
   mouse: { x: innerWidth / 2, y: innerHeight / 2 },
 };
 
+// ---------- submissions: one cancelable render chain per layer ----------
+// Both ways a new song reaches a layer go through this: a direct pick on the wheel, and a pick made
+// while an Audio FX is held, which the engine queues and commits on the FX release (see fxRelease).
+// Each call asks the engine for a sequenced submission recording the layer, song, pitch ratio and
+// target length; the engine discards any worker reply whose sequence has expired, so the last
+// choice is always the one that is cached and heard. The latest descriptor per layer is kept here
+// (and exposed on E.submission for tests and the UI), never the stale ones.
+const submissions = new Map(); // layer id -> { seq, song, type, bpm, semis, pitchRatio, targetLen, key }
+async function commitSubmission(layerId, song) {
+  const descriptor = await E.selectStem(layerId, song);
+  if (descriptor && descriptor.seq) {
+    const last = submissions.get(layerId);
+    if (!last || descriptor.seq >= last.seq) submissions.set(layerId, descriptor);
+  }
+  return descriptor;
+}
+
 // ---------- toast ----------
 let toastTimer;
 function toast(msg, kind = '') {
@@ -42,7 +59,9 @@ const wheel = createWheel($('#wheel'), {
 
 function pickSong(song) {
   if (!E.stemTypeFor(ui.layer, song)) return; // an empty slot for this layer: nothing to pick
-  E.selectStem(ui.layer, song);
+  // The single submission entry: a direct pick, or — while an FX is held — the queued pick the
+  // same chain commits when the effect is released (see fxRelease).
+  commitSubmission(ui.layer, song);
 }
 
 // ---------- hub ----------
@@ -592,6 +611,10 @@ function fxRelease() {
   ui.fx.amount = 0;
   $('#fxBtn').classList.remove('held');
   $('#fxPicker').classList.remove('held');
+  // E.fxStop settles the held swap group: every pick queued during the hold was submitted through
+  // the same sequenced chain as a direct pick (commitSubmission -> E.selectStem), so its worker
+  // replies are already bound to their submissions and the newest song per layer is what drops in,
+  // together with the effect letting go. Nothing is re-submitted here — the chain already owns it.
   E.fxStop();
 }
 function bindFx() {

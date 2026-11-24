@@ -59,6 +59,12 @@ for (const l of LAYERS) {
     source: null, cur: null, tails: [], fxIn: null, insert: null, gain: null, analyser: null,
     loading: false, syncing: false, progress: 0, renderTag: 0,
     error: null, // why the layer couldn't follow the last tempo or key change, if it couldn't
+    // The one cancelable render chain a layer's picks go through. `seq` identifies the newest
+    // submission (a pick, a re-pick, a clear, or a tempo/key change): any worker job or reply
+    // carrying an older one is dropped, and any buffer it would have written is never cached or
+    // played. `request` is what that submission asked for — { song, type, bpm, semis, pitchRatio,
+    // targetLen, key } — so a late reply can also be checked against the parameters themselves.
+    seq: 0, request: null,
   };
 }
 
@@ -379,8 +385,19 @@ function spawnWorker() {
     slot.job = null;
     if (e.data.quality) int16Input = true;
     if (job && job.id === e.data.id) {
-      if (e.data.error) job.reject(new Error(e.data.error));
-      else job.resolve(e.data); // { channels, quality, formant }
+      // The same cancelable chain as the submissions: a job whose layer has since moved on (a new
+      // pick, a clear, or a tempo/key change) is stale, whatever the worker did with it. Its reply
+      // is discarded here — no resolve, so no buffer is built, written into the renders cache, or
+      // played — and the job is dropped like one removed from the queue (see pumpJobs). The
+      // worker's echo of targetLen/pitchRatio lets a layer-bound job be checked even without a
+      // state lookup; unbound jobs (hover pre-renders, hq upgrades) keep their own wanted().
+      if (jobStale(job, e.data)) {
+        dropJob(job);
+      } else if (e.data.error) {
+        job.reject(new Error(e.data.error));
+      } else {
+        job.resolve(e.data); // { channels, quality, formant, targetLen, pitchRatio }
+      }
     }
     pumpJobs();
     preRenderSoon(); // a worker is free: the hovered song may be rendered now
@@ -396,6 +413,24 @@ function spawnWorker() {
   };
   pool.push(slot);
   return slot;
+}
+
+// A worker reply is no longer wanted when its bound layer's submission has moved on: the layer's
+// sequence advanced past the job's, or the layer's current request no longer asks for this render
+// key (its song, tempo or key changed). Jobs without a layer — hover pre-renders and hq upgrades —
+// answer to their own wanted() instead, which is rechecked by pumpJobs before they start. The
+// worker's echoed pitch ratio is cross-checked against the request (a different ratio means the
+// reply answers an older key); the echoed target length is informational, since the decoded loop's
+// exact frame count can differ slightly from the manifest figure the request was built from.
+function jobStale(job, reply) {
+  if (job.layerId === null || job.layerId === undefined) return false;
+  const s = state.layers[job.layerId];
+  if (!s || s.seq !== job.seq) return true;
+  const req = s.request;
+  if (!req) return true;
+  if (req.key !== job.renderKey) return true;
+  if (reply && reply.pitchRatio !== undefined && Math.abs(reply.pitchRatio - req.pitchRatio) > 1e-9) return true;
+  return false;
 }
 
 function dropJob(job) { job.dropped(); job.reject(abortError()); }
@@ -426,9 +461,20 @@ const mixBusy = () => activeLayers().some((id) => {
 // an upgrade only while no other background job runs either (a pre-render doesn't wait for an
 // upgrade, it runs beside it), and one nobody would pick now stops at once.
 function pumpJobs() {
-  for (let k = jobQueue.length - 1; k >= 0; k--) if (!jobQueue[k].wanted()) dropJob(jobQueue.splice(k, 1)[0]);
+  // Expire queued jobs first — both ones whose own wanted() says so and layer-bound jobs whose
+  // submission has moved on (a newer pick, a clear, or a tempo/key change). Running them is
+  // pointless and they must not queue ahead of the submission that replaced them.
+  for (let k = jobQueue.length - 1; k >= 0; k--) {
+    const j = jobQueue[k];
+    if (!j.wanted() || jobStale(j)) dropJob(jobQueue.splice(k, 1)[0]);
+  }
   for (const slot of [...pool]) {
-    if (slot.job && slot.pre && !slot.job.wanted()) { retire(slot); if (!pool.length) spawnWorker(); }
+    if (!slot.job) continue;
+    // A background job nobody would pick now gives its worker back at once. A layer-bound urgent
+    // job whose submission has expired (a re-pick, a clear, a tempo/key change) is retired too:
+    // otherwise its render runs to the end and its reply lands late, holding a worker and, for
+    // hq jobs, ~130 MB, behind the submission that replaced it.
+    if ((slot.pre && !slot.job.wanted()) || jobStale(slot.job)) { retire(slot); if (!pool.length) spawnWorker(); }
   }
   const rank = (j) => (j.urgent() ? 2 : j.low ? 0 : 1);
   while (jobQueue.length) {
@@ -462,12 +508,16 @@ function pumpJobs() {
 // (`inLen` samples of loop), or floats of exactly the loop, at `srcRate` (the originals' rate; the
 // worker converts it to `sampleRate`, the context's). `type` (the stem type) lets the worker
 // tune itself per layer; `quality` and `formant` ask for its slower paths (see upgrade). Resolves
-// with the worker's reply: { channels, quality, formant }.
-function stretchInWorker(channels, sampleRate, targetLen, pitchRatio, { wanted = () => true, urgent = wanted, dropped = () => {}, type, inLen, srcRate = sampleRate, low = false, quality, formant } = {}) {
+// with the worker's reply: { channels, quality, formant, targetLen, pitchRatio }.
+// `layerId`/`seq`/`renderKey` bind a job to the submission that asked for it (null for unbound
+// background work): a reply whose sequence has expired is discarded in the worker's onmessage,
+// before any buffer or cache entry is made.
+function stretchInWorker(channels, sampleRate, targetLen, pitchRatio, opts = {}) {
+  const { wanted = () => true, urgent = wanted, dropped = () => {}, type, inLen, srcRate = sampleRate, low = false, quality, formant, layerId = null, seq = 0, renderKey = null } = opts;
   return new Promise((resolve, reject) => {
     const id = ++jobSeq;
     const message = async (int16) => ({ id, channels: await channels(int16), inLen, sampleRate, srcRate, targetLen, pitchRatio, type, ...(quality && { quality, formant }) });
-    jobQueue.push({ id, message, wanted, urgent, dropped, low, resolve, reject });
+    jobQueue.push({ id, message, wanted, urgent, dropped, low, resolve, reject, layerId, seq, renderKey });
     pumpJobs();
   });
 }
@@ -931,7 +981,7 @@ async function stretchStem(info, type, bpm, semis, { onProgress, ...job }) {
     }
     return out;
   };
-  const out = await stretchInWorker(chans, sr, len, ratio, { ...job, type, inLen, srcRate });
+  const out = await stretchInWorker(chans, sr, len, ratio, { ...job, type, inLen, srcRate, targetLen: len, pitchRatio: ratio });
   const buf = ctx.createBuffer(2, len, sr);
   for (let c = 0; c < 2; c++) await inSteps(len, copyInto, 0, out.channels[c], buf.getChannelData(c));
   buf.trim = stemTrim(info, type) * gain; // and back up by what toInt16 scaled a hot lossy decode down
@@ -940,12 +990,115 @@ async function stretchStem(info, type, bpm, semis, { onProgress, ...job }) {
   return buf;
 }
 
+// ---------- submissions: the one cancelable render chain per layer ----------
+// Every time a layer's heard parameters change — a pick (direct, or one queued while an Audio FX is
+// held and committed on its release), a clear, or a tempo/key change — that is a submission with a
+// fresh sequence number, recording the layer, the song, the pitch ratio, the target length and the
+// render key they produce. A worker reply whose sequence has expired, or whose echoed parameters no
+// longer match the layer's request, is discarded (see jobStale): the last submission is the only
+// one that can ever reach the cache or the transport.
+let submitSeq = 0;
+
+// The request a submission at the current (or given) tempo and key renders, with every figure the
+// chain has to agree on. Same inputs always give the same record, so a re-pick of the same song
+// finds its render in the cache instead of stretching again.
+function makeRequest(layerId, song, type, at) {
+  const info = MANIFEST[song];
+  const bpm = at?.bpm ?? state.bpm;
+  const semis = at?.semis ?? semisFor(info.key);
+  const pitchRatio = Math.pow(2, semis / 12);
+  // The same length stretchStem asks the worker for. The manifest's frame count gives the loop's
+  // beats at the stem's own BPM (loopShape); where it is absent, fall back to the 128-beat cycle.
+  // This is a recorded figure for the chain to agree on, not the source of truth — the render key
+  // (song, type, bpm, semis, sample rate) is what actually identifies the render.
+  const frames = info.frames && info.frames[type];
+  const beats = frames ? loopShape(frames, info.bpm, STEM_RATE).beats : BEATS;
+  const targetLen = loopSamples(beats, bpm, ctx.sampleRate);
+  return { layerId, song, type, bpm, semis, pitchRatio, targetLen, key: renderKey(song, type, bpm, semis) };
+}
+
+// Records a layer's newest submission and cancels whatever was in flight for it. `req` is null for
+// a clear. The old request's render key is released from the cache unless another layer, a source
+// still sounding, or a hover pre-render still holds that exact render, so memory does not grow with
+// the number of re-picks: one layer keeps one stretched buffer for its current parameters.
+function submit(layerId, req) {
+  const s = state.layers[layerId];
+  const oldReq = s.request;
+  s.seq = ++submitSeq;
+  s.request = req;
+  pumpJobs(); // retire or dequeue jobs whose seq has now expired (see jobStale)
+  if (oldReq && (!req || oldReq.key !== req.key)) releaseRenderKey(oldReq.key);
+  return { seq: s.seq, ...(req || {}) };
+}
+
+// The buffers some layer is still holding — playing sources, pending tails and the layers' own
+// buffers — so a render behind them is never pulled out from under a sounding source.
+function heldBuffers() {
+  const used = new Set();
+  for (const l of LAYERS) {
+    const s = state.layers[l.id];
+    if (s.buffer) used.add(s.buffer);
+    for (const x of sourcesOf(s)) used.add(x.buf);
+  }
+  return used;
+}
+
+// Renders no submission asks for any more. One layer's current parameters keep exactly one
+// stretched buffer: replaced or cleared layers explicitly let their old buffers go, so the cache
+// does not grow with the number of re-picks. A key whose buffer a sounding source or the layer
+// itself still holds is parked in `deferredKeys` and dropped the moment that hold ends (the next
+// buffer assignment, a source ending, or a clear), rather than being pulled out from under it.
+const deferredKeys = new Set();
+
+// Drops a cached render no submission asks for any more. In-flight entries are left for their own
+// seq check (the job that resolves them is already being retired); an entry a source is still
+// sounding stays until that source ends. Anything else is discarded now.
+function releaseRenderKey(key) {
+  const entry = renders.get(key);
+  if (!entry) return;
+  const wantedNow = activeLayers().some((id) => state.layers[id].request?.key === key)
+    || (hover && hoverRenders().some((h) => h.key === key));
+  if (wantedNow) return;
+  if (entry.buf && heldBuffers().has(entry.buf)) { deferredKeys.add(key); return; }
+  renders.delete(key);
+  deferredKeys.delete(key);
+}
+
+// Re-runs the release for keys parked while a layer or source held their buffer. Called whenever a
+// hold can have ended: a buffer is swapped onto a layer, a source ends, or a layer is cleared.
+function releaseDeferred() {
+  if (!deferredKeys.size) return;
+  for (const key of [...deferredKeys]) releaseRenderKey(key);
+}
+
+// Swaps a freshly rendered buffer onto a layer, then lets the render it replaced go: the old key
+// was parked (releaseRenderKey) while this layer still held its buffer, and from this assignment on
+// nothing does, so its entry is discarded instead of lingering for the cache budget to evict it.
+function assignBuffer(s, buf, key, bpm) {
+  s.buffer = buf; s.bufferKey = key; s.bufferBpm = bpm;
+  releaseDeferred();
+}
+
+// A tempo or key change moves every layer's request to a new render key. Submitting again cancels
+// each layer's in-flight jobs at the old key and releases its old cache entry; the rebuild that
+// follows (see setBpm, rebuildAll) renders the new requests.
+function resubmitAll() {
+  if (!ctx) return;
+  for (const id of activeLayers()) {
+    const s = state.layers[id];
+    if (s.request && s.request.key === renderKey(s.song, s.type)) continue;
+    submit(id, makeRequest(id, s.song, s.type));
+  }
+}
+
 // Renders a stem at the current tempo and key (or at `at`, { bpm, semis }: see preRender).
 // Identical requests share one render. An entry holds the best render made for its key: the fast
 // one, replaced by its hq upgrade once that lands (see upgrade). The key needs no quality of its
 // own, as nothing asks for the fast render once there is a better one, and formant correction
 // follows from the key (the song, its type and the shift).
-function render(song, type, onProgress, at) {
+// `binding` ({ layerId, seq }) ties the stretch jobs to a submission: stale replies are dropped
+// before the entry's buffer is ever set, so an expired render can never be cached or played.
+function render(song, type, onProgress, at, binding = null) {
   const info = MANIFEST[song];
   const { bpm, semis } = at || { bpm: state.bpm, semis: semisFor(info.key) };
   const key = renderKey(song, type, bpm, semis);
@@ -960,11 +1113,19 @@ function render(song, type, onProgress, at) {
       return s.song === song && s.type === type && renderKey(song, type) === key;
     });
     const wanted = () => urgent() || hoverRenders().some((h) => h.key === key);
+    const jobBinding = binding ? { layerId: binding.layerId, seq: binding.seq, renderKey: key } : {};
     entry.promise = (async () => {
       const kept = await keptRender(info, type, key);
       if (kept) { if (onProgress) onProgress(1); entry.buf = kept; return kept; }
       // Dropped from the queue: forgotten at once, so a new request for it starts afresh.
-      entry.buf = await stretchStem(info, type, bpm, semis, { onProgress, wanted, urgent, dropped: forget });
+      entry.buf = await stretchStem(info, type, bpm, semis, { onProgress, wanted, urgent, dropped: forget, ...jobBinding });
+      // The await above may have outlived the submission: its worker reply was already discarded
+      // (jobStale), which rejects with an AbortError before this line. Keep the guard anyway so a
+      // buffer can never be published onto an entry that has been released meanwhile.
+      if (binding && jobStale({ layerId: binding.layerId, seq: binding.seq, renderKey: key })) {
+        forget();
+        throw abortError();
+      }
       return entry.buf;
     })();
     entry.promise.then(() => setTimeout(trimCaches), forget); // once the layer waiting for it holds it
@@ -1207,6 +1368,7 @@ function gone(x) {
   const s = state.layers[x.layerId];
   s.tails = s.tails.filter((y) => y !== x);
   if (s.cur === x) s.cur = s.source = null; // a looping source never ends by itself
+  releaseDeferred(); // a parked render whose last sounding source just ended can now go
   trimCaches();
 }
 
@@ -1348,6 +1510,9 @@ function checkSources() {
   for (const l of LAYERS) {
     const s = state.layers[l.id], x = s.cur;
     if (!x || (state.playing && (s.song ? x.bpm === clockBpm : leaving))) continue;
+    // A native fallback (a failed stretch) is meant to play at the stem's own tempo until the next
+    // submission retries the stretch: its off-tempo is the fallback, not a stray source.
+    if (state.playing && s.song && x.buf && x.buf.nativeFallback) continue;
     const offTempo = state.playing && !!s.song;
     health[offTempo ? 'offTempo' : 'stray']++;
     console.warn(`${l.id}: ${!state.playing ? 'still playing after the jam stopped' : !s.song ? 'still playing after it was cleared'
@@ -1574,11 +1739,13 @@ function retime(t) {
 }
 
 // Renders the given layers at the current tempo/key, in parallel; remembers which pick each
-// render was for, so a layer re-picked meanwhile can ignore it.
+// render was for, so a layer re-picked meanwhile can ignore it. Each job carries the layer's
+// current submission sequence: a tempo/key change or a new pick mid-pass expires it, and the
+// worker's reply is discarded instead of being cached (see jobStale).
 async function renderLayers(ids) {
   const jobs = ids.map((id) => {
     const s = state.layers[id];
-    return { id, song: s.song, tag: s.renderTag, job: render(s.song, s.type) };
+    return { id, song: s.song, tag: s.renderTag, seq: s.seq, job: render(s.song, s.type, undefined, undefined, { layerId: id, seq: s.seq }) };
   });
   const done = await Promise.allSettled(jobs.map((j) => j.job.promise));
   return jobs.map((j, k) => ({ ...j, result: done[k] }));
@@ -1635,7 +1802,7 @@ export async function play() {
       s.syncing = false;
       if (s.song !== r.song || s.renderTag !== r.tag) continue; // re-picked meanwhile
       if (r.result.status === 'fulfilled') {
-        s.buffer = r.result.value; s.bufferKey = r.job.key; s.bufferBpm = r.job.bpm; s.error = null;
+        assignBuffer(s, r.result.value, r.job.key, r.job.bpm); s.error = null;
       } else if (!isAbort(r.result.reason)) failed.set(r.id, r);
     }
     if (gen !== playGen || state.playing) { changed(); return; } // stopped or restarted meanwhile
@@ -1684,6 +1851,11 @@ const resyncGroups = []; // swap groups waiting on the next pass (see settle)
 export function rebuildAll(group) {
   if (group) resyncGroups.push(group);
   if (!ctx) { resyncGroups.splice(0).forEach((g) => settle(g, 'resync')); return Promise.resolve(); }
+  // A tempo or key change moves every layer's target render key. Re-submitting first cancels the
+  // jobs still rendering the old key (their replies are discarded, never cached) and releases the
+  // old key's buffer, then the pass below renders the new requests. No-op while the keys still
+  // match, so a plain rebuild after a pick costs nothing here.
+  resubmitAll();
   pumpJobs(); // a pre-render for the old key or tempo stops now
   if (resyncRun) { resyncAgain = true; return resyncRun; }
   resyncRun = (async () => {
@@ -1721,7 +1893,7 @@ async function resyncOnce() {
     for (const r of fresh) {
       const s = state.layers[r.id];
       if (s.song !== r.song || s.renderTag !== r.tag || s.loading || r.job.key !== renderKey(s.song, s.type)) continue; // moved on during the wait
-      s.buffer = r.result.value; s.bufferKey = r.job.key; s.bufferBpm = r.job.bpm; s.error = null;
+      assignBuffer(s, r.result.value, r.job.key, r.job.bpm); s.error = null;
     }
   };
   if (stale.length) {
@@ -1822,6 +1994,41 @@ async function tempoWait(t, bpm) {
 }
 
 // ---------- layer selection ----------
+// A stretch that genuinely failed (a worker crashed or threw, not an AbortError: those mean the
+// submission moved on and are retried) must not leave the layer stuck "loading". Where the original
+// stem is already decoded, the layer plays that original at its own speed instead — audible now,
+// with the layer still picked so the next tempo/key change, or Stop then Play, retries the stretch
+// (the failed render was never cached, so nothing has to be evicted first). Returns the fallback
+// buffer, or null when the original isn't available (a download failure, handled by the caller).
+async function nativeFallback(info, type, onProgress) {
+  let orig;
+  try {
+    const entry = originals.get(info.stems[type]);
+    orig = entry && entry.settled ? entry.buf : await getOriginal(info, type, onProgress);
+  } catch (err) {
+    if (isAbort(err)) throw err;
+    return null; // nothing decoded: the caller reports the load failure
+  }
+  // The original at its own rate, in the context's rate: the same conversion a first pick would
+  // ask the worker for, but with no time stretch or pitch shift, so it sounds exactly as recorded.
+  const sr = ctx.sampleRate, srcRate = orig.sampleRate;
+  const len = Math.round(orig.length * (sr / srcRate));
+  const buf = ctx.createBuffer(2, len, sr);
+  const from16 = !!orig.channels;
+  const gain = from16 ? orig.gain : 1;
+  for (let c = 0; c < 2; c++) {
+    const x = (from16 ? orig.channels : orig.floats)[Math.min(c, (from16 ? orig.channels : orig.floats).length - 1)];
+    const y = buf.getChannelData(c), n = Math.min(len, x.length);
+    if (from16) await inSteps(n, (from, to, _, src, dst, k) => { for (let i = from; i < to; i++) dst[i] = src[i] * k; }, 0, x, y, 1 / 32768 * gain);
+    else await inSteps(n, copyInto, 0, x, y);
+  }
+  buf.trim = stemTrim(info, type) * gain;
+  buf.quality = 'native'; // marks a fallback, never an upgrade target (see upgrade)
+  buf.formant = false;
+  buf.nativeFallback = true;
+  return buf;
+}
+
 export async function selectStem(layerId, song, opts = {}) {
   ensureCtx();
   const s = state.layers[layerId];
@@ -1833,7 +2040,7 @@ export async function selectStem(layerId, song, opts = {}) {
     return clearLayer(layerId);
   }
   const type = stemTypeFor(layerId, song);
-  if (!type) { settle(opts.group, layerId); return; }
+  if (!type) { settle(opts.group, layerId); return null; }
 
   // The tempo moves to the average with this pick in (see autoTempo): a share link's picks keep its
   // tempo (keepTempo), and Random sets it once for all of its picks (tempoSet).
@@ -1862,6 +2069,11 @@ export async function selectStem(layerId, song, opts = {}) {
   s.progress = 0;
   s.error = null;
   if (!state.anchorOrder.includes(layerId)) state.anchorOrder.push(layerId);
+  // One sequenced submission for this pick — direct, or queued while an Audio FX is held (the same
+  // held group commits it on release, see dropHeld). Any submission the layer had in flight is
+  // cancelled here, and its render key's cache entry is released: the last pick is always the only
+  // one that can resolve into this layer's buffer.
+  const submission = submit(layerId, makeRequest(layerId, song, type));
   changed();
   // The replaced pick's download, and any hover prefetch, stop competing with this one (after
   // this task, so a Random batch doesn't cancel a download one of its other picks needs).
@@ -1884,24 +2096,36 @@ export async function selectStem(layerId, song, opts = {}) {
   s.joinGroup = (g) => { group = s.group = g; }; // switching auto tempo on while it loads (see setAutoTempo)
   const leave = () => { if (s.group !== group) settle(group, layerId); };
   const tag = ++s.renderTag;
+  // The submission this pick renders against. Captured afresh on every retry: a tempo/key change
+  // re-submits the layer (see rebuildAll), so the retry is bound to the newest sequence and a reply
+  // for an old one is discarded rather than winning the race.
+  const bind = () => ({ layerId, seq: s.seq });
+  // Progress arrives per network chunk; re-render the UI in 2% steps, not hundreds of times.
+  // It can go back (an Ogg this browser couldn't decode, then the FLAC). Declared before the try
+  // so the worker-failure fallback below can report its download progress too.
+  const progress = (p) => {
+    if (s.renderTag === tag && (p >= 1 || Math.abs(p - s.progress) >= 0.02)) { s.progress = p; changed(); }
+  };
   try {
-    // Progress arrives per network chunk; re-render the UI in 2% steps, not hundreds of times.
-    // It can go back (an Ogg this browser couldn't decode, then the FLAC).
-    const progress = (p) => {
-      if (s.renderTag === tag && (p >= 1 || Math.abs(p - s.progress) >= 0.02)) { s.progress = p; changed(); }
-    };
     let job, buf;
     for (;;) {
-      job = render(song, type, progress);
+      const binding = bind();
+      job = render(song, type, progress, undefined, binding);
       try { buf = await job.promise; break; } catch (err) {
         // Dropped from the stretch queue because the tempo or key moved while it waited: render
         // again for the new settings, however often that happens (nothing failed). A pick
         // replaced meanwhile just ends, below.
         if (!isAbort(err) || s.renderTag !== tag || s.song !== song) throw err;
+        // The layer was re-submitted (its request moved to another render key): follow it instead
+        // of re-rendering the key the submission no longer asks for.
+        if (s.request && s.request.key !== job.key) song = s.request.song, type = s.request.type;
       }
     }
-    if (s.renderTag !== tag || s.song !== song) { leave(); return; }
-    s.buffer = buf; s.bufferKey = job.key; s.bufferBpm = job.bpm;
+    // A newer pick (or a clear) superseded this one: its own submission owns the layer now, so this
+    // call leaves without touching the buffer. A re-submit for the same pick (a tempo/key change
+    // handled in the retry loop) keeps the same render tag and is not an exit.
+    if (s.renderTag !== tag || s.song !== song) { leave(); return null; }
+    assignBuffer(s, buf, job.key, job.bpm);
     s.loading = false;
     s.progress = 1;
     let retimeLater = false;
@@ -1930,8 +2154,41 @@ export async function selectStem(layerId, song, opts = {}) {
     if (!isCurrent(s) || (state.playing && job.bpm !== clockBpm && !retimeLater)) rebuildAll();
     changed();
     preRenderSoon();
+    return submission; // the sequenced descriptor ({ seq, song, pitchRatio, targetLen, key, ... })
   } catch (err) {
-    if (s.renderTag !== tag) { leave(); return; }
+    if (s.renderTag !== tag) { leave(); return null; }
+    // A stretch-worker failure with the original in hand: fall back to the original at its own
+    // speed instead of dropping the pick and sitting in the loading state. The layer stays picked
+    // and marked with the error, so any later submission (Stop/Play, a tempo or key nudge, another
+    // pick) retries the stretch; nothing is written into the renders cache for the failed key.
+    if (!isAbort(err) && s.song === song) {
+      const info = MANIFEST[song];
+      const fallback = await nativeFallback(info, type, progress).catch((e) => (isAbort(e) ? Promise.reject(e) : null));
+      if (fallback && s.renderTag === tag && s.song === song) {
+        console.warn('stretch failed, playing the original at its own speed:', err);
+        s.buffer = fallback;
+        s.bufferKey = null; // no cached render: a retry stretches afresh
+        s.bufferBpm = info.bpm;
+        releaseDeferred();
+        s.loading = false;
+        s.progress = 1;
+        s.error = loadError(song, err);
+        status(`${song} plays at its own speed for now — it'll re-stretch on the next change`, 'error');
+        if (state.playing) {
+          const go = (t) => {
+            if (state.playing && s.renderTag === tag && s.buffer === fallback) startSource(layerId, t, t - state.transportStart);
+          };
+          if (!settle(group, layerId, go)) go(nextBarTime());
+        } else {
+          settle(group, layerId);
+          if ((wantPlay || (!opts.noAutoplay && gen === playGen)) && activeLayers().every((id) => !state.layers[id].loading)) {
+            play();
+          }
+        }
+        changed();
+        return submission; // the pick still stands, on its native-speed fallback
+      }
+    }
     console.error(err);
     s.loading = false;
     stopSource(layerId);
@@ -1996,14 +2253,50 @@ export function clearLayer(layerId) {
   s.renderTag++;
   s.group = null; // a pick still loading settles its group as it ends (see selectStem)
   const rootBefore = masterRoot();
+  // Cancel the cleared layer's whole submission chain: its seq moves past every in-flight job (a
+  // late worker reply is then discarded in onmessage and can never resurrect the layer), and its
+  // render key is released from the cache. The sounding source, if any, keeps its buffer until the
+  // bar-line stop ends it; the cache release leaves that buffer alone while a source holds it.
+  const oldReq = s.request;
   s.song = s.type = s.buffer = s.bufferKey = s.error = null;
   s.loading = s.syncing = false;
+  submit(layerId, null);
+  if (oldReq) releaseRenderKey(oldReq.key);
+  releaseDeferred(); // the cleared layer no longer holds any parked buffer
   state.anchorOrder = state.anchorOrder.filter((x) => x !== layerId);
   if (!activeLayers().length) { endJam(); playGen++; }
   abortUnwanted(); // its download, if it was still coming
   changed();
   if (auto || (masterRoot() !== rootBefore && masterRoot() !== null)) rebuildAll();
 }
+
+// ---------- submission / render-chain introspection (UI and tests) ----------
+// The newest sequenced submission recorded for a layer, or null after a clear: { seq, layerId,
+// song, type, bpm, semis, pitchRatio, targetLen, key }. This is the only request a worker reply is
+// allowed to fulfil (see jobStale).
+export const submission = (layerId) => {
+  const s = state.layers[layerId];
+  return s && s.request ? { seq: s.seq, ...s.request } : null;
+};
+// The stretched buffers currently cached by render key, and whether a key's render is in flight.
+// One layer's current parameters map to exactly one kept buffer; replaced or cleared keys are
+// released (see releaseRenderKey), so the map does not grow with the number of re-picks.
+export const renderCache = () => ({
+  keys: () => [...renders.keys()],
+  has: (key) => renders.has(key),
+  buffered: (key) => !!renders.get(key)?.buf,
+  size: renders.size,
+});
+// The worker pool's state: how many workers exist, how many jobs are running or queued, and how
+// many of those are bound to a (possibly expired) submission. Lets tests prove in-flight jobs are
+// cancelled rather than quietly completed.
+export const poolState = () => ({
+  workers: pool.length,
+  running: pool.filter((slot) => slot.job).length,
+  queued: jobQueue.length,
+  boundRunning: pool.filter((slot) => slot.job && slot.job.layerId !== null && slot.job.layerId !== undefined).length,
+  staleRunning: pool.filter((slot) => slot.job && jobStale(slot.job)).length,
+});
 
 export function randomize() {
   ensureCtx();
