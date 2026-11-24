@@ -121,6 +121,19 @@ bun run mod check my-story                          # also dry-runs the specs; m
 
 Use ids of 1000 or more (the game uses up to 999). The compiler refuses an id the game already uses.
 
+Builds are **per-spec isolated**: each `maps/*.spec.json` compiles on its own, so one broken spec is reported and skipped
+without stopping the others. Successful specs are written and a failed spec's map/data/dialogue files (including stale
+output from an earlier good build) are removed. The `MapInfos.json` patch is generated once from the successful **new**
+maps only — self-base edits (`"base": <same id>`) are compiled but never registered — so skipping a spec leaves no
+duplicate id or stale registration. Two specs that declare the same custom tileset name with different PNG sizes are a
+conflict: the later, mismatching spec fails while the first and unrelated specs build normally.
+
+Programmatic callers get the per-spec detail from `buildMaps` (`Built.results`, also aliased as `Built.specs`: each
+entry has `id`, `ok`/`success`, `errors`, `warnings`, `files`, `outputs`). On the Bun side,
+`buildModReport(modDir, { source? })` returns `{ ok, results:[{ file, id, ok, errors, warnings, written, removed }],
+files, removed, ... }` and accepts a fake `GameSource`, so the whole flow is testable without an install;
+`buildMod(modDir, quietOrOptions?, source?)` stays a boolean CLI wrapper and prints the same report.
+
 `maps/1001.spec.json`:
 
 ```json

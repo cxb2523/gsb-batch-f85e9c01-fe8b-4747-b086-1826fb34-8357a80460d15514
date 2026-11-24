@@ -1,9 +1,9 @@
 // Bun side of the map kit: a GameSource that reads the player's install directly, and the `mod map ...` commands.
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve, sep } from 'node:path';
 import { GAME_DIR, ROOT, WWW, readGameKey } from '../gamedir.ts';
 import { ModEngine } from './engine.ts';
-import { buildMaps, previewMap, type GameSource, type MapSpec } from './mapkit.ts';
+import { buildMaps, previewMap, type Built, type GameSource, type MapSpec } from './mapkit.ts';
 import { scanStory, storyReport, type ScanSource, type StoryIndex } from './storyscan.ts';
 
 const dec = new TextDecoder();
@@ -53,24 +53,180 @@ export function loadSpecs(modDir: string): { file: string; spec: MapSpec }[] {
     return readdirSync(dir).filter(f => /\.spec\.json$/.test(f)).sort().map(f => ({ file: f, spec: JSON.parse(readFileSync(join(dir, f), 'utf8')) as MapSpec }));
 }
 
-/** Compile every maps/*.spec.json in a mod. Returns false if anything was wrong (nothing is written then). */
-export function buildMod(modArg: string, quiet = false): boolean {
-    const modDir = modDirOf(modArg);
-    if (!existsSync(join(modDir, 'mod.json'))) { console.error(`${modDir} has no mod.json`); return false; }
-    const id = JSON.parse(readFileSync(join(modDir, 'mod.json'), 'utf8')).id as string;
-    const specs = loadSpecs(modDir);
-    if (!specs.length) { if (!quiet) console.log(`no maps/*.spec.json in ${modDir}`); return true; }
-    const built = buildMaps(id, specs.map(s => s.spec), gameSource(modDir));
-    for (const w of built.warnings) console.log(`! ${w}`);
-    for (const e of built.errors) console.log(`✗ ${e}`);
-    if (built.errors.length) { console.log(`nothing written: ${built.errors.length} error(s)`); return false; }
-    for (const [rel, text] of Object.entries(built.files)) {
-        mkdirSync(dirname(join(modDir, rel)), { recursive: true });
-        writeFileSync(join(modDir, rel), text);
-    }
-    console.log(`✓ built ${specs.map(x => x.spec.id).join(', ')} (${Object.keys(built.files).length} files)`);
-    return true;
+export interface LoadedSpecFile { file: string; spec: MapSpec | null; error: string | null }
+
+/** Like loadSpecs, but a spec file that is not valid JSON becomes a failed entry instead of aborting the batch. */
+export function loadSpecFiles(modDir: string): LoadedSpecFile[] {
+    const dir = join(modDir, 'maps');
+    if (!existsSync(dir)) return [];
+    return readdirSync(dir).filter(f => /\.spec\.json$/.test(f)).sort().map(file => {
+        try { return { file, spec: JSON.parse(readFileSync(join(dir, file), 'utf8')) as MapSpec, error: null }; }
+        catch (e) { return { file, spec: null, error: (e as Error).message }; }
+    });
 }
+
+/** Per-spec disk outcome, returned by buildModReport for the CLI (or tests) to print. */
+export interface ModSpecReport {
+    file: string | null;
+    id: number | null;
+    ok: boolean;
+    success: boolean;
+    editing: boolean;
+    errors: string[];
+    warnings: string[];
+    /** Mod-relative files written for this successful spec. */
+    written: string[];
+    /** Stale/partial files of this failed spec deleted from disk. */
+    removed: string[];
+}
+
+export interface BuildModOptions {
+    /** Compile against a caller-supplied source (tests use a fake GameSource, no game install needed). */
+    source?: GameSource;
+    quiet?: boolean;
+}
+
+export interface BuildModReport {
+    modDir: string;
+    modId: string | null;
+    /** True only when every spec compiled and the batch wrote without a global failure. */
+    ok: boolean;
+    results: ModSpecReport[];
+    /** All mod-relative files written this run (successful spec files + unified MapInfos patch). */
+    files: string[];
+    /** Stale generated files removed while isolating failed specs / clearing an obsolete MapInfos patch. */
+    removed: string[];
+    errors: string[];
+    warnings: string[];
+    built: Built | null;
+    /** Set when the run could not even start (missing mod.json / unreadable mod id / source failure). */
+    fatal?: string;
+}
+
+export const MAPINFOS_PATCH_REL = 'patches/data/MapInfos.json.patch.json';
+
+/** Delete mod-relative `rel` only when it resolves inside `modDir`; returns true when a file was removed. */
+function safeUnlink(modDir: string, rel: string): boolean {
+    const root = resolve(modDir);
+    const abs = resolve(root, rel);
+    if (abs !== root && !abs.startsWith(root + sep)) return false;
+    try { if (existsSync(abs)) { unlinkSync(abs); return true; } } catch { /* best-effort cleanup; never mask the compile error */ }
+    return false;
+}
+
+/**
+ * Compile every maps/*.spec.json independently: successful specs are written, failed specs are skipped and any
+ * partial/stale output of theirs is removed. The MapInfos patch is generated once from the successful new maps.
+ * Never throws for a per-spec problem; global startup/source problems come back as `fatal`.
+ */
+export function buildModReport(modArg: string, options: BuildModOptions = {}): BuildModReport {
+    const modDir = modDirOf(modArg);
+    const base: BuildModReport = { modDir, modId: null, ok: false, results: [], files: [], removed: [], errors: [], warnings: [], built: null };
+    if (!existsSync(join(modDir, 'mod.json'))) return { ...base, errors: [`${modDir} has no mod.json`], fatal: 'no-mod-json' };
+
+    let modId: string;
+    try { modId = JSON.parse(readFileSync(join(modDir, 'mod.json'), 'utf8')).id as string; }
+    catch (e) { return { ...base, errors: [`mod.json is not valid JSON: ${(e as Error).message}`], fatal: 'bad-mod-json' }; }
+
+    const loaded = loadSpecFiles(modDir);
+    if (!loaded.length) return { ...base, modId, ok: true };
+
+    const valid = loaded.filter((l): l is { file: string; spec: MapSpec; error: null } => l.spec !== null);
+    const source = options.source ?? gameSource(modDir);
+
+    let built: Built;
+    try { built = buildMaps(modId, valid.map(v => v.spec), source); }
+    catch (e) {
+        const msg = (e as Error).message;
+        return { ...base, modId, errors: [msg], fatal: msg };
+    }
+
+    // Write exactly the aggregated files of the successful specs plus the unified MapInfos patch.
+    for (const [rel, text] of Object.entries(built.files)) {
+        const abs = join(modDir, rel);
+        mkdirSync(dirname(abs), { recursive: true });
+        writeFileSync(abs, text);
+        base.files.push(rel);
+    }
+
+    // Align pure results back onto the loaded files (buildMaps only saw the parseable specs, in the same order).
+    const reports: ModSpecReport[] = [];
+    let vi = 0;
+    for (const l of loaded) {
+        if (!l.spec) {
+            reports.push({ file: l.file, id: null, ok: false, success: false, editing: false, errors: [`invalid spec JSON: ${l.error ?? 'parse error'}`], warnings: [], written: [], removed: [] });
+            continue;
+        }
+        const r = built.results[vi++]!;
+        const rep: ModSpecReport = {
+            file: l.file, id: r.id, ok: r.ok, success: r.ok, editing: r.editing,
+            errors: r.errors, warnings: r.warnings,
+            written: r.ok ? r.files.filter(rel => rel in built.files) : [],
+            removed: [],
+        };
+        if (!r.ok) {
+            // Remove this failed spec's partial output unless the same path is produced by a successful spec
+            // (e.g. a duplicate id whose first spec succeeded, or a shared tileset a success also writes).
+            for (const rel of r.outputs) {
+                if (rel in built.files) continue;
+                if (safeUnlink(modDir, rel)) { rep.removed.push(rel); base.removed.push(rel); }
+            }
+        }
+        reports.push(rep);
+    }
+
+    // Reconcile the global MapInfos patch with the successful new maps: no successful registrations means no stale patch.
+    if (!(MAPINFOS_PATCH_REL in built.files) && safeUnlink(modDir, MAPINFOS_PATCH_REL)) {
+        base.removed.push(MAPINFOS_PATCH_REL);
+    }
+
+    const ok = reports.every(r => r.ok);
+    const labelOf = (r: ModSpecReport) => r.file ?? (r.id !== null ? `map ${r.id}` : 'spec');
+    return {
+        ...base, modId, ok, results: reports, built,
+        errors: reports.flatMap(r => r.errors.map(m => `${labelOf(r)}: ${m}`)),
+        warnings: reports.flatMap(r => r.warnings.map(m => `${labelOf(r)}: ${m}`)),
+    };
+}
+
+/** Human-readable per-spec build output for the CLI. */
+export function printBuildReport(r: BuildModReport, quiet = false) {
+    if (quiet) return;
+    if (r.fatal === 'no-mod-json') { console.error(`✗ ${r.errors[0]}`); return; }
+    if (r.fatal) { console.error(`✗ map build could not start: ${r.fatal}`); return; }
+    if (!r.results.length) { console.log(`no maps/*.spec.json in ${r.modDir}`); return; }
+    for (const s of r.results) {
+        const label = `${s.file ?? '(inline spec)'}${s.id !== null ? ` (map ${s.id})` : ''}`;
+        if (s.ok) console.log(`✓ ${label}: ${s.written.length} file(s)${s.editing ? ' [edit, no MapInfos registration]' : ''}`);
+        else console.log(`✗ ${label}: skipped with ${s.errors.length} error(s)`);
+        for (const w of s.warnings) console.log(`  ! ${w}`);
+        for (const e of s.errors) console.log(`  ✗ ${e}`);
+        for (const rel of s.removed) console.log(`  - removed stale ${rel}`);
+    }
+    const failed = r.results.filter(s => !s.ok).length;
+    const okN = r.results.length - failed;
+    const registered = r.built?.infos.map(i => i.id).join(', ');
+    if (failed) console.log(`partially built: ${okN} spec(s) written, ${failed} skipped; MapInfos ids: ${registered || 'none'}`);
+    else console.log(`✓ built ${r.results.map(s => s.id).filter((x): x is number => x !== null).join(', ')} (${r.files.length} files)${registered ? `; MapInfos: ${registered}` : ''}`);
+}
+
+/**
+ * Compile every maps/*.spec.json in a mod, writing successful specs only.
+ * Returns false if any spec failed or the build could not start (successful files are still written).
+ * Second arg is the legacy `quiet` boolean or a BuildModOptions bag (tests may inject a GameSource).
+ */
+export function buildMod(modArg: string, quiet: boolean | BuildModOptions = false, maybeSource?: GameSource): boolean {
+    const opts: BuildModOptions = typeof quiet === 'object' && quiet !== null
+        ? quiet
+        : { quiet: Boolean(quiet), ...(maybeSource ? { source: maybeSource } : {}) };
+    const q = opts.quiet ?? false;
+    const report = buildModReport(modArg, opts);
+    printBuildReport(report, q);
+    return report.ok;
+}
+
+/** Alias of buildModReport for callers that look for an explicitly "detailed" build entry point. */
+export const buildModDetailed = buildModReport;
 
 function show(args: string[]) {
     const src = gameSource();

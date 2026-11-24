@@ -62,7 +62,53 @@ export interface MapSpec {
     events?: EventSpec[];
 }
 
-export interface Built { files: Record<string, string>; infos: { id: number; name: string }[]; errors: string[]; warnings: string[] }
+export interface MapInfoEntry { id: number; name: string }
+
+/** Outcome of compiling one spec, independently of every other spec. */
+export interface SpecResult {
+    /** Position of the spec in the input array. */
+    index: number;
+    /** The original spec object. */
+    spec: MapSpec;
+    /** maps/<file>.spec.json name when the caller supplied it (node layer fills this in). */
+    file?: string;
+    /** Declared id, or null when the spec does not carry a valid positive-integer id. */
+    id: number | null;
+    /** True when the spec compiled without errors and its files were committed to Built.files. */
+    ok: boolean;
+    /** Alias of `ok` for callers that phrase the state as success/failure. */
+    success: boolean;
+    /** True for a spec that edits an existing game map ("base" points at its own id). */
+    editing: boolean;
+    /** Un-prefixed error messages for this spec (the flat Built.errors versions are tagged "map <id>:"). */
+    errors: string[];
+    warnings: string[];
+    /** Relative output paths this spec owns (map/data/dialogue + its custom tileset JSONs), once its id is valid.
+     *  Used by the disk layer to delete stale/partial files of a failed spec. */
+    outputs: string[];
+    /** Relative paths actually committed to Built.files for a successful spec; empty for a failed one. */
+    files: string[];
+    /** MapInfos registration contributed by this spec (only successful, non-editing new maps). */
+    info: MapInfoEntry | null;
+}
+
+export interface Built {
+    /** Files of every SUCCESSFUL spec plus the unified MapInfos patch. Failed specs contribute nothing. */
+    files: Record<string, string>;
+    /** MapInfos entries of successful NEW maps (edits are excluded). */
+    infos: MapInfoEntry[];
+    /** All specs' errors, tagged with "map <id>: ", in spec order. */
+    errors: string[];
+    warnings: string[];
+    /** Per-spec success/failure detail, in input order. */
+    results: SpecResult[];
+    /** Alias of `results`. */
+    specs: SpecResult[];
+    /** Alias of `results`. */
+    specResults: SpecResult[];
+    /** True only when every spec compiled. */
+    ok: boolean;
+}
 
 const DIRS = [2, 4, 6, 8];
 const TRIGGERS = { action: 0, touch: 1, 'event-touch': 2, auto: 3, parallel: 4 } as const;
@@ -264,49 +310,90 @@ function paint(dst: any, p: PaintSpec, src: GameSource, fail: (m: string) => voi
     } else fail('paint: give either "tile" (+ rect/at) or "tiles" (a grid of local tile ids, null = leave empty)');
 }
 
+/** Relative files a spec with a valid id can generate. The dialogue path is only written when it has lines. */
+export function specOutputPaths(modId: string, id: number, tilesetNames: string[] = []): string[] {
+    return [
+        `files/maps/map${id}.json`,
+        `files/data/Map${String(id).padStart(3, '0')}.json`,
+        `files/languages/en/${modId}_map${id}.yml`,
+        ...tilesetNames.map(n => `files/maps/${n}.json`),
+    ];
+}
+
+const positiveId = (s: MapSpec): number | null => (Number.isInteger(s?.id) && (s.id as number) >= 1 ? (s.id as number) : null);
+
+interface CompileOutcome extends SpecResult { staged: Record<string, string> }
+
 export function buildMaps(modId: string, specs: MapSpec[], src0: GameSource): Built {
     const errors: string[] = [], warnings: string[] = [];
     const files: Record<string, string> = {};
-    const infos: { id: number; name: string }[] = [];
+    const infos: MapInfoEntry[] = [];
+    const results: SpecResult[] = [];
     const game = src0.mapInfos();
-    const mapIds = new Set<number>(game.filter(Boolean).map((i: any) => i.id));
-    for (const s of specs) mapIds.add(s.id);
+    const gameList: any[] = Array.isArray(game) ? game : [];
+    const mapIds = new Set<number>(gameList.filter(Boolean).map((i: any) => i.id as number));
+    for (const s of specs) if (positiveId(s) !== null) mapIds.add(s.id);
     const sys = src0.systemCounts();
     const seen = new Set<number>();
 
-    // Tilesets the mod defines itself are visible to stamp/paint like the game's own.
+    // Custom tilesets shared by every spec of the mod. The first valid declaration of a name fixes its PNG size;
+    // a later declaration with a different size is a conflict that fails only that later spec.
     const custom = new Map<string, any>();
     const src: GameSource = { ...src0, tileset: s => custom.get(s) ?? src0.tileset(s) };
 
-    for (const spec of specs) {
-        const tag = `map ${spec.id}`;
-        const err = (m: string) => errors.push(`${tag}: ${m}`), warn = (m: string) => warnings.push(`${tag}: ${m}`);
-        const before = errors.length;
+    function compileOne(index: number, spec: MapSpec): CompileOutcome {
+        const se: string[] = [], sw: string[] = [];
+        const err = (m: string) => se.push(m), warn = (m: string) => sw.push(m);
+        const staged: Record<string, string> = {};
+        const tilesetNames: string[] = [];
+        let editing = false;
+        let info: MapInfoEntry | null = null;
+
+        const finish = (ok: boolean, committed: string[] = []): CompileOutcome => {
+            const id = positiveId(spec);
+            return {
+                index, spec, id, ok, success: ok, editing,
+                errors: se, warnings: sw,
+                outputs: id === null ? tilesetNames.map(n => `files/maps/${n}.json`) : specOutputPaths(modId, id, tilesetNames),
+                files: ok ? committed : [],
+                info: ok ? info : null,
+                staged: ok ? staged : {},
+            };
+        };
+
         validateSpec(spec, err);
-        if (errors.length > before) continue;
-        if (seen.has(spec.id)) { err('duplicate id in this mod'); continue; }
+        if (se.length) return finish(false);
+        if (seen.has(spec.id)) { err('duplicate id in this mod'); return finish(false); }
         seen.add(spec.id);
-        const existing = game[spec.id];
-        const editing = spec.base !== undefined && spec.base === spec.id;
-        if (existing && !editing) { err(`id ${spec.id} is already used by the game ("${existing.name}"); pick a free id (${Math.max(1000, game.length)}+ is safe), or set "base": ${spec.id} to edit that map`); continue; }
-        if (editing && !existing) { err(`"base": ${spec.id} but the game has no map ${spec.id}`); continue; }
+        const existing = gameList[spec.id];
+        editing = spec.base !== undefined && spec.base === spec.id;
+        if (existing && !editing) { err(`id ${spec.id} is already used by the game ("${existing.name}"); pick a free id (${Math.max(1000, gameList.length)}+ is safe), or set "base": ${spec.id} to edit that map`); return finish(false); }
+        if (editing && !existing) { err(`"base": ${spec.id} but the game has no map ${spec.id}`); return finish(false); }
         if (editing) warn(`replaces the game's map ${spec.id} ("${existing.name}") as a whole file; another mod that also replaces it will conflict`);
 
-        // custom tilesets declared by this spec
+        // custom tilesets declared by this spec, reconciled against the shared batch state
         let bad = false;
         for (const t of spec.tilesets ?? []) {
+            tilesetNames.push(t.name);
             const dims = src0.pngSize?.(`img/tilesets/${t.name}.png`);
             if (!dims) { err(`tileset "${t.name}": put the image at files/img/tilesets/${t.name}.png in this mod`); bad = true; continue; }
             if (dims[0] < 32 || dims[1] < 32) { err(`tileset "${t.name}": image is ${dims[0]}x${dims[1]}; tiles are 32x32`); bad = true; continue; }
             const def = tilesetJson(t.name, dims[0], dims[1]);
-            custom.set(`${t.name}.json`, def);
-            files[`files/maps/${t.name}.json`] = JSON.stringify(def);
+            const key = `${t.name}.json`;
+            const prev = custom.get(key);
+            if (prev && (prev.imagewidth !== def.imagewidth || prev.imageheight !== def.imageheight)) {
+                err(`tileset "${t.name}" is shared with another spec but the PNG sizes disagree: already ${prev.imagewidth}x${prev.imageheight}, this spec sees ${def.imagewidth}x${def.imageheight}. Use one identical PNG for the shared name or rename one tileset`);
+                bad = true;
+                continue;
+            }
+            if (!prev) custom.set(key, def);
+            staged[`files/maps/${t.name}.json`] = JSON.stringify(def);
         }
-        if (bad) continue;
+        if (bad) return finish(false);
 
         const from = spec.base ?? spec.tilesFrom ?? 13;
         let base: any, baseData: any;
-        try { base = src.tiledMap(from); baseData = src.mapData(from); } catch (e) { err(`${spec.base !== undefined ? 'base' : 'tilesFrom'} ${from}: ${(e as Error).message}`); continue; }
+        try { base = src.tiledMap(from); baseData = src.mapData(from); } catch (e) { err(`${spec.base !== undefined ? 'base' : 'tilesFrom'} ${from}: ${(e as Error).message}`); return finish(false); }
         const tiled = spec.base !== undefined ? clone(base) : newTiledMap(base, spec.size![0], spec.size![1]);
         if (spec.base !== undefined && spec.size && (spec.size[0] !== tiled.width || spec.size[1] !== tiled.height)) warn(`size ${spec.size} ignored: a "base" map keeps its own size (${tiled.width}x${tiled.height})`);
         const w = tiled.width as number, h = tiled.height as number;
@@ -333,17 +420,44 @@ export function buildMaps(modId: string, specs: MapSpec[], src0: GameSource): Bu
         else { if (spec.name) data.displayName = spec.name; if (spec.note !== undefined) data.note = spec.note; }
         if (spec.bgm) { data.bgm = audio(spec.bgm); data.autoplayBgm = true; }
 
-        files[`files/maps/map${spec.id}.json`] = JSON.stringify(tiled);
-        files[`files/data/Map${String(spec.id).padStart(3, '0')}.json`] = JSON.stringify(data);
-        if (ctx.messages.length) files[`files/languages/en/${file}.yml`] = ctx.messages.map((t, i) => `message_${i}:\n  text: ${yamlStr(t)}\n`).join('\n');
-        if (!editing) infos.push({ id: spec.id, name: spec.name! });
+        staged[`files/maps/map${spec.id}.json`] = JSON.stringify(tiled);
+        staged[`files/data/Map${String(spec.id).padStart(3, '0')}.json`] = JSON.stringify(data);
+        if (ctx.messages.length) staged[`files/languages/en/${file}.yml`] = ctx.messages.map((t, i) => `message_${i}:\n  text: ${yamlStr(t)}\n`).join('\n');
+        if (!editing) info = { id: spec.id, name: spec.name! };
+
+        // Completeness: every shared custom tileset this map references must ship its generated JSON, even when this
+        // spec only painted/stamped it and another spec was the one that declared the PNG.
+        for (const ts of tiled.tilesets as any[]) {
+            const sourceName = ts?.source as string | undefined;
+            const def = sourceName ? custom.get(sourceName) : undefined;
+            const rel = sourceName ? `files/maps/${sourceName}` : undefined;
+            if (def && rel && !staged[rel]) staged[rel] = JSON.stringify(def);
+        }
+
+        // Isolation: any error collected while painting/compiling discards this spec's staged files.
+        if (se.length) return finish(false);
+        return finish(true, Object.keys(staged));
     }
+
+    specs.forEach((spec, index) => {
+        const o = compileOne(index, spec);
+        for (const m of o.errors) errors.push(`map ${spec?.id}: ${m}`);
+        for (const m of o.warnings) warnings.push(`map ${spec?.id}: ${m}`);
+        const { staged, ...pub } = o;
+        results.push(pub);
+        if (o.ok) {
+            for (const [k, v] of Object.entries(o.staged)) files[k] = v;
+            if (o.info) infos.push(o.info);
+        }
+    });
 
     if (infos.length) {
         // MapInfos is an array indexed by id: ids inside the array are tested for "empty", ids past the end are appended in order.
+        // Generated once from the successful new maps only, so a skipped spec never registers and ids stay unique/ordered.
         const ops: unknown[] = [];
-        let len = game.length;
-        for (const i of [...infos].sort((a, b) => a.id - b.id)) {
+        let len = gameList.length;
+        const unique = [...new Map(infos.map(i => [i.id, i])).values()].sort((a, b) => a.id - b.id);
+        for (const i of unique) {
             const value = { id: i.id, expanded: false, name: i.name, order: i.id, parentId: 0, scrollX: 0, scrollY: 0, type: 'Name', line: '-' };
             if (i.id < len) ops.push({ op: 'test', path: `/${i.id}`, value: null }, { op: 'replace', path: `/${i.id}`, value });
             else {
@@ -353,7 +467,7 @@ export function buildMaps(modId: string, specs: MapSpec[], src0: GameSource): Bu
         }
         files['patches/data/MapInfos.json.patch.json'] = JSON.stringify(ops, null, 2);
     }
-    return { files, infos, errors, warnings };
+    return { files, infos, errors, warnings, results, specs: results, specResults: results, ok: results.every(r => r.ok) };
 }
 
 // ------------------------------------------------------------------ preview
