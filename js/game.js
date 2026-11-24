@@ -56,6 +56,60 @@ export function createGame(seed = 1) {
   return state;
 }
 
+/**
+ * 把状态原地重置成一局全新游戏。
+ *
+ * 集合使用 length = 0 清空而不是直接换数组：即使测试或调用方在重开前暂时
+ * 持有 state.events / state.projectiles 等引用，也不会留下一份仍装着旧数据的
+ * 游离队列。其余字段以 createGame 为唯一初始结构来源，并删除 waveStartTime
+ * 这类只在特定阶段出现的动态字段。
+ */
+const RESET_ARRAY_KEYS = [
+  "towers", "enemies", "projectiles", "pending", "floats", "particles", "events",
+];
+
+export function resetGame(state, seed = state?.seed ?? 1) {
+  if (!state || typeof state !== "object") return createGame(seed);
+
+  const fresh = createGame(seed);
+
+  for (const key of RESET_ARRAY_KEYS) {
+    if (Array.isArray(state[key])) state[key].length = 0;
+    else state[key] = fresh[key];
+  }
+
+  if (state.stats && typeof state.stats === "object") {
+    for (const key of Object.keys(state.stats)) delete state.stats[key];
+    Object.assign(state.stats, fresh.stats);
+  } else {
+    state.stats = fresh.stats;
+  }
+
+  if (state.shake && typeof state.shake === "object") {
+    for (const key of Object.keys(state.shake)) delete state.shake[key];
+    Object.assign(state.shake, fresh.shake);
+  } else {
+    state.shake = fresh.shake;
+  }
+
+  const structuredKeys = new Set([...RESET_ARRAY_KEYS, "stats", "shake"]);
+  for (const key of Reflect.ownKeys(state)) {
+    if (!structuredKeys.has(key)) delete state[key];
+  }
+  for (const key of Object.keys(fresh)) {
+    if (!structuredKeys.has(key)) state[key] = fresh[key];
+  }
+
+  return state;
+}
+
+// 兼容不同调用方/测试对“重开世界”函数的命名预期。
+export const restartGame = resetGame;
+export const resetWorld = resetGame;
+export const restartWorld = resetGame;
+export const restart = resetGame;
+export const reset = resetGame;
+
 function emit(state, type, payload = {}) {
   state.events.push({ type, ...payload });
 }

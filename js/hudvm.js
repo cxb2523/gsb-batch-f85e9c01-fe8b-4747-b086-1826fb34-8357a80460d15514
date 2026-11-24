@@ -52,6 +52,21 @@ export function hudViewModel(state, cfg) {
 }
 
 /**
+ * 清空 HUD 差量缓存。
+ *
+ * 重开后必须调用：缓存记录的是“当前 DOM 上一次写成了什么”。虽然多数数值
+ * 变化会自然失效，但显式清空能保证下一帧把所有字段和塔卡状态按全新对局重写，
+ * 不依赖新旧对局数值是否恰好不同。
+ */
+export function resetHudCache(prev) {
+  if (!prev || typeof prev !== "object") return {};
+  for (const key of Object.keys(prev)) delete prev[key];
+  return prev;
+}
+
+export const clearHudCache = resetHudCache;
+
+/**
  * 差量应用：只有值真的变了才调用对应的写入器。
  * @param {object} vm 本次视图模型
  * @param {object} prev 上次的扁平值缓存（会被原地更新）

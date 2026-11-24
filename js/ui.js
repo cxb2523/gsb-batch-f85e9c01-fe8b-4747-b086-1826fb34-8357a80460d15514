@@ -7,11 +7,11 @@ import {
 } from "./data.js";
 import {
   createGame, update, placeTower, upgradeTower, sellTower, startWave, togglePause,
-  cycleSpeed, upgradeCostOf, towerAt, snapshot, PHASE,
+  cycleSpeed, upgradeCostOf, towerAt, snapshot, resetGame, PHASE,
 } from "./game.js";
 import { statsAt, investedOf } from "./rules.js";
 import { buildBackground, drawScene, drawBody } from "./render.js";
-import { hudViewModel, applyHudViewModel } from "./hudvm.js";
+import { hudViewModel, applyHudViewModel, resetHudCache } from "./hudvm.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -124,6 +124,7 @@ function mount() {
     selectType,
     get selectedType() { return selectedType; },
     get selectedTowerId() { return selectedTowerId; },
+    get hover() { return hover ? { ...hover } : null; },
     setSelectedTower: (id) => { selectedTowerId = id; syncInspect(); },
     refresh: renderHud,
     get muted() { return Sfx.muted; },
@@ -457,13 +458,31 @@ function toast(msg) {
   toastTimer = setTimeout(() => el.classList.remove("show"), 1600);
 }
 
+function clearToast() {
+  clearTimeout(toastTimer);
+  toastTimer = 0;
+  const el = $("toast");
+  el.classList.remove("show");
+  el.textContent = "";
+}
+
 function restart() {
-  const seed = Date.now() & 0xffff;
-  state = createGame(seed);
-  inspectKey = null;
-  overlayKey = null;
+  // 逻辑层原地完整重置：投射物、怪物、待生成队列、飘字、粒子、未交付事件、
+  // 震屏和萝卜抖动都不会留在新世界里。
+  resetGame(state, Date.now() & 0xffff);
+
+  // UI 的临时交互状态与差量/面板缓存也必须一起复位，否则下一帧可能沿用旧
+  // 对局的选中态，或因为缓存键命中而跳过本应按初始状态执行的 DOM 写入。
+  hover = null;
+  hoverOk = false;
   selectedTowerId = null;
   selectedType = null;
+  hudAcc = 0;
+  resetHudCache(hudPrev);
+  inspectKey = null;
+  overlayKey = null;
+  clearToast();
+
   syncShop();
   $("overlay").hidden = true;
   renderHud();

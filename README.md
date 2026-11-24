@@ -50,7 +50,7 @@ python -m http.server 8080
 ## 测试
 
 ```bash
-npm test          # 44 个用例：node --test tests/rules.test.js tests/state.test.js
+npm test          # 52 个用例：node --test tests/rules.test.js tests/state.test.js tests/restart.test.js tests/ui-restart.test.js
 npm run sim       # 无头难度断言（三种打法必须落在固定区间）
 npm run e2e       # 浏览器端到端（需要先起浏览器，见下）
 ```

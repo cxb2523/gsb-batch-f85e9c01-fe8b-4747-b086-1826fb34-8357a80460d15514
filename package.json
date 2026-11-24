@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test tests/rules.test.js tests/state.test.js",
+    "test": "node --test tests/rules.test.js tests/state.test.js tests/restart.test.js tests/ui-restart.test.js",
     "sim": "node scripts/sim.js",
     "e2e": "node scripts/e2e.js",
     "benchmark": "node tools/benchmark.mjs",
