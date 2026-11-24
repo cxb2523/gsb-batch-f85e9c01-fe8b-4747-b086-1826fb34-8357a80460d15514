@@ -593,6 +593,7 @@ class Ditty {
     }
 
     setVars(vars) {
+        if (!Array.isArray(vars)) return;
         vars.forEach(kv => {
             input[kv.key] = parseFloat(kv.value);
         });
@@ -1230,7 +1231,7 @@ class Audiobus {
 
         this.useMasterVolume = useMasterVolume;
 
-        data.in.forEach(worker => {
+        (data.in || []).forEach(worker => {
             const workerData = {
                 buffers: [],
                 activeBuffer: undefined,
@@ -1295,6 +1296,19 @@ class Audiobus {
     }
 
     reset() {
+        // Detach handlers from the previous run's input ports so late messages
+        // can't keep pushing buffers into an AudioBus that is being discarded.
+        if (this.input) {
+            this.input.forEach(input => {
+                if (input.port) {
+                    try {
+                        input.port.onmessage = null;
+                    } catch (e) {
+                    }
+                }
+            });
+        }
+
         this.started = false;
         this.input = new Map();
         this.counter = 0;
@@ -1369,6 +1383,7 @@ class Audiobus {
     }
 
     setAmp(data) {
+        if (!data) return;
         if (data.loops) {
             data.loops.forEach(volData => {
                 const loop = this.input.get(volData.name);
@@ -1397,22 +1412,65 @@ class DittyWorker extends Ditty {
         this.postMessage({type: MSG_INIT, success: true, structure: ditty.structure});
     }
 
+    /**
+     * Clears all per-playback state so nothing from a previous ditty can leak
+     * into the next one: queued buffers, the AudioBus (input ports and their
+     * volume ramps), the transport counters and the input parameters.
+     */
+    resetPlaybackState() {
+        this._index = 0;
+        this._buffers = [];
+        this.time = 0;
+        this.tick = 0;
+
+        if (this._audioBus) {
+            this._audioBus.reset();
+            this._audioBus = undefined;
+        }
+
+        // Drop any handler still attached to the previous message channel so
+        // late messages from a released playback run can't queue buffers.
+        if (this._port) {
+            try {
+                this._port.onmessage = null;
+            } catch (e) {
+            }
+        }
+        this._port = undefined;
+        this._node = undefined;
+        this._nodeType = undefined;
+
+        // Stale input parameters must not carry over to the next ditty; MSG_INIT
+        // re-applies the current values right after resetting.
+        Object.keys(input).forEach(key => delete input[key]);
+
+        debug.reset();
+    }
+
     onmessage(data) {
         switch (data.type) {
+            case MSG_RESET:
+                this.resetPlaybackState();
+                break;
             case MSG_INIT:
-                this._node = undefined;
-                this._index = 0;
+                // A fresh MSG_INIT may target the same worker for a new ditty,
+                // so reset everything from scratch before wiring it up. Note:
+                // resetPlaybackState() deliberately keeps this.loops/filters,
+                // since the compiled code has already re-registered them.
+                this.resetPlaybackState();
+
                 this._port = data.port;
-                this._buffers = [];
                 this._nodeType = data.nodeType;
-                this._audioBus = data.in.length > 0 ? new Audiobus().initInput(data, () => this.fillBuffers()) : undefined;
+                this._audioBus = (data.in && data.in.length > 0) ? new Audiobus().initInput(data, () => this.fillBuffers()) : undefined;
 
                 if (data.nodeType === NODE_TYPE_LOOP) {
                     this._node = this.loops[data.name];
                 } else if (data.nodeType === NODE_TYPE_FILTER) {
                     this._node = this.filters[data.name];
                 }
-                this._node.init();
+                if (this._node) {
+                    this._node.init();
+                }
 
                 this.setVars(data.vars);
 

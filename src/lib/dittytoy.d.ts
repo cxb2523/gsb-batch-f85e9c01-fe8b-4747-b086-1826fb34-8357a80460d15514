@@ -54,6 +54,8 @@ export class Dittytoy extends EventDispatcher {
 
   onmessage(e: any): this;
 
+  terminateWorkers(): void;
+
   stop(): Promise<void>;
 
   pause(): Promise<void>;

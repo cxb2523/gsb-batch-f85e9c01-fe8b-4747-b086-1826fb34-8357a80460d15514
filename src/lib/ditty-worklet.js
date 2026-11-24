@@ -198,7 +198,7 @@ class Audiobus {
 
         this.useMasterVolume = useMasterVolume;
 
-        data.in.forEach(worker => {
+        (data.in || []).forEach(worker => {
             const workerData = {
                 buffers: [],
                 activeBuffer: undefined,
@@ -263,6 +263,19 @@ class Audiobus {
     }
 
     reset() {
+        // Detach handlers from the previous run's input ports so late messages
+        // can't keep pushing buffers into an AudioBus that is being discarded.
+        if (this.input) {
+            this.input.forEach(input => {
+                if (input.port) {
+                    try {
+                        input.port.onmessage = null;
+                    } catch (e) {
+                    }
+                }
+            });
+        }
+
         this.started = false;
         this.input = new Map();
         this.counter = 0;
@@ -337,6 +350,7 @@ class Audiobus {
     }
 
     setAmp(data) {
+        if (!data) return;
         if (data.loops) {
             data.loops.forEach(volData => {
                 const loop = this.input.get(volData.name);
@@ -369,11 +383,25 @@ class DittyWorklet extends AudioWorkletProcessor {
 
             switch (data.type) {
                 case MSG_RESET:
+                    // Drop any pending output frame and transport counters so
+                    // the render thread emits silence immediately.
                     ditty.reset();
                     this.audiobus.reset();
+                    this.reset();
                     break;
                 case MSG_INIT:
-                    ditty.bpm = data.state.bpm;
+                    // A (re)init always starts a new playback run: clear the
+                    // output frame, counters and previous AudioBus inputs
+                    // before wiring up the new ones.
+                    this.reset();
+                    ditty.reset();
+                    this.audiobus.reset();
+
+                    if (data.state) {
+                        if (typeof data.state.bpm === 'number') {
+                            ditty.bpm = data.state.bpm;
+                        }
+                    }
                     this.audiobus.initInput(data, () => {
                     }, true);
                     this.audiobus.setAmp(data.amp);

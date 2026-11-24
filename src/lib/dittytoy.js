@@ -12,6 +12,31 @@ function getAudioWorkletURL() {
     return workletCodeURL;
 }
 
+/**
+ * Merges a volume update into the remembered volume, keeping the most recent
+ * value per target. Master volume and per-loop volumes are independent.
+ */
+function mergeVolume(prev, update) {
+    const next = {
+        ...(prev || {}),
+    };
+    if (!update || typeof update !== 'object') return next;
+    if (update.master && typeof update.master === 'object') {
+        next.master = {...(prev && prev.master), ...update.master};
+    }
+    if (Array.isArray(update.loops)) {
+        const byName = new Map((prev && Array.isArray(prev.loops) ? prev.loops : [])
+            .filter(l => l && l.name != null)
+            .map(l => [l.name, {...l}]));
+        update.loops.forEach(l => {
+            if (!l || l.name == null) return;
+            byName.set(l.name, {...byName.get(l.name), ...l});
+        });
+        next.loops = [...byName.values()];
+    }
+    return next;
+}
+
 export const LOOP_OPERATOR_SYNTH = 0;
 export const LOOP_OPERATOR_OPTION = 1;
 
@@ -204,9 +229,59 @@ export class Dittytoy extends EventDispatcher {
         this._workerData = [];
         this._volumeWorkers = [];
         this._structure = {};
+        this._code = '';
+
+        this._context = null;
+        this._source = null;
+        this._worklet = null;
+
+        // Volume / input parameters set by the user. Kept here so values set
+        // before play or while stopped survive the next playback run.
+        this._volume = {};
+        this._inputParameters = [];
+
+        // Single source of truth for the playback lifecycle:
+        // 'stopped' | 'playing' | 'paused'
+        this._state = 'stopped';
 
         this.paused = true;
         this.stopped = true;
+
+        // Serializes all public lifecycle calls (compile/play/stop/pause/resume)
+        // so concurrent calls can't create duplicate resources or interleave
+        // state transitions.
+        this._queue = Promise.resolve();
+    }
+
+    /**
+     * Runs `task` after every previously enqueued lifecycle operation has
+     * settled. The queue keeps running even if a previous task rejected.
+     */
+    _enqueue(task) {
+        const result = this._queue.then(task, task);
+        this._queue = result.then(() => undefined, () => undefined);
+        return result;
+    }
+
+    _setState(state) {
+        this._state = state;
+        this.paused = state !== 'playing';
+        this.stopped = state === 'stopped';
+    }
+
+    /**
+     * Combines the caller-supplied input parameters with those remembered from
+     * earlier setInputParameters() calls; explicit values win.
+     */
+    _mergeInputParameters(vars) {
+        const provided = Array.isArray(vars) ? vars : [];
+        if (this._inputParameters.length === 0) return provided;
+
+        const byKey = new Map(this._inputParameters.map(p => [p.key, p]));
+        provided.forEach(kv => {
+            if (kv && kv.key != null) byKey.set(kv.key, kv);
+        });
+        return [...byKey.values()];
     }
 
     postMessage(data, transfer = []) {
@@ -215,25 +290,61 @@ export class Dittytoy extends EventDispatcher {
     }
 
     postMessageToWorklet(data, transfer = []) {
-        if (this._worklet) {
-            this._worklet.port.postMessage(data, transfer);
+        if (this._worklet && this._worklet.port) {
+            try {
+                this._worklet.port.postMessage(data, transfer);
+            } catch (e) {
+                // The worklet may be in a transient state while the audio
+                // graph is being (re)built; never let a status update throw.
+            }
         }
     }
 
     postMessageToWorkers(data, transfer = []) {
-        this._workerData.forEach(worker => worker.worker.postMessage(data, transfer));
+        this._workerData.forEach(workerData => {
+            if (workerData.terminated) return;
+            try {
+                workerData.worker.postMessage(data, transfer);
+            } catch (e) {
+                // Ignore messages to workers that were just released.
+            }
+        });
     }
 
     postMessageToVolumeWorkers(data, transfer = []) {
         this.postMessageToWorklet(data, transfer);
-        this._volumeWorkers.forEach(worker => worker.postMessage(data, transfer));
+        this._volumeWorkers.forEach(worker => {
+            try {
+                worker.postMessage(data, transfer);
+            } catch (e) {
+                // Ignore messages to workers that were just released.
+            }
+        });
     }
 
     setVolume(amp) {
+        if (amp == null) return;
+
+        // Remember the requested volume so a value set while stopped/paused is
+        // applied to the next playback run (workers are released on stop, and
+        // the worklet's AudioBus is reset, so the message alone would be lost).
+        this._volume = mergeVolume(this._volume, amp);
+
         this.postMessageToVolumeWorkers({type: MSG_SET_AMP, amp});
     }
 
     setInputParameters(vars) {
+        if (!Array.isArray(vars)) return;
+
+        // Same as setVolume: keep the values for the next playback run. Values
+        // are merged by key, with the most recent call winning.
+        vars.forEach(kv => {
+            if (!kv || kv.key == null) return;
+            const existing = this._inputParameters.filter(p => p.key !== kv.key);
+            existing.push({key: kv.key, value: kv.value});
+            this._inputParameters = existing;
+        });
+
         this.postMessageToWorkers({type: MSG_SET_VARS, vars});
     }
 
@@ -258,44 +369,129 @@ export class Dittytoy extends EventDispatcher {
     }
 
     async stop() {
-        if (!this.stopped) this.log('[STOP]');
-        this.postMessageToWorklet({type: MSG_RESET});
-        if (this._worklet) {
-            await this._context.suspend();
+        return this._enqueue(() => this._stopInternal());
+    }
+
+    async pause() {
+        return this._enqueue(() => this._pauseInternal());
+    }
+
+    async resume(vars = [], amp = {}, releaseMode = false) {
+        return this._enqueue(() => this._resumeInternal(vars, amp, releaseMode));
+    }
+
+    /**
+     * Stops playback, mutes the audio graph, and releases the Workers that
+     * belong to the current playback run. The AudioContext and worklet node
+     * are kept alive so later plays don't have to recreate them.
+     */
+    async _stopInternal() {
+        if (this._state === 'stopped') {
+            // Already stopped: make sure no stale workers linger, but don't
+            // dispatch an event because nothing actually changed.
+            this._releaseWorkers();
+            return;
         }
-        this.paused = true;
-        this.stopped = true;
+
+        this.log('[STOP]');
+
+        // Silence the worklet first: reset clears its internal buffer, beat
+        // counters and AudioBus state, and suspending guarantees the render
+        // thread has stopped producing audio before we report the stop.
+        this.postMessageToWorklet({type: MSG_RESET});
+        if (this._context && this._context.state === 'running') {
+            try {
+                await this._context.suspend();
+            } catch (e) {
+                this.error(e.message, e);
+            }
+        }
+
+        this._releaseWorkers();
+        this._setState('stopped');
 
         this.dispatch(MSG_STOP);
     }
 
-    async pause() {
-        this.log('[PAUSE]');
-        if (!this.paused) {
-            await this._context.suspend().then(() => {
-                this.paused = true;
-                this.dispatch(MSG_PAUSE);
-            });
+    async _pauseInternal() {
+        if (this._state !== 'playing') {
+            // Pausing a stopped or already paused synth is a no-op; no event.
+            return;
         }
+
+        this.log('[PAUSE]');
+
+        if (this._context && this._context.state === 'running') {
+            try {
+                await this._context.suspend();
+            } catch (e) {
+                this.error(e.message, e);
+            }
+        }
+
+        this._setState('paused');
+        this.dispatch(MSG_PAUSE);
     }
 
-    async resume(vars = [], amp = {}, releaseMode = false) {
-        if (this.stopped) {
-            await this.play(vars, amp, releaseMode);
-        } else if (this.paused) {
-            this.log('[RESUME]');
-            this._context.resume().then(() => {
-                this.paused = false;
-                this.dispatch(MSG_RESUME);
-            });
+    async _resumeInternal(vars = [], amp = {}, releaseMode = false) {
+        if (this._state === 'stopped') {
+            // Resume from a full stop behaves like a fresh play (the original
+            // API semantics); play() will emit MSG_PLAY for the transition.
+            return this._playInternal(vars, amp, releaseMode);
         }
+
+        if (this._state !== 'paused') {
+            // Already playing: nothing to resume, and no state changed.
+            return;
+        }
+
+        this.log('[RESUME]');
+
+        if (this._context) {
+            try {
+                await this._context.resume();
+            } catch (e) {
+                this.error(e.message, e);
+            }
+        }
+
+        this._setState('playing');
+        this.dispatch(MSG_RESUME);
+    }
+
+    _releaseWorkers() {
+        if (this._workerData.length > 0 || this._volumeWorkers.length > 0) {
+            this.log('[TERMINATE WORKERS]');
+        }
+        this._workerData.forEach(workerData => {
+            workerData.terminated = true;
+
+            // Drop our handlers and the channel ports before terminating so no
+            // closure keeps a handle to the released worker or its ports.
+            try {
+                workerData.worker.onmessage = null;
+            } catch (e) {
+            }
+            try {
+                workerData.worker.terminate();
+            } catch (e) {
+                // Worker was already terminated.
+            }
+            try {
+                workerData.channel.port1.close();
+            } catch (e) {
+            }
+            try {
+                workerData.channel.port2.close();
+            } catch (e) {
+            }
+        });
+        this._workerData = [];
+        this._volumeWorkers = [];
     }
 
     terminateWorkers() {
-        if (this._workerData.length > 0) this.log('[TERMINATE WORKERS]');
-        this._workerData.forEach(workerData => workerData.worker.terminate());
-        this._workerData = [];
-        this._volumeWorkers = [];
+        this._releaseWorkers();
     }
 
     setupWorkers(structure, code, vars = {}, amp = {}, releaseMode = true) {
@@ -377,24 +573,42 @@ export class Dittytoy extends EventDispatcher {
     }
 
     async compile(code) {
-        await this.stop();
-        this.terminateWorkers();
+        return this._enqueue(() => this._compileInternal(code));
+    }
+
+    async _compileInternal(code) {
+        await this._stopInternal();
+        this._releaseWorkers();
 
         this.logClear().log('Analyze code...', 0);
 
         return new Promise((resolve, reject) => {
             const worker = new Worker(getWorkerURL(false));
+            let settled = false;
+
+            const finish = (fn, value) => {
+                if (settled) return;
+                settled = true;
+                worker.terminate();
+                fn(value);
+            };
 
             worker.addEventListener('error', (e) => { // error while compiling code
                 this.error(e.message, this.formatErrorCode(e));
                 this.log('Unable to analyze code', 1);
 
-                reject(this.formatErrorCode(e), worker);
-                worker.terminate();
+                finish(reject, this.formatErrorCode(e));
             });
 
             worker.addEventListener('message', (e) => {
                 const structure = e.data.structure;
+
+                if (!structure) {
+                    // Not the analysis result (e.g. a log emitted while the
+                    // code was being evaluated) - just forward the event.
+                    this.onmessage(e);
+                    return;
+                }
 
                 if (Object.values(structure.loops).length <= 0) {
                     // add loop to code
@@ -408,69 +622,172 @@ export class Dittytoy extends EventDispatcher {
 
                 this.onmessage(e);
 
-                resolve(e);
-                worker.terminate();
+                finish(resolve, e);
             });
 
             worker.postMessage({type: MSG_ANALYZE_STRUCTURE, code});
         });
     }
 
-    async play(vars = [], amp = {}, releaseMode = false) {
-        await this.stop();
-        this.log('[PLAY]');
+    /**
+     * Lazily creates the AudioContext / worklet graph. The graph is reused for
+     * the entire lifetime of the Dittytoy instance so repeated play/stop
+     * cycles never create a second AudioContext or AudioWorkletNode.
+     * Returns true when the graph is ready.
+     */
+    async _ensureAudioGraph() {
+        if (this._context && this._worklet) {
+            return true;
+        }
 
-        this.postMessageToWorklet({type: MSG_RESET});
+        const sampleRate = 44100;
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
 
-        if (!this._context) {
-            const sampleRate = 44100;
+        if (!AudioContext) {
+            this.error('Web Audio API is not supported in this browser');
+            return false;
+        }
 
-            const AudioContext = window.AudioContext || window.webkitAudioContext;
-            this._context = new AudioContext({sampleRate: sampleRate});
+        let context = null;
+        try {
+            context = new AudioContext({sampleRate: sampleRate});
 
-            this._source = new AudioBufferSourceNode(this._context);
-            this._source.buffer = this._context.createBuffer(2, sampleRate, sampleRate);
-            this._source.loop = true;
+            const source = context.createBufferSource();
+            source.buffer = context.createBuffer(2, sampleRate, sampleRate);
+            source.loop = true;
 
-            await this._context.audioWorklet.addModule(getAudioWorkletURL());
-            this._worklet = new AudioWorkletNode(this._context, `ditty-worklet`, {
+            await context.audioWorklet.addModule(getAudioWorkletURL());
+
+            const worklet = new AudioWorkletNode(context, `ditty-worklet`, {
                 numberOfInputs: 1,
                 numberOfOutputs: 1,
                 outputChannelCount: [2]
             });
 
-            this._worklet.onerror = (e) => this.error(e.message, e);
+            worklet.onerror = (e) => this.error(e.message, e);
 
-            await this._source.start();
-            this._source.connect(this._worklet).connect(this._context.destination);
+            source.connect(worklet).connect(context.destination);
+            source.start();
 
-            this._worklet.port.onmessage = (e) => {
-                this.onmessage(e);
-            };
+            worklet.port.onmessage = (e) => this.onmessage(e);
+
+            this._context = context;
+            this._source = source;
+            this._worklet = worklet;
 
             this.enableAudioVisualizer(this._context, this._worklet);
+            return true;
+        } catch (e) {
+            // Never leave a half-initialized graph behind - a later play()
+            // must be able to try again from a clean slate.
+            if (this._worklet) {
+                try {
+                    this._worklet.disconnect();
+                } catch (_) {
+                }
+                this._worklet = null;
+            }
+            if (this._source) {
+                try {
+                    this._source.stop();
+                    this._source.disconnect();
+                } catch (_) {
+                }
+                this._source = null;
+            }
+            if (context) {
+                try {
+                    context.close();
+                } catch (_) {
+                }
+            }
+            this._context = null;
+
+            this.error(e && e.message ? e.message : e, e);
+            return false;
+        }
+    }
+
+    async play(vars = [], amp = {}, releaseMode = false) {
+        return this._enqueue(() => this._playInternal(vars, amp, releaseMode));
+    }
+
+    async _playInternal(vars = [], amp = {}, releaseMode = false) {
+        if (!this._code || !this._structure || !Array.isArray(this._structure.loops)) {
+            // Nothing compiled yet: playing would only create orphan workers.
+            return;
         }
 
-        this.setupWorkers(this._structure, this._code, vars, amp, releaseMode);
+        const previousState = this._state;
 
-        const out = this._workerData.filter(workerData => workerData.out.nodeType === NODE_TYPE_OUT);
+        // A play always starts a fresh run: release the workers of a previous
+        // run (if any) and reset the worklet transport before wiring new ones.
+        this._releaseWorkers();
+        this.postMessageToWorklet({type: MSG_RESET});
 
-        this.postMessageToWorklet({
-            type: MSG_INIT, in: out.map(w => ({name: w.name, nodeType: w.nodeType, port: w.channel.port2})
-            ), state: this._structure, vars: vars, amp: amp,
-        }, out.map(w => w.channel.port2));
-
-
-        if (this._context.state === 'suspended') {
-            await this._context.resume().then(() => {
-            }).catch((e) => this.error(e, e));
-        } else {
-
+        if (!await this._ensureAudioGraph()) {
+            // Could not build the audio graph: there is no sound, so make sure
+            // the advertised state matches reality (and report the change if
+            // we were previously playing or paused).
+            if (this._state !== 'stopped') {
+                this._setState('stopped');
+                this.dispatch(MSG_STOP);
+            }
+            return;
         }
 
-        this.paused = false;
-        this.stopped = false;
+        this.log('[PLAY]');
 
-        this.dispatch(MSG_PLAY);
+        const structure = this._structure;
+        const code = this._code;
+
+        // Fold in volume / input parameters set while stopped or paused so the
+        // values requested by the user are in effect for this playback run.
+        const playVars = this._mergeInputParameters(vars);
+        const playAmp = mergeVolume(this._volume, amp);
+
+        // Only forward per-loop volumes for loops this ditty actually has, so
+        // volumes remembered from previously played ditties don't accumulate.
+        if (Array.isArray(playAmp.loops) && Array.isArray(structure.loops)) {
+            const names = new Set(structure.loops.map(l => l.name));
+            playAmp.loops = playAmp.loops.filter(l => names.has(l.name));
+        }
+
+        try {
+            this.setupWorkers(structure, code, playVars, playAmp, releaseMode);
+
+            const out = this._workerData.filter(workerData => workerData.out.nodeType === NODE_TYPE_OUT);
+
+            this.postMessageToWorklet({
+                type: MSG_INIT, in: out.map(w => ({name: w.name, nodeType: w.nodeType, port: w.channel.port2})
+                ), state: structure, vars: playVars, amp: playAmp,
+            }, out.map(w => w.channel.port2));
+        } catch (e) {
+            // Creating or wiring workers failed: nothing is producing audio,
+            // so release whatever was created and report an honest state.
+            this.error(e && e.message ? e.message : e, e);
+            this._releaseWorkers();
+            this.postMessageToWorklet({type: MSG_RESET});
+            if (this._state !== 'stopped') {
+                this._setState('stopped');
+                this.dispatch(MSG_STOP);
+            }
+            return;
+        }
+
+        if (this._context.state !== 'running') {
+            try {
+                await this._context.resume();
+            } catch (e) {
+                this.error(e.message, e);
+            }
+        }
+
+        this._setState('playing');
+
+        // Only report a play transition when the state actually changed.
+        if (previousState !== 'playing') {
+            this.dispatch(MSG_PLAY);
+        }
     }
 }
