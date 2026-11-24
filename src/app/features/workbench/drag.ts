@@ -67,6 +67,8 @@ interface Session {
   overLibrary: boolean;
   raf: number;
   shift: boolean;
+  /** Terminal settlement (drop/abort) has run once; guards against double settlement. */
+  finalized: boolean;
 }
 
 let s: Session | null = null;
@@ -128,6 +130,7 @@ function begin(e: React.PointerEvent<HTMLElement>, source: Source, mode: PressMo
     overLibrary: false,
     raf: 0,
     shift: e.shiftKey,
+    finalized: false,
   };
   // Press-in feedback until the gesture resolves (lift, tap, scroll or menu).
   s.pressEl.setAttribute("data-pressed", "");
@@ -313,8 +316,44 @@ function frame(final = false): void {
   }
 }
 
+/** Canvas uids carried by the stack: the dragged source first, then gathered tiles. */
+function stackUids(sess: Session): string[] {
+  const out: string[] = [];
+  if (sess.source.kind === "canvas") out.push(sess.source.uid);
+  for (const uid of sess.gathered) if (!out.includes(uid)) out.push(uid);
+  return out;
+}
+
+/** De-duplicate a merge ingredient list while preserving order. */
+function uniqueUids(uids: readonly string[]): string[] {
+  return [...new Set(uids)];
+}
+
+/** Remove every uid this session could have placed in the module-level `held` set. */
+function clearHeld(sess: Session): void {
+  if (sess.source.kind === "canvas") held.delete(sess.source.uid);
+  for (const uid of sess.gathered) held.delete(uid);
+}
+
+/** Keep the imperative stack badge and the React-visible `useDrag.stack` in lockstep. */
+function syncStackBadge(sess: Session): void {
+  const n = 1 + sess.gathered.length;
+  const el = sess.pose?.el;
+  if (el) {
+    el.setAttribute("data-stack", String(n));
+    el.style.setProperty("--stack", `"${n}"`);
+  }
+  useDrag.setState({ stack: n });
+}
+
 function gather(uid: string): void {
   if (!s) return;
+  // Lifecycle guard: a tile is collected at most once, can never be the source itself, and
+  // the stack never exceeds MAX_INPUTS materials. `frame()` already excludes these from the
+  // candidate set; these checks make a duplicate/staleness race harmless too.
+  if (s.gathered.includes(uid)) return;
+  if (s.source.kind === "canvas" && s.source.uid === uid) return;
+  if (s.gathered.length >= MAX_INPUTS - 1) return;
   poses.get(uid)?.el?.removeAttribute("data-target");
   s.gathered.push(uid);
   s.target = null;
@@ -328,15 +367,16 @@ function gather(uid: string): void {
   }
   haptic("gather");
   playSound("pickup");
-  const n = 1 + s.gathered.length;
-  s.pose?.el?.setAttribute("data-stack", String(n));
-  s.pose?.el?.style.setProperty("--stack", `"${n}"`);
-  useDrag.setState({ stack: n });
+  syncStackBadge(s);
 }
 
+/**
+ * Return gathered tiles to their static rest positions and restore scale/opacity. This is
+ * the single "abort ending" for gathered members; it is safe to call once per exit path.
+ */
 function releaseGathered(gathered: readonly string[]): void {
   const { tiles } = useCanvas.getState();
-  for (const uid of gathered) {
+  for (const uid of uniqueUids(gathered)) {
     held.delete(uid);
     const t = tiles.find((x) => x.uid === uid);
     const p = poses.get(uid);
@@ -363,38 +403,43 @@ function onUp(e: PointerEvent): void {
   }
   sess.x = e.clientX;
   sess.y = e.clientY;
-  frame(true);
-  cleanup();
-  suppressNextClick();
-  drop(sess);
+  // Resolve exactly once. Whatever the release decision does, the window session is torn
+  // down and every held uid is released even if a resolution step throws.
+  try {
+    frame(true);
+    cleanup();
+    suppressNextClick();
+    drop(sess);
+  } catch (err) {
+    if (!sess.finalized) abort(sess);
+    else clearHeld(sess);
+    if (import.meta.env?.DEV) console.error("[drag] release failed:", err);
+  } finally {
+    cleanup();
+    clearHeld(sess);
+  }
 }
 
 function onCancel(e: PointerEvent): void {
   if (!s || e.pointerId !== s.pointerId) return;
   const sess = s;
-  if (!sess.active) {
-    cleanup(); // the browser took over a scroll before the drag started
-    return;
-  }
-  // Chromium can cancel a long-press-activated touch drag that moves along the scroller's
-  // pan axis (no further touch events follow). The finger was carrying the tile to where it
-  // last was, so resolve it as a drop there rather than snapping it back.
-  if (sess.touch) {
-    frame(true);
-    cleanup();
-    suppressNextClick();
-    drop(sess);
-  } else {
-    cleanup();
-    abort(sess);
-  }
+  // Pointer cancellation (browser gesture takeover, touch scroll, interruption) is an abort
+  // ending for the whole stack: gathered tiles return home instead of merging. This applies
+  // to mouse, touch and pen alike; leaving it on the drop path stranded the stack whenever a
+  // touch pointercancel was synthesized mid-gesture.
+  cleanup();
+  if (sess.active) abort(sess);
 }
 
 function onKey(e: KeyboardEvent): void {
   if (e.key !== "Escape" || !s) return;
   const sess = s;
-  cleanup();
-  if (sess.active) abort(sess);
+  try {
+    cleanup();
+    if (sess.active) abort(sess);
+  } finally {
+    clearHeld(sess);
+  }
 }
 
 function onTap(sess: Session): void {
@@ -429,15 +474,24 @@ function endVisuals(sess: Session): void {
 }
 
 function abort(sess: Session): void {
+  if (sess.finalized) return;
+  sess.finalized = true;
   endVisuals(sess);
   releaseGathered(sess.gathered);
   if (sess.source.kind === "canvas") {
     held.delete(sess.source.uid);
     if (sess.origin) sess.pose?.moveTo(sess.origin, SPRING.settle);
   }
+  clearHeld(sess);
 }
 
 function drop(sess: Session): void {
+  if (sess.finalized) return;
+  sess.finalized = true;
+  // Reset React-visible drag state (ghost/stack) and release the held set BEFORE any further
+  // coordinate work, so no exit path can leave a stale stack badge or a permanently held tile.
+  endVisuals(sess);
+  clearHeld(sess);
   const { T, tiles, bounds } = useCanvas.getState();
   const rect = sess.rect;
   const raw = toCanvas(sess.x + sess.grab.x, sess.y + sess.grab.y, rect);
@@ -450,18 +504,16 @@ function drop(sess: Session): void {
   const overLib = sess.overLibrary;
   const insideCanvas = !!rect && sess.y >= rect.top && sess.y <= rect.bottom && sess.x >= rect.left && sess.x <= rect.right;
   const sourceUid = sess.source.kind === "canvas" ? sess.source.uid : null;
-  endVisuals(sess);
-  if (sourceUid) held.delete(sourceUid);
-  for (const g of sess.gathered) held.delete(g);
 
-  // 1) Released over the library: put a canvas tile away / cancel a library drag.
+  // 1) Released over the library: put a canvas tile away / cancel a library drag. Gathered
+  //    stack members are not stored there, so they return to their rest positions.
   if (overLib) {
     releaseGathered(sess.gathered);
     if (sourceUid) removeTile(sourceUid, true);
     return;
   }
 
-  const stack = [...(sourceUid ? [sourceUid] : []), ...sess.gathered];
+  const stack = stackUids(sess);
   const mergeHit = !!target && dist(raw, target) < MERGE_RADIUS * T;
 
   // 2) Merge into the locked target, or merge a gathered stack where it was released.
@@ -470,15 +522,25 @@ function drop(sess: Session): void {
     if (sess.source.kind === "library") {
       const at = bounds ? clampPt(raw, bounds, T) : raw;
       const uid = dropNewTile(sess.source.elementId, at, visual, false);
-      if (!uid) return;
+      if (!uid) {
+        // Workbench full / spawn refused: the ghost source never materialised, so the
+        // gathered tiles must fly home rather than stay absorbed and orphaned.
+        releaseGathered(sess.gathered);
+        return;
+      }
       stack.unshift(uid);
     }
+    // De-duplicate defensively: the locked target is excluded from targeting while gathered,
+    // but a stale/duplicate uid must never reach the merge as two ingredients.
+    const ingredientUids = mergeHit && target ? uniqueUids([...stack, target.uid]) : uniqueUids(stack);
     const at = mergeHit && target ? { x: target.x, y: target.y } : bounds ? clampPt(raw, bounds, T) : raw;
-    void mergeTiles(mergeHit && target ? [...stack, target.uid] : stack, at, { snapshot: false });
+    void mergeTiles(ingredientUids, at, { snapshot: false });
     return;
   }
 
-  // 3) Place on the canvas (clamped; neighbours make room).
+  // 3) Plain placement. Any gathered tiles that are not merging here (e.g. released outside
+  //    the canvas rect) are returned home first so no tile stays absorbed/invisible.
+  releaseGathered(sess.gathered);
   if (!bounds) return;
   const at = clampPt(raw, bounds, T);
   if (sess.source.kind === "library") {

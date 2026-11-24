@@ -257,7 +257,8 @@ interface MergeOpts {
  */
 export async function mergeTiles(uids: readonly string[], at: Pt, opts: MergeOpts = {}): Promise<void> {
   const { tiles } = useCanvas.getState();
-  const inputs = uids
+  // De-duplicate uids before mapping: a gathered drag stack must never count one tile twice.
+  const inputs = [...new Set(uids)]
     .map((u) => tiles.find((t) => t.uid === u))
     .filter((t): t is NonNullable<typeof t> => !!t && !t.pending && !t.leaving && !!t.elementId)
     .slice(0, 4);
