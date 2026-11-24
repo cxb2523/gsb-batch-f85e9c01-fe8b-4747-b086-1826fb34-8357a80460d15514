@@ -12,3 +12,5 @@ export { drawSpectrogram, spectrogramPixels } from './spectrogram.js';
 export type { SpectrogramOptions } from './spectrogram.js';
 export { AudioSession } from './session.js';
 export type { AudioSessionOptions, SessionState } from './session.js';
+export { AnalysisSession } from './analysis-session.js';
+export type { AnalysisSessionOptions } from './analysis-session.js';

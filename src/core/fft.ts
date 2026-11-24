@@ -9,6 +9,7 @@
 
 import { isPow2 } from './pow2.js';
 import { assertFiniteSamples, assertInteger, assertPositive } from './validation.js';
+import { bitReversalCache, buildBitReversalTable } from './bit-reversal-cache.js';
 
 export const MAX_FFT_SIZE = 1 << 20; // 1,048,576
 
@@ -17,22 +18,13 @@ export interface ComplexArray {
   im: Float32Array;
 }
 
-const bitReversalCache = new Map<number, Uint32Array>();
-
+// Tables are kept in a bounded LRU cache (see bit-reversal-cache.ts) so that
+// repeatedly switching FFT sizes cannot grow memory without limit. A size
+// whose table has been evicted is rebuilt transparently on the next call.
 function bitReversalTable(n: number): Uint32Array {
   const cached = bitReversalCache.get(n);
   if (cached) return cached;
-  const bits = Math.log2(n);
-  const table = new Uint32Array(n);
-  for (let i = 0; i < n; i++) {
-    let x = i;
-    let r = 0;
-    for (let j = 0; j < bits; j++) {
-      r = (r << 1) | (x & 1);
-      x >>= 1;
-    }
-    table[i] = r;
-  }
+  const table = buildBitReversalTable(n);
   bitReversalCache.set(n, table);
   return table;
 }

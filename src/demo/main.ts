@@ -1,7 +1,7 @@
-import { serializeAnalysis, analysisToCsv } from '../io/analysis-export.js';
+import { analysisToCsv } from '../io/analysis-export.js';
 import { encodeWav } from '../io/wav.js';
 import { loadAudioFile } from './file-loader.js';
-import { analyzeAudio, type AudioAnalysis } from '../analysis.js';
+import type { AudioAnalysis } from '../analysis.js';
 import type { AudioBuffer } from '../core/buffer.js';
 import { downmixToMono } from '../core/downmix.js';
 import { buildPyramid, type Pyramid } from '../core/pyramid.js';
@@ -14,6 +14,7 @@ import {
   drawSpectrogram,
   Viewport,
   AudioSession,
+  AnalysisSession,
   type PaletteName,
 } from '../browser/index.js';
 import { createSignal, SIGNAL_LABELS, type SignalName } from './signals.js';
@@ -24,8 +25,11 @@ let audio: AudioBuffer = createSignal('harmonics');
 let samples = downmixToMono(audio).getChannel(0);
 let pyramid: Pyramid = buildPyramid(samples);
 let viewport = new Viewport(samples.length);
-let analysis: AudioAnalysis;
-let frameIndex = 0;
+// Owns the coherent frame/spectrum/spectrogram snapshot. Every parameter
+// change goes through this session so a failed rebuild leaves the previous
+// snapshot readable instead of mixing old and new FFT sizes.
+let analysisSession: AnalysisSession = new AnalysisSession(audio);
+let analysis: AudioAnalysis = analysisSession.analysis;
 let loadGeneration = 0;
 let sourceDetail = '';
 let previousState: string = 'idle';
@@ -41,21 +45,17 @@ function status(message: string, error = false): void {
 function draw(): void {
   if (session.state === 'microphone') return;
   drawWaveform(wave, samples, { ...canvasSize(wave), range: viewport.range, pyramid });
-  drawSpectrum(spectrum, analysis.frames[frameIndex]?.decibels ?? [], {
+  drawSpectrum(spectrum, analysisSession.currentSpectrum(), {
     ...canvasSize(spectrum),
     floor: Number(select('db-floor')),
     color: '#a89bff',
   });
-  drawSpectrogram(
-    spectrogram,
-    analysis.frames.map((frame) => frame.decibels),
-    {
-      ...canvasSize(spectrogram),
-      floor: Number(select('db-floor')),
-      palette: select('palette') as PaletteName,
-      frequencyScale: select('frequency-scale') as 'linear' | 'log',
-    },
-  );
+  drawSpectrogram(spectrogram, analysisSession.spectrogramColumns(), {
+    ...canvasSize(spectrogram),
+    floor: Number(select('db-floor')),
+    palette: select('palette') as PaletteName,
+    frequencyScale: select('frequency-scale') as 'linear' | 'log',
+  });
   const colors = {
     ocean: 'linear-gradient(90deg,#123456,#10879d,#ecffe3)',
     ember: 'linear-gradient(90deg,#0d0a1d,#be344d,#fff8cc)',
@@ -63,34 +63,40 @@ function draw(): void {
   };
   const legend = document.querySelector<HTMLElement>('.color-key i');
   if (legend) legend.style.background = colors[select('palette') as PaletteName];
-  setText('frame-time', `${(analysis.frames[frameIndex]?.timeSeconds ?? 0).toFixed(3)} s`);
-  setText('spectrum-mode', `FRAME ${frameIndex + 1}`);
+  setText(
+    'frame-time',
+    `${(analysis.frames[analysisSession.currentFrameIndex]?.timeSeconds ?? 0).toFixed(3)} s`,
+  );
+  setText('spectrum-mode', `FRAME ${analysisSession.currentFrameIndex + 1}`);
   setText('range-start', `${(viewport.range.start / audio.sampleRate).toFixed(2)} s`);
   setText('range-end', `${(viewport.range.end / audio.sampleRate).toFixed(2)} s`);
 }
-function analyze(): void {
-  const fftSize = Number(select('fft-size'));
-  analysis = analyzeAudio(audio, {
-    fftSize,
-    hopSize: Math.max(fftSize / 4, Math.ceil(audio.numSamples / 1000)),
-    window: select('window') as WindowType,
-  });
-  frameIndex = Math.min(frameIndex, Math.max(0, analysis.frames.length - 1));
+function syncViews(): void {
   const slider = element<HTMLInputElement>('analysis-frame');
   slider.max = String(Math.max(0, analysis.frames.length - 1));
-  slider.value = String(frameIndex);
+  slider.value = String(analysisSession.currentFrameIndex);
   setText('duration', `${audio.getDuration().toFixed(2)} s`);
   setText('rms', `${linToDb(rms(samples)).toFixed(1)} dB`);
   const centroid =
     analysis.frames.reduce((sum, frame) => sum + frame.centroid, 0) /
     Math.max(1, analysis.frames.length);
   setText('centroid', `${(centroid / 1000).toFixed(2)} kHz`);
-  setText('resolution', `${(audio.sampleRate / fftSize).toFixed(1)} Hz`);
+  setText('resolution', `${(audio.sampleRate / analysisSession.fftSize).toFixed(1)} Hz`);
   setText('nyquist', `${audio.sampleRate / 2000} kHz`);
   setText('spectrogram-end', `${audio.getDuration().toFixed(2)} s`);
   setText('legend-floor', select('db-floor'));
   setText('frame-count', `${analysis.frames.length} frames`);
   draw();
+}
+function analyze(): void {
+  // Atomic rebuild: on success frames, spectra and spectrogram all use the
+  // new parameters; on failure the session keeps its previous snapshot and
+  // this function throws before any local view state is replaced.
+  analysis = analysisSession.update({
+    fftSize: Number(select('fft-size')),
+    window: select('window') as WindowType,
+  });
+  syncViews();
 }
 function choose(next: AudioBuffer, name: string, synthetic: boolean): void {
   session.stop();
@@ -100,13 +106,19 @@ function choose(next: AudioBuffer, name: string, synthetic: boolean): void {
   samples = downmixToMono(audio).getChannel(0);
   pyramid = buildPyramid(samples);
   viewport = new Viewport(samples.length);
+  // Swap the recording and apply the UI-selected parameters in one atomic
+  // rebuild, so no second analysis pass is needed.
+  analysis = analysisSession.setAudio(audio, {
+    fftSize: Number(select('fft-size')),
+    window: select('window') as WindowType,
+  });
   setText('source-title', sourceName);
   setText(
     'source-detail',
     `${synthetic ? 'Synthetic signal' : 'Local file'} · ${audio.sampleRate / 1000} kHz · ${audio.numChannels === 1 ? 'mono' : audio.numChannels + ' channels'}`,
   );
   sourceDetail = element('source-detail').textContent ?? '';
-  analyze();
+  syncViews();
   status('Ready to explore. Choose Play to listen.');
 }
 for (const button of document.querySelectorAll<HTMLButtonElement>('[data-signal]'))
@@ -310,7 +322,7 @@ function paintLive(time: number): void {
         );
       }
     } else {
-      setText('spectrum-mode', `FRAME ${frameIndex + 1}`);
+      setText('spectrum-mode', `FRAME ${analysisSession.currentFrameIndex + 1}`);
     }
   }
   requestAnimationFrame(paintLive);
@@ -349,7 +361,7 @@ element('microphone').addEventListener('click', async () => {
 
 element('export-json').addEventListener('click', () =>
   download(
-    new Blob([serializeAnalysis(analysis)], { type: 'application/json' }),
+    new Blob([analysisSession.exportJson()], { type: 'application/json' }),
     'sonascope-analysis.json',
   ),
 );
@@ -370,20 +382,21 @@ element('export-png').addEventListener('click', () =>
 );
 
 element<HTMLInputElement>('analysis-frame').addEventListener('input', (event) => {
-  frameIndex = Number((event.target as HTMLInputElement).value);
+  analysisSession.setFrameIndex(Number((event.target as HTMLInputElement).value));
   draw();
 });
 
 spectrogram.addEventListener('pointerdown', (event) => {
   if (session.state === 'microphone' || analysis.frames.length === 0) return;
   const rect = spectrogram.getBoundingClientRect();
-  frameIndex = Math.max(
+  const next = Math.max(
     0,
     Math.min(
       analysis.frames.length - 1,
       Math.floor(((event.clientX - rect.left) / rect.width) * analysis.frames.length),
     ),
   );
-  element<HTMLInputElement>('analysis-frame').value = String(frameIndex);
+  analysisSession.setFrameIndex(next);
+  element<HTMLInputElement>('analysis-frame').value = String(analysisSession.currentFrameIndex);
   draw();
 });

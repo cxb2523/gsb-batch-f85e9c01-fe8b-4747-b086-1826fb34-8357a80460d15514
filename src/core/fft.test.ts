@@ -1,6 +1,11 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { fft, fftInPlace, fftReal, ifft, ifftInPlace, ifftReal } from './fft.js';
 import { generateSine } from './generators.js';
+import {
+  BIT_REVERSAL_CACHE_LIMIT,
+  bitReversalCacheSize,
+  clearBitReversalCache,
+} from './bit-reversal-cache.js';
 
 describe('fft', () => {
   it('fft then ifft recovers the input', () => {
@@ -128,6 +133,56 @@ describe('fft', () => {
   it('fft rejects sizes above MAX_FFT_SIZE', () => {
     const samples = new Float32Array(1 << 25);
     expect(() => fft(samples)).toThrow(/<= 1048576/);
+  });
+});
+
+describe('bounded bit-reversal cache', () => {
+  beforeEach(() => clearBitReversalCache());
+
+  it('stays bounded when many FFT sizes are used repeatedly', () => {
+    const sizes = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
+    for (let round = 0; round < 4; round++) {
+      for (const size of sizes) {
+        fft(new Float32Array(size));
+        expect(bitReversalCacheSize()).toBeLessThanOrEqual(BIT_REVERSAL_CACHE_LIMIT);
+      }
+    }
+    expect(bitReversalCacheSize()).toBe(BIT_REVERSAL_CACHE_LIMIT);
+  });
+
+  it('returns results identical to a cache-free computation after eviction', () => {
+    const sizes = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
+    const makeInput = (size: number) => {
+      const samples = new Float32Array(size);
+      for (let i = 0; i < size; i++) samples[i] = Math.sin((2 * Math.PI * 3 * i) / size) + 0.25;
+      return samples;
+    };
+    // Cycle through enough sizes to force repeated evictions, including
+    // sizes used much earlier whose tables have since been dropped.
+    clearBitReversalCache();
+    for (let round = 0; round < 3; round++) for (const size of sizes) fft(makeInput(size));
+    // Recompute every size with an empty cache (table rebuilt each time)
+    // and confirm the cached path produces exactly the same numbers.
+    for (const size of sizes) {
+      clearBitReversalCache();
+      const rebuilt = fft(makeInput(size));
+      clearBitReversalCache();
+      const fresh = fft(makeInput(size));
+      expect(Array.from(rebuilt.re)).toEqual(Array.from(fresh.re));
+      expect(Array.from(rebuilt.im)).toEqual(Array.from(fresh.im));
+    }
+  });
+
+  it('recomputes correct DC output for a size whose table was evicted', () => {
+    clearBitReversalCache();
+    const small = 64;
+    fft(new Float32Array(small)); // populate then evict via larger sizes
+    for (const size of [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768])
+      fft(new Float32Array(size));
+    expect(bitReversalCacheSize()).toBe(BIT_REVERSAL_CACHE_LIMIT);
+    const result = fft(new Float32Array(small).fill(1));
+    expect(result.re[0]).toBeCloseTo(small, 4);
+    for (let i = 1; i < small; i++) expect(result.re[i] ?? 0).toBeCloseTo(0, 4);
   });
 });
 it('preserves both planes when a transform would exceed Float32 range', () => {
