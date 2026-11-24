@@ -56,11 +56,14 @@ export class Lightning {
     scene.add(this.mesh);
   }
 
-  clear() { this.bolts.length = 0; }
+  clear() { this.bolts.length = 0; this.g.setDrawRange(0, 0); }
+  // drop everything except ambient scenery (pylon coil arcs)
+  clearCombat() { this.bolts = this.bolts.filter((b) => b.amb > 0.5); }
 
   // a, b: {x,y,z} (kept by reference, so a moving endpoint is followed on each re-roll)
-  strike(a, b, { width = 0.14, life = 0.25, r = 0.35, g = 0.7, b: bl = 1.0, intensity = 14, jag = 0.2, branches = 2, regen = 0.045, levels = 5 } = {}) {
-    const bolt = { a, b, width, life, age: 0, r, g, bl, intensity, jag, branches, regen, regenT: 0, levels, lines: [], flick: 1 };
+  // amb: scene-resident, survives clearCombat
+  strike(a, b, { width = 0.14, life = 0.25, r = 0.35, g = 0.7, b: bl = 1.0, intensity = 14, jag = 0.2, branches = 2, regen = 0.045, levels = 5, amb = 0 } = {}) {
+    const bolt = { a, b, width, life, age: 0, r, g, bl, intensity, jag, branches, regen, regenT: 0, levels, lines: [], flick: 1, amb };
     this.bolts.push(bolt);
     return bolt;
   }
@@ -196,7 +199,7 @@ export class Trails {
     scene.add(this.mesh);
     this.seed = 0;
   }
-  clear() { this.list.length = 0; }
+  clear() { this.list.length = 0; this.g.setDrawRange(0, 0); }
   start({ width = 0.5, life = 0.3, heat = 1.2, ramp = 0, up = false } = {}) {
     const t = { width, life, heat, ramp, up, pts: [], ended: false, seed: (this.seed += 0.37) % 1 };
     this.list.push(t);
@@ -360,7 +363,7 @@ export class GroundQuads {
     this.decal = decal;
     scene.add(this.mesh);
   }
-  clear() { this.items.length = 0; }
+  clear() { this.items.length = 0; this.g.instanceCount = 0; }
   // decal: t counts seconds up to 'life'. fx: t is progress 0..1 over 'life' (or driven externally via item.p)
   add(x, z, radius, { mode = 0, life = 1, r = 1, g = 1, b = 1, intensity = 1, seed = 0, y = 0.012 } = {}) {
     const it = { x, y, z, radius, mode, life, t: 0, r, g, b, intensity, seed, dead: false };
@@ -420,7 +423,7 @@ export class Debris {
     this.p = new THREE.Vector3();
     this.e = new THREE.Euler();
   }
-  clear() { this.items.length = 0; }
+  clear() { this.items.length = 0; this.mesh.count = 0; }
   spawn(x, y, z, vx, vy, vz, size, life, r = 1, g = 0.4, b = 0.1, heat = 8) {
     if (this.items.length >= this.max) this.items.shift();
     this.items.push({ x, y, z, vx, vy, vz, size, life, t: 0, rx: vx * 0.7 + 1, ry: vy * 0.3, rz: vz * 0.7 - 1, ax: x * 3.1, ay: z * 2.3, az: y, r, g, b, heat, rest: false });
@@ -712,14 +715,17 @@ export class Beam {
     this.group = new THREE.Group();
     this.group.visible = false;
     scene.add(this.group);
-    const geo = new THREE.CylinderGeometry(1, 1, 1, 40, 96, true);
+    const geo = (this.geo = new THREE.CylinderGeometry(1, 1, 1, 40, 96, true));
     geo.translate(0, 0.5, 0);
+    this.mats = [];
     const mk = (core, radius, heat, wobble, flow) => {
       const u = {
         ...fxGlobals, uLen: { value: 1 }, uRadius: { value: radius }, uWobble: { value: wobble }, uFlow: { value: flow },
         uHeat: { value: heat }, uRamp: { value: ramp }, uCore: { value: core }, uAlpha: { value: 1 },
       };
-      const m = new THREE.Mesh(geo, new THREE.ShaderMaterial({ vertexShader: BEAM_VERT, fragmentShader: BEAM_FRAG, uniforms: u, ...PREMULT, side: THREE.DoubleSide }));
+      const mat = new THREE.ShaderMaterial({ vertexShader: BEAM_VERT, fragmentShader: BEAM_FRAG, uniforms: u, ...PREMULT, side: THREE.DoubleSide });
+      this.mats.push(mat);
+      const m = new THREE.Mesh(geo, mat);
       m.frustumCulled = false;
       m.layers.set(LAYER.FX);
       m.renderOrder = 9;
@@ -733,6 +739,11 @@ export class Beam {
     this.core = mk(1, fire ? 0.6 : 0.5, 0.98, 0.12, 16);
     this.alpha = 0;
     this.baseR = [this.sheath2.uRadius.value, this.sheath.uRadius.value, this.core.uRadius.value];
+  }
+  // Free the GPU resources; the group must already be out of the scene graph.
+  dispose() {
+    this.geo.dispose();
+    for (const m of this.mats) m.dispose();
   }
   set(ox, oy, oz, yaw, len, on, dt, scale = 1) {
     this.alpha += ((on ? 1 : 0) - this.alpha) * Math.min(1, dt * (on ? 30 : 9));

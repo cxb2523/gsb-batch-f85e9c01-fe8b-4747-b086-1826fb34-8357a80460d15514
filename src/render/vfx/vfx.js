@@ -50,7 +50,7 @@ export class VFX {
 
   bindFighters(world) {
     for (let i = 0; i < 2; i++) {
-      if (this.beams[i]) this.scene.remove(this.beams[i].group);
+      if (this.beams[i]) { this.scene.remove(this.beams[i].group); this.beams[i].dispose(); }
       this.beams[i] = new Beam(this.scene, world.fighters[i].stats.element === 'fire' ? 0 : 1);
     }
   }
@@ -578,12 +578,12 @@ export class VFX {
       const w = mx < 0;
       this.glows.emit(mx, r.range(0.2, 5), mz, 0.035, 0.03, r.range(3, 6), w ? 5 : 1.2, w ? 1.8 : 3.2, w ? 0.4 : 6, { vx: r.range(-0.3, 0.3), vy: r.range(0.05, 0.4), vz: r.range(-0.3, 0.3), turb: 1, fadePow: 0.7, amb: 1 });
     }
-    if (due('haze', 0.3)) for (const b of this.arena.braziers) this.shocks.emit(b.x, b.y + 0.9, b.z, 1.3, 1.1, 0.012, { haze: true, vy: 1.2 });
+    if (due('haze', 0.3)) for (const b of this.arena.braziers) this.shocks.emit(b.x, b.y + 0.9, b.z, 1.3, 1.1, 0.012, { haze: true, vy: 1.2, amb: 1 });
     if (due('coil', 0.34)) {
       const c = r.pick(this.arena.coils);
       const to = r.chance(0.5) ? P3(c.x + r.range(-1.2, 1.2), c.y - r.range(0.6, 1.4), c.z + r.range(-1.2, 1.2)) : P3(c.x + r.range(-2.5, 2.5), 0.05, c.z + r.range(-2.5, 2.5));
-      this.bolts.strike(P3(c.x, c.y, c.z), to, { width: 0.07, life: r.range(0.08, 0.2), intensity: 9, branches: 1, levels: 4, jag: 0.25 });
-      this.glows.emit(c.x, c.y, c.z, 0.5, 1.3, 0.2, 2, 5, 10, { fadePow: 1.5 });
+      this.bolts.strike(P3(c.x, c.y, c.z), to, { width: 0.07, life: r.range(0.08, 0.2), intensity: 9, branches: 1, levels: 4, jag: 0.25, amb: 1 });
+      this.glows.emit(c.x, c.y, c.z, 0.5, 1.3, 0.2, 2, 5, 10, { fadePow: 1.5, amb: 1 });
     }
     if (due('mist', 0.5)) {
       const a = r.range(0, TAU), d = r.range(2, ARENA_R + 3);
@@ -778,15 +778,20 @@ export class VFX {
   }
 
   // New scene (next round, next shot): nothing from the last exchange may linger in the air.
-  // Scenery — brazier flames, motes, mist — and the scars on the floor stay.
+  // Scenery — brazier flames, motes, mist, heat haze, coil arcs — and the scars on the floor stay.
+  // Safe to call any number of times in a row: every handle it drops is also nulled here.
   clearCombat() {
     this.clearTransient();
-    this.puffs.clearCombat(); this.glows.clearCombat();
-    this.sparks.clear(); this.shocks.clear(); this.bolts.clear(); this.trails.clear(); this.ground.clear();
+    this.puffs.clearCombat(); this.glows.clearCombat(); this.shocks.clearCombat(); this.bolts.clearCombat();
+    this.sparks.clear(); this.trails.clear(); this.ground.clear();
     this.rubble.clear(); this.cubes.clear(); this.slashes.clear(); this.orbs.clear();
     this.dashTrail = [null, null];
     for (const l of this.arena.dyn) l.intensity = 0;
     this.arena.shared.uPulse.value = 0;
+    // barrier ripples and the sky flash are combat feedback, not scenery
+    for (const h of this.arena.barrierUniforms.uHits.value) h.w = -1;
+    this.arena.flash = 0;
+    this.arena.skyUniforms.uFlash.value.w = 0;
     const S = this.screen;
     S.ca = 0; S.radial = 0; S.flash = 0;
     this.trauma = 0;

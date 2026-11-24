@@ -155,6 +155,7 @@ export class Puffs {
     let n = 0;
     for (let k = 0; k < this.n; k++) if (d[k * PS + 23] > 0.5) { if (n !== k) d.copyWithin(n * PS, k * PS, k * PS + PS); n++; }
     this.n = n;
+    this.g.instanceCount = n;
   }
   update(dt, camera, t) {
     const d = this.d;
@@ -367,6 +368,7 @@ export class Glows {
     let n = 0;
     for (let k = 0; k < this.n; k++) if (d[k * GS + 18] > 0.5) { if (n !== k) d.copyWithin(n * GS, k * GS, k * GS + GS); n++; }
     this.n = n;
+    this.g.instanceCount = n;
   }
   update(dt, t) {
     const d = this.d;
@@ -451,7 +453,7 @@ void main() {
   gl_FragColor = vec4(off, 0.0, 0.0);
 }
 `;
-const HS = 10;
+const HS = 11;
 export class Shocks {
   constructor(scene, max = 48) {
     this.max = max;
@@ -468,11 +470,19 @@ export class Shocks {
     scene.add(this.mesh);
   }
   clear() { this.n = 0; this.g.instanceCount = 0; }
-  // ring: expanding refraction front; haze: wobbling heat shimmer
-  emit(x, y, z, radius, life, strength, { ground = false, haze = false, vy = 0 } = {}) {
+  // drop everything except ambient scenery (brazier heat haze)
+  clearCombat() {
+    const d = this.d;
+    let n = 0;
+    for (let k = 0; k < this.n; k++) if (d[k * HS + 10] > 0.5) { if (n !== k) d.copyWithin(n * HS, k * HS, k * HS + HS); n++; }
+    this.n = n;
+    this.g.instanceCount = n;
+  }
+  // ring: expanding refraction front; haze: wobbling heat shimmer; amb: scene-resident, survives clearCombat
+  emit(x, y, z, radius, life, strength, { ground = false, haze = false, vy = 0, amb = 0 } = {}) {
     if (this.n >= this.max) return;
     const d = this.d, i = this.n++ * HS;
-    d[i] = x; d[i + 1] = y; d[i + 2] = z; d[i + 3] = radius; d[i + 4] = 0; d[i + 5] = life; d[i + 6] = strength; d[i + 7] = ground ? 1 : 0; d[i + 8] = haze ? 1 : 0; d[i + 9] = vy;
+    d[i] = x; d[i + 1] = y; d[i + 2] = z; d[i + 3] = radius; d[i + 4] = 0; d[i + 5] = life; d[i + 6] = strength; d[i + 7] = ground ? 1 : 0; d[i + 8] = haze ? 1 : 0; d[i + 9] = vy; d[i + 10] = amb;
   }
   update(dt) {
     const d = this.d;

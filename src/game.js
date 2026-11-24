@@ -187,6 +187,9 @@ export async function run(params) {
     stage.R.setQuality(q);
     stage.vfx.density = q === 'low' ? 0.5 : q === 'medium' ? 0.75 : 1;
     localStorage.setItem('mc.quality', q);
+    // The frame loop is stopped while paused and resizing the canvas clears it, so present one
+    // frame at the new settings right away — otherwise the pause menu sits over a black screen.
+    if (G.paused) stage.render(1 / 60);
   }
   input.onKey = (code) => {
     if (code === 'Escape' || code === 'KeyP') { if (G.paused) setPaused(false); else setPaused(true); return; }
