@@ -103,6 +103,10 @@ The scripts in `scripts/` drive a real GPU-backed Chromium through Playwright:
 - `node scripts/shot.mjs <url> <out.png>` takes a screenshot
 - `node scripts/play.mjs` plays a short game through the interface
 - `node scripts/perf.mjs <url> 1920x1080` measures frame rate
+- `node scripts/quality.mjs <url> [WxH]` switches graphics presets at runtime and checks that
+  shadow maps and post-processing resources are released, the post stack matches each preset,
+  dynamic resolution resets and keeps adapting, and existing rooms and items still cast shadows.
+  It exits non-zero on failure, so it can run in CI
 
 These URL flags are handy with them:
 

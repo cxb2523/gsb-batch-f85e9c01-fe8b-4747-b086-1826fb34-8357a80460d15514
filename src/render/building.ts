@@ -185,6 +185,14 @@ export class BuildingView {
     for (const e of this.edges.values()) e.target = this.targetHeight(e);
   }
 
+  /** Adopt a new graphics preset without rebuilding geometry. */
+  setPreset(preset: Preset) {
+    this.preset = preset;
+    // The baked contact strips stand in for screen-space AO, so they get fainter when a
+    // preset actually turns AO on.
+    (this.contact.material as THREE.MeshBasicMaterial).opacity = preset.ao === 'off' ? 0.42 : 0.22;
+  }
+
   private targetHeight(e: EdgeRec): number {
     const yaw = Math.PI / 4 + this.quadrant * (Math.PI / 2);
     const dx = -Math.sin(yaw), dz = -Math.cos(yaw);

@@ -63,7 +63,12 @@ export class View {
     this.litter = new LitterView(engine.scene);
     engine.rig.onYawStep = (q) => this.building.setQuadrant(q);
     this.building.setQuadrant(engine.rig.quadrant());
-    engine.onQualityChange.push(() => this.exterior.setGrass(engine.preset.grass));
+    engine.onQualityChange.push(() => {
+      // Each view adopts the new preset: grass density and lamp pools live outdoors, the
+      // baked contact strips and pool counts live in the building.
+      this.exterior.setPreset(engine.preset);
+      this.building.setPreset(engine.preset);
+    });
     this.items.onEmit = (kind, p, rate, dt) => this.particles.emit(`${kind}:${p.x.toFixed(1)},${p.z.toFixed(1)}`, kind as PKind, p, rate, dt);
     this.items.onLanded = (x, z) => { this.particles.dustRing(x, z, 16, 0.5); this.engine.rig.shake(0.12); };
     this.chars.onEmit = (kind, p, rate, dt) => this.particles.emit(`c:${kind}:${p.x.toFixed(0)},${p.z.toFixed(0)}`, kind === 'bubble' ? 'soap' : kind, p, rate, dt, kind === 'snow' ? 0.35 : 0.25);

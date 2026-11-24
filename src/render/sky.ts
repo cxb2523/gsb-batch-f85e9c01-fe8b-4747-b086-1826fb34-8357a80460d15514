@@ -17,6 +17,7 @@
  * code written by Blaine Bouvier are Copyright (c) 2026. All Rights Reserved.
  */
 import * as THREE from 'three';
+import { releaseShadowMap } from './quality';
 
 const vert = /* glsl */ `
 varying vec3 vDir;
@@ -125,7 +126,12 @@ export class Sky {
 
   configureShadow(size: number) {
     this.sun.castShadow = size > 0;
-    if (size <= 0) return;
+    if (size <= 0) {
+      // Shadows are off: free the old map instead of leaving a dead preset-sized texture
+      // resident. three.js allocates a fresh one on the next shadow render.
+      releaseShadowMap(this.sun.shadow);
+      return;
+    }
     const s = this.sun.shadow;
     s.mapSize.set(size, size);
     const cam = s.camera;
@@ -134,8 +140,8 @@ export class Sky {
     s.normalBias = 0.025;
     s.radius = size >= 4096 ? 4 : 3;
     s.blurSamples = 12;
-    s.map?.dispose();
-    (s as unknown as { map: null }).map = null;
+    // Drop the old map so the renderer rebuilds at the new size instead of resizing in place.
+    releaseShadowMap(s);
     cam.updateProjectionMatrix();
   }
 

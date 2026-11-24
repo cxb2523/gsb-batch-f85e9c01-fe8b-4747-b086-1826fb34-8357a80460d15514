@@ -21,6 +21,7 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import { CameraRig } from './camera';
 import { Sky } from './sky';
 import { buildPost, type PostStack } from './post';
+import { recompileSceneMaterials } from './quality';
 
 export type Quality = 'ultra' | 'high' | 'medium' | 'low';
 
@@ -82,7 +83,6 @@ export class Engine {
     this.renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance', stencil: false, depth: true });
     this.renderer.toneMapping = THREE.NoToneMapping;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-    this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFShadowMap;
     container.appendChild(this.renderer.domElement);
     this.renderer.domElement.classList.add('gl');
@@ -93,6 +93,9 @@ export class Engine {
     } catch { /* ignore */ }
     this.quality = quality ?? detectQuality(this.renderer);
     this.preset = PRESETS[this.quality];
+    // Keep the renderer in step with the starting preset, so a Low boot never allocates a
+    // shadow map and a preset with shadows compiles against them from the first frame.
+    this.renderer.shadowMap.enabled = this.preset.shadow > 0;
 
     const pmrem = new THREE.PMREMGenerator(this.renderer);
     this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
@@ -117,14 +120,28 @@ export class Engine {
     if (q === this.quality) return;
     this.quality = q;
     this.preset = PRESETS[q];
+    // A preset change starts a fresh adaptive-resolution run: back to full scale and a
+    // clean frame-time window, so the measurements from the old preset don't drag it down.
     this.renderScale = 1;
+    this.frameAcc = 0;
+    this.frames = 0;
+    this.lowFor = 0;
+    this.highFor = 0;
+    // Free the old shadow map outright (also when the new preset has no shadows), then
+    // size the new one from the preset. This is the only place the map is rebuilt.
     this.sky.configureShadow(this.preset.shadow);
     this.renderer.shadowMap.enabled = this.preset.shadow > 0;
-    this.scene.traverse((o) => {
-      const m = (o as THREE.Mesh).material as THREE.Material | THREE.Material[] | undefined;
-      if (!m) return;
-      for (const mm of Array.isArray(m) ? m : [m]) mm.needsUpdate = true;
-    });
+    // Force the coming frame to regenerate shadows, so a preset with shadows as large as
+    // the previous one doesn't reuse a stale map, and a preset without them doesn't
+    // accumulate stale needsUpdate requests.
+    this.renderer.shadowMap.autoUpdate = false;
+    this.renderer.shadowMap.needsUpdate = this.preset.shadow > 0;
+    this.shadowDirty = this.preset.shadow > 0;
+    // Existing meshes must take part in the new shadow setup. Materials are shared, so
+    // bumping each once recompiles the whole scene, not just objects created later.
+    recompileSceneMaterials(this.scene);
+    // Rebuild the post stack; disposing the old one frees its composer, effects and the
+    // n8ao internals the composer can't reach on its own.
     this.post.dispose();
     this.post = this.makePost();
     this.resize();
@@ -162,6 +179,8 @@ export class Engine {
   }
 
   private frameNo = 0;
+  /** Set by a preset change so the next frame rebuilds the shadow map once, whatever the parity. */
+  private shadowDirty = false;
 
   render(dt: number) {
     this.adapt(dt);
@@ -169,7 +188,10 @@ export class Engine {
     // below Ultra, refresh the shadow map every other frame: moving shadows at 30 Hz are hard to spot
     const sm = this.renderer.shadowMap;
     sm.autoUpdate = false;
-    sm.needsUpdate = this.quality === 'ultra' || this.frameNo++ % 2 === 0;
+    sm.needsUpdate = this.preset.shadow > 0 && (this.shadowDirty || this.quality === 'ultra' || this.frameNo % 2 === 0);
+    this.frameNo++;
     this.post.composer.render(dt);
+    // The rebuild for this preset is now done; later frames go back to the usual cadence.
+    this.shadowDirty = false;
   }
 }

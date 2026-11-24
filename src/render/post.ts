@@ -24,6 +24,7 @@ import {
 // @ts-expect-error n8ao ships without type declarations
 import { N8AOPostPass } from 'n8ao';
 import type { Preset } from './engine';
+import { disposePostResources } from './quality';
 
 export interface PostStack {
   composer: EffectComposer;
@@ -79,6 +80,13 @@ export function buildPost(renderer: THREE.WebGLRenderer, scene: THREE.Scene, cam
   if (p.smaa) composer.addPass(new EffectPass(camera, new SMAAEffect({ preset: p.ao === 'full' ? SMAAPreset.HIGH : SMAAPreset.MEDIUM })));
   return {
     composer, bloom, tilt, ao,
-    dispose() { composer.dispose(); },
+    dispose() {
+      // Composer.dispose() only walks properties it recognises as render targets,
+      // materials, textures or passes. The n8ao pass keeps its targets and shader
+      // materials inside plain helper objects and has no dispose() of its own, so free
+      // those first or every rebuild strands a float render target plus its programs.
+      for (const pass of composer.passes) disposePostResources(pass);
+      composer.dispose();
+    },
   };
 }

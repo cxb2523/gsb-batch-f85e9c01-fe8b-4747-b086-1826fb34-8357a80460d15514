@@ -209,6 +209,10 @@ export class Exterior {
   private signMat!: THREE.MeshStandardMaterial;
   private fountainLights = glow('#7fe0ff', 0).clone();
   private grass: THREE.InstancedMesh | null = null;
+  private pools: THREE.InstancedMesh | null = null;
+  private poolMatrices: THREE.Matrix4[] = [];
+  /** One shared plane for the lamp glow pools; the InstancedMeshes come and go with presets. */
+  private readonly poolGeo = new THREE.PlaneGeometry(1, 1);
 
   readonly theme: Theme;
   private b: BuildingRect;
@@ -420,6 +424,11 @@ export class Exterior {
     if (this.grass) {
       this.group.remove(this.grass);
       this.grass.geometry.dispose();
+      // The blade material is created here each time, so free it with the mesh; otherwise
+      // a preset switch leaves its program and instance buffers behind.
+      const mat = this.grass.material;
+      for (const m of Array.isArray(mat) ? mat : [mat]) m.dispose();
+      this.grass.dispose();
       this.grass = null;
     }
     if (count <= 0) return;
@@ -487,12 +496,34 @@ export class Exterior {
       this.group.add(bake(g));
       pools.push(new THREE.Matrix4().compose(new THREE.Vector3(x, 0.06, 31.2), new THREE.Quaternion().setFromEuler(new THREE.Euler(-Math.PI / 2, 0, 0)), new THREE.Vector3(5, 5, 1)));
     }
-    if (this.preset.lightPools) {
-      const im = new THREE.InstancedMesh(new THREE.PlaneGeometry(1, 1), this.poolMat, pools.length);
-      pools.forEach((p, i) => im.setMatrixAt(i, p));
+    this.poolMatrices = pools;
+    this.syncPools();
+  }
+
+  /** Show or remove the lamp glow pools to match the current preset. */
+  private syncPools() {
+    const want = this.preset.lightPools;
+    if (want && !this.pools) {
+      const im = new THREE.InstancedMesh(this.poolGeo, this.poolMat, this.poolMatrices.length);
+      this.poolMatrices.forEach((p, i) => im.setMatrixAt(i, p));
       im.renderOrder = 2;
+      im.frustumCulled = false;
+      this.pools = im;
       this.group.add(im);
+    } else if (!want && this.pools) {
+      // Detach but keep the shared geometry: the pools come back on the next preset that
+      // wants them, and creating a new PlaneGeometry each time grew the geometry count.
+      this.group.remove(this.pools);
+      this.pools.dispose();
+      this.pools = null;
     }
+  }
+
+  /** Adopt a new graphics preset, rebuilding only the pieces that depend on it. */
+  setPreset(preset: Preset) {
+    this.preset = preset;
+    this.setGrass(preset.grass);
+    this.syncPools();
   }
 
   private vehicles() {
