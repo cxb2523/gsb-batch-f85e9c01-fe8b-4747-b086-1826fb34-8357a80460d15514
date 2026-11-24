@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#050b14">
+<title>Hot Pursuit 2 Web</title>
+<meta name="description" content="Need for Speed: Hot Pursuit 2 (PlayStation 2, 2002) in the browser: the game's own code recompiled to WebAssembly, drawn with WebGPU. Fan project, not affiliated with Electronic Arts.">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main class="app" id="start">
+  <header class="panel top">
+    <div class="lightbar" aria-hidden="true"><span></span><span></span></div>
+    <div class="top-row">
+      <div class="brand">
+        <h1 class="title"><span class="chrome">Hot Pursuit 2</span> <span class="plate">Web</span></h1>
+        <p class="hint">Made by <a target="_blank" rel="noopener noreferrer" href="https://github.com/vitorinii">Vitorini</a>. <a href="#credits" id="credits-link">Credits</a> below.</p>
+        <p class="hint">Built on ZloiKILLER's <a class="nowrap" href="https://github.com/ZloiKILLER/nfshp2-port-win" target="_blank" rel="noopener noreferrer">nfshp2-port-win</a>, the static recompilation of the game and its PC runtime.</p>
+        <p class="hint">Fan project, not affiliated with or endorsed by Electronic Arts.</p>
+      </div>
+      <div class="row top-end">
+        <a target="_blank" rel="noopener noreferrer" class="btn" href="https://github.com/vitorinii/nfshp2-web"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .5a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.52-1.33-1.28-1.69-1.28-1.69-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.19 1.76 1.19 1.03 1.76 2.69 1.25 3.35.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.84 1.19 3.1 0 4.42-2.69 5.39-5.26 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .5z"/></svg>GitHub</a>
+        <a target="_blank" rel="noopener noreferrer" class="btn" href="https://www.youtube.com/@v-racer"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M23.5 6.2a3 3 0 0 0-2.1-2.1C19.5 3.6 12 3.6 12 3.6s-7.5 0-9.4.5A3 3 0 0 0 .5 6.2 31 31 0 0 0 0 12a31 31 0 0 0 .5 5.8 3 3 0 0 0 2.1 2.1c1.9.5 9.4.5 9.4.5s7.5 0 9.4-.5a3 3 0 0 0 2.1-2.1A31 31 0 0 0 24 12a31 31 0 0 0-.5-5.8zM9.6 15.6V8.4l6.3 3.6-6.3 3.6z"/></svg>YouTube</a>
+        <a target="_blank" rel="noopener noreferrer" class="btn" href="https://discord.gg/sgE3VGprPc"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.86-.6 1.25a18.3 18.3 0 0 0-5.49 0 12.6 12.6 0 0 0-.62-1.25.08.08 0 0 0-.08-.04 19.7 19.7 0 0 0-4.88 1.52.07.07 0 0 0-.03.03C.53 9.05-.32 13.58.1 18.06a.08.08 0 0 0 .03.06 19.9 19.9 0 0 0 5.99 3.03.08.08 0 0 0 .09-.03c.46-.63.87-1.3 1.22-1.99a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13l.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01l.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.65-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 1.99a.08.08 0 0 0 .09.03 19.8 19.8 0 0 0 6-3.03.08.08 0 0 0 .03-.06c.5-5.18-.84-9.67-3.55-13.66a.06.06 0 0 0-.03-.03zM8.02 15.33c-1.18 0-2.16-1.09-2.16-2.42s.96-2.42 2.16-2.42c1.21 0 2.18 1.1 2.16 2.42 0 1.33-.96 2.42-2.16 2.42zm7.97 0c-1.18 0-2.15-1.09-2.15-2.42s.95-2.42 2.15-2.42c1.21 0 2.18 1.1 2.16 2.42 0 1.33-.95 2.42-2.16 2.42z"/></svg>Discord</a>
+        <button type="button" class="btn donate" id="donate-btn" aria-haspopup="dialog"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20.5s-8.5-5.2-8.5-11A4.75 4.75 0 0 1 12 6.6a4.75 4.75 0 0 1 8.5 2.9c0 5.8-8.5 11-8.5 11z"/></svg>Donate</button>
+      </div>
+    </div>
+    <div class="bar" role="progressbar" aria-label="Game loading" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress">
+      <div class="bar-fill" id="progress-fill"></div>
+    </div>
+  </header>
+
+  <div class="side">
+    <section class="panel hero" aria-label="Play">
+      <p class="status" id="status" role="status">Loading</p>
+      <p class="status-sub" id="status-sub">Loading the game.</p>
+      <button type="button" class="play" id="play" disabled>Play <kbd>Enter</kbd></button>
+      <ul class="problems" id="problems" aria-live="polite"></ul>
+    </section>
+
+    <section class="panel" aria-labelledby="controls-title" id="controls">
+      <h2 id="controls-title">Controls</h2>
+      <div class="tabs" role="tablist">
+        <button type="button" class="tab" role="tab" data-tab="keyboard">Keyboard</button>
+        <button type="button" class="tab" role="tab" data-tab="pad">Controller</button>
+        <button type="button" class="tab" role="tab" data-tab="touch">Touch</button>
+      </div>
+      <ul class="keys pane" data-tab="keyboard" role="tabpanel">
+        <li><span>Accelerate, brake and reverse</span><span><kbd>↑</kbd><kbd>↓</kbd></span></li>
+        <li><span>Steer</span><span><kbd>←</kbd><kbd>→</kbd></span></li>
+        <li><span>Handbrake</span><span><kbd>Space</kbd></span></li>
+        <li><span>Speed boost</span><span><kbd>Shift</kbd></span></li>
+        <li><span>Shift down, shift up (manual)</span><span><kbd>Z</kbd><kbd>X</kbd></span></li>
+        <li><span>Horn or siren</span><span><kbd>H</kbd></span></li>
+        <li><span>Change view, look back</span><span><kbd>C</kbd><kbd>Q</kbd></span></li>
+        <li><span>Reset car</span><span><kbd>R</kbd></span></li>
+        <li><span>Show or hide the HUD</span><span><kbd>Tab</kbd></span></li>
+        <li><span>Pause</span><span><kbd>Esc</kbd></span></li>
+        <li><span>Menus: choose, back, help</span><span><kbd>Enter</kbd><kbd>Esc</kbd><kbd>F1</kbd></span></li>
+        <li><span>Full screen</span><span><kbd>Alt</kbd><kbd>Enter</kbd></span></li>
+      </ul>
+      <ul class="keys pane" data-tab="pad" role="tabpanel" hidden>
+        <li><span>Accelerate</span><span><kbd>A</kbd><kbd>✕</kbd></span></li>
+        <li><span>Brake and reverse</span><span><kbd>X</kbd><kbd>□</kbd></span></li>
+        <li><span>Steer</span><span><kbd>Left stick</kbd></span></li>
+        <li><span>Handbrake</span><span><kbd>RB</kbd><kbd>R1</kbd></span></li>
+        <li><span>Speed boost</span><span><kbd>Right stick press</kbd></span></li>
+        <li><span>Shift down, shift up (manual)</span><span><kbd>LT</kbd><kbd>RT</kbd></span></li>
+        <li><span>Horn or siren</span><span><kbd>B</kbd><kbd>○</kbd></span></li>
+        <li><span>Change view, look back</span><span><kbd>Y</kbd><kbd>LB</kbd></span></li>
+        <li><span>Reset car</span><span><kbd>Back</kbd></span></li>
+        <li><span>Pause</span><span><kbd>Start</kbd></span></li>
+        <li><span>Menus: choose, back</span><span><kbd>A</kbd><kbd>B</kbd></span></li>
+      </ul>
+      <ul class="keys pane" data-tab="touch" role="tabpanel" hidden>
+        <li><span>Accelerate, brake and reverse (a finger slides from one to the other)</span><span><kbd>Gas</kbd><kbd>Brake</kbd></span></li>
+        <li><span>Steer</span><span><kbd>◀</kbd><kbd>▶</kbd></span></li>
+        <li><span>Handbrake</span><span><kbd>Handbrake</kbd></span></li>
+        <li><span>Shift down, shift up (manual)</span><span><kbd>−</kbd><kbd>+</kbd></span></li>
+        <li><span>Change view, look back, horn, reset car</span><span><kbd>Camera</kbd><kbd>Look back</kbd><kbd>Horn</kbd><kbd>Reset</kbd></span></li>
+        <li><span>Pause, full screen</span><span><kbd>❚❚</kbd><kbd>⛶</kbd></span></li>
+        <li><span>Menus: tap them, or</span><span><kbd>◀</kbd><kbd>▲</kbd><kbd>▼</kbd><kbd>▶</kbd><kbd>OK</kbd><kbd>Back</kbd></span></li>
+        <li><span>A profile's name</span><span>the phone's keyboard</span></li>
+      </ul>
+      <p class="hint">Plug in a controller and press one of its buttons. Keys and buttons can be changed in the game: Options, Controls.
+        On a phone or tablet the touch controls show over the game: held sideways it fills the screen, upright the picture is on top.</p>
+    </section>
+  </div>
+
+  <div class="content">
+    <section class="panel" aria-label="Saves, game data and graphics" id="manage">
+      <div class="tabs" role="tablist">
+        <button type="button" class="tab" role="tab" data-tab="saves">Saves</button>
+        <button type="button" class="tab" role="tab" data-tab="data">Data</button>
+        <button type="button" class="tab" role="tab" data-tab="graphics">Graphics</button>
+      </div>
+      <div class="pane" data-tab="saves" role="tabpanel">
+      <div class="panel-head pane-head">
+        <div class="row">
+          <button type="button" class="btn" id="backup">Download backup</button>
+          <button type="button" class="btn" id="restore">Restore</button>
+          <input type="file" id="restore-file" accept=".zip,application/zip" hidden>
+        </div>
+      </div>
+      <p class="box" id="profiles-none">No profiles yet. Make one in the game: it is saved in this browser.</p>
+      <ul class="profiles" id="profiles"></ul>
+      <p class="msg" id="saves-msg" hidden></p>
+      <p class="hint">Your profiles and settings stay in this browser, never on the server. A backup keeps them safe, or takes them to another browser.</p>
+    
+      </div>
+      <div class="pane" data-tab="data" role="tabpanel">
+      <div class="panel-head pane-head">
+        <div class="row">
+          <button type="button" class="text-btn" id="data-remove" hidden>Remove</button>
+          <button type="button" class="btn" id="preload" disabled>Preload the game data</button>
+        </div>
+      </div>
+      <div class="bar small"><div class="bar-fill" id="data-fill"></div></div>
+      <p class="data-text" id="data-text">&nbsp;</p>
+      <p class="msg bad" id="data-msg" hidden></p>
+      <p class="hint">Preloaded, the game reads its tracks, cars and music from this device instead of the server: no waiting on a slow
+        connection. Play stops the download; what came stays, and Preload fetches the rest later.</p>
+      <p class="hint" id="data-local" hidden>You are playing from this computer's own server, so there is little to gain here.</p>
+    
+      </div>
+      <div class="pane" id="graphics" data-tab="graphics" role="tabpanel">
+      <div class="panel-head pane-head">
+        <button type="button" class="text-btn" id="graphics-reset">Reset all</button>
+      </div>
+      <p class="hint gfx-intro">The game's own Options, Graphics, here before you play. A change applies at the next Play; in the game you change the
+        same things the same way, and the two stay in step. Saved in this browser.</p>
+      <div id="graphics-groups"></div>
+      <p class="msg" id="graphics-msg" hidden></p>
+      <div id="blur-wrap" class="gfx-row gfx-page-option">
+        <div class="gfx-text">
+          <label class="check"><input type="checkbox" id="blur-sides"><span>Blurred bars beside the menus <em class="tag">Experimental</em></span></label>
+          <p class="hint gfx-help">The race fills a wide window, but the menus keep the shape they were made in, 4:3, so a wide window has bars on both
+            sides. This fills them with a soft copy of the menu instead of black. Off by default: it may not look right everywhere, and a movie's own
+            dark edge can show against it.</p>
+        </div>
+      </div>
+    
+      </div>
+    </section>
+
+    <section class="panel" aria-label="About this project" id="about">
+      <div class="tabs" role="tablist">
+        <button type="button" class="tab" role="tab" data-tab="about">About</button>
+        <button type="button" class="tab" role="tab" data-tab="credits">Credits</button>
+      </div>
+      <div class="pane prose" data-tab="about" role="tabpanel">
+        <p><i>Need for Speed: Hot Pursuit 2</i> (2002), the PlayStation 2 version, in your browser. The game's own code is translated to
+          C++ ahead of time and compiled to WebAssembly; WebGPU draws it and Web Audio plays it.</p>
+        <p>The driving is the console's: the demo races recorded in the game replay with every one of their checks matching.</p>
+        <p>Needs the latest Chrome or Edge on a computer, or the latest Chrome on an Android phone.</p>
+        <p>The site counts visits, plays and time played to see how it is doing: no cookies, and no addresses or anything about you
+          kept.</p>
+      </div>
+      <div class="pane prose" data-tab="credits" role="tabpanel" hidden>
+        <p>Made by Vitorini: <a target="_blank" rel="noopener noreferrer" href="https://github.com/vitorinii">GitHub</a>, <a target="_blank" rel="noopener noreferrer" href="https://www.youtube.com/@v-racer">YouTube</a>.
+          The source code is on GitHub: <a target="_blank" rel="noopener noreferrer" href="https://github.com/vitorinii/nfshp2-web">vitorinii/nfshp2-web</a>.</p>
+        <p>Built on ZloiKILLER's <a href="https://github.com/ZloiKILLER/nfshp2-port-win" target="_blank" rel="noopener noreferrer">nfshp2-port-win</a>,
+          the static recompilation of the game and its PC runtime.</p>
+        <p>The browser side follows th0mk's <a href="https://github.com/th0mk/nfsu2-web" target="_blank" rel="noopener noreferrer">nfsu2-web</a>,
+          Need for Speed: Underground 2 in the browser.</p>
+        <p><i>Need for Speed</i> and <i>Hot Pursuit</i> are trademarks of Electronic Arts Inc.</p>
+      </div>
+    </section>
+  </div>
+</main>
+
+<dialog class="dlg" id="donate" aria-labelledby="donate-title">
+  <form method="dialog">
+    <h2 id="donate-title">Support the project</h2>
+    <p>Keeping the server running and making mods takes time and money. If you'd like to help, you can buy me a coffee on Ko-fi.
+      The game is the same for everyone: nothing is sold and nothing is locked behind a donation. Supporters get a role on the
+      Vitorini Mods Discord.</p>
+    <div class="row end">
+      <button class="btn" value="close">Not now</button>
+      <a class="btn go" id="donate-go" href="https://ko-fi.com/vracer" target="_blank" rel="noopener noreferrer">Donate on Ko-fi</a>
+    </div>
+  </form>
+</dialog>
+
+<div id="stage" hidden>
+  <canvas id="screen" tabindex="0"></canvas>
+  <div id="hud" class="hud"></div>
+  <p id="note" class="note" role="status" hidden>A new version is out: the next Play loads it. Your saves stay.</p>
+  <!-- touch controls (touch.js): data-b is the controller part each one holds; data-scene picks the driving or the menus' set -->
+  <input id="type-box" class="type-box" type="text" autocomplete="off" autocapitalize="words" autocorrect="off" spellcheck="false"
+    enterkeyhint="done" maxlength="40" aria-label="The name to type" tabindex="-1">
+  <div id="touch" class="touch" data-scene="menu" hidden>
+    <button type="button" tabindex="-1" class="t-btn t-small t-kbd" data-b="ui-kbd" hidden>Keyboard</button>
+    <div class="t-row t-tl">
+      <button type="button" tabindex="-1" class="t-btn t-small" data-b="start" aria-label="Pause"><svg viewBox="0 0 24 24"><path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z"/></svg></button>
+      <button type="button" tabindex="-1" class="t-btn t-small" data-b="ui-full" aria-label="Full screen"><svg viewBox="0 0 24 24"><path d="M4 9V4h5v2H6v3zM15 4h5v5h-2V6h-3zM20 15v5h-5v-2h3v-3zM9 20H4v-5h2v3h3z"/></svg></button>
+    </div>
+    <div class="t-drive">
+      <div class="t-row t-tr">
+        <button type="button" tabindex="-1" class="t-btn t-small" data-b="view">Camera</button>
+        <button type="button" tabindex="-1" class="t-btn t-small" data-b="look">Look back</button>
+        <button type="button" tabindex="-1" class="t-btn t-small" data-b="horn">Horn</button>
+        <button type="button" tabindex="-1" class="t-btn t-small" data-b="reset">Reset</button>
+      </div>
+      <div class="t-steer">
+        <div class="t-gears">
+          <button type="button" tabindex="-1" class="t-btn t-gear" data-b="gearDown" aria-label="Shift down">−</button>
+          <button type="button" tabindex="-1" class="t-btn t-gear" data-b="gearUp" aria-label="Shift up">+</button>
+        </div>
+        <div class="t-arrows">
+          <button type="button" tabindex="-1" class="t-btn t-arrow" data-b="left" aria-label="Steer left"><svg viewBox="0 0 24 24"><path d="M16 4v16L5 12z"/></svg></button>
+          <button type="button" tabindex="-1" class="t-btn t-arrow" data-b="right" aria-label="Steer right"><svg viewBox="0 0 24 24"><path d="M8 4v16l11-8z"/></svg></button>
+        </div>
+      </div>
+      <div class="t-pedals">
+        <button type="button" tabindex="-1" class="t-btn t-hand" data-b="hand">Handbrake</button>
+        <button type="button" tabindex="-1" class="t-btn t-brake" data-b="brake">Brake</button>
+        <button type="button" tabindex="-1" class="t-btn t-gas" data-b="gas">Gas</button>
+      </div>
+    </div>
+    <div class="t-menu">
+      <div class="t-dpad">
+        <button type="button" tabindex="-1" class="t-btn t-d t-up" data-b="up" aria-label="Up"><svg viewBox="0 0 24 24"><path d="M4 16h16L12 5z"/></svg></button>
+        <button type="button" tabindex="-1" class="t-btn t-d t-left" data-b="mleft" aria-label="Left"><svg viewBox="0 0 24 24"><path d="M16 4v16L5 12z"/></svg></button>
+        <button type="button" tabindex="-1" class="t-btn t-d t-right" data-b="mright" aria-label="Right"><svg viewBox="0 0 24 24"><path d="M8 4v16l11-8z"/></svg></button>
+        <button type="button" tabindex="-1" class="t-btn t-d t-down" data-b="down" aria-label="Down"><svg viewBox="0 0 24 24"><path d="M4 8h16l-8 11z"/></svg></button>
+      </div>
+      <div class="t-okback">
+        <button type="button" tabindex="-1" class="t-btn t-back" data-b="cancel">Back</button>
+        <button type="button" tabindex="-1" class="t-btn t-ok" data-b="ok">OK</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script type="module" src="main.js"></script>
+</body>
+</html>
