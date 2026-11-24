@@ -216,6 +216,16 @@ As outlined in the overview, OutputStreamNode requires external audio samples. T
 
 **Note**: Any data passed from the UI thread to the Worker (such as fillerParams in the WorkerBufferNodeParams<T>) must be serializable (e.g., primitives, arrays, objects). Non-serializable values like functions or DOM elements cannot be passed.
 
+### Stopping a Stream
+
+`OutputStreamNode.stop()` completes a full teardown regardless of how playback ends. The same cleanup runs exactly once whether you call `stop()` yourself, call it on a node that has not started yet, or the filler reports completion on its own (by returning `false` or throwing):
+
+- The fill timer used by the Timed strategy is cleared.
+- The Worker used by the Worker strategy is asked to stop, answers with an acknowledgement, and is then terminated. A stop requested before the Worker finishes initializing is also acknowledged, so the main thread never waits forever.
+- The node is disconnected, its message port is closed, and a single `StopEvent` is dispatched.
+
+Calling `stop()` again, including while a stop is still in progress, returns the same promise; it never dispatches a second `StopEvent` and never throws. The returned promise resolves only after the resources above have been released, so it is safe to immediately create and start the next stream.
+
 ### Buffer Underrun Handling
 
 - When the buffer becomes empty, silent audio is output instead of throwing an error.

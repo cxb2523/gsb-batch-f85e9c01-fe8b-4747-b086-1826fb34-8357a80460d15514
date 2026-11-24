@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Stopping a stream now performs a complete, one-time teardown. Previously the Timed strategy left its `setInterval` running after the node stopped, and the Worker strategy did not terminate its Worker when the node was stopped externally or when the filler finished on its own. Repeated starts could therefore leave several fillers writing to the same buffer, producing overlapping audio and rising CPU load.
+- `OutputStreamNode.stop()` now clears the timer / terminates the Worker / closes the port through a single path that dispatches `StopEvent` exactly once. Repeated calls, including calls made while stopping is still in progress, return the same promise instead of dispatching another event or throwing.
+- The Worker now stops its timer and acknowledges a stop request before the main thread terminates it. A stop received before the Worker finishes initialization is acknowledged immediately, so initialization no longer hangs. A filler that throws inside the Worker is treated as the end of playback.
+- The Timed strategy routes a throwing filler through its normal cleanup path before stopping the node.
+- A `stop()` on a node that was never started now releases its resources and reports `0` frames through `StopEvent`.
+- A failed strategy initialization now releases the resources it may have acquired instead of leaving the Worker running.
+
+### Changed
+
+- `BufferWriteStrategy.onStopped()` may now return a promise; the node waits for it before completing the stop. Existing implementations that return `void` keep working unchanged.
+
 ## [2.0.3] - 2026-11-20
 
 ### Changed

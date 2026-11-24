@@ -20,7 +20,9 @@ export interface BufferWriteStrategy {
   onStart(node: OutputStreamNode): boolean
 
   /**
-   * Stops the strategy.
+   * Stops the strategy and releases everything it owns (timers, workers, ports).
+   * Implementations must be idempotent: calling this more than once must not throw.
+   * When a promise is returned, the node waits for it before completing the stop.
    */
-  onStopped(): void
+  onStopped(): void | Promise<void>
 }

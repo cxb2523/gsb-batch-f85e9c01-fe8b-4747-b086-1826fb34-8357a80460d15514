@@ -4,6 +4,13 @@ import type { MessageToStrategy, MessageToWorker } from './worker/message'
 import type { OutputStreamNode } from '../output-stream-node'
 
 /**
+ * Maximum time to wait for the worker to acknowledge a stop request.
+ * The worker normally answers immediately; this guard only prevents the main thread
+ * from waiting forever if the worker is unresponsive or has already died.
+ */
+const STOP_ACKNOWLEDGEMENT_TIMEOUT_MS = 1000
+
+/**
  * Parameters for creating a PlayContext.
  * @property node - The OutputStreamNode instance.
  * @property context - The FillerFrameBufferContext instance.
@@ -26,6 +33,10 @@ class Context<FillerParams> {
   private readonly _bufferContext: FillerFrameBufferContext
   private readonly _fillerParam: FillerParams
   private readonly _worker: Worker
+  private _stopPromise: Promise<void> | null = null
+  private _resolveStop: (() => void) | null = null
+  private _stopTimerId: number = 0
+  private _terminated = false
 
   /**
    * Creates an instance of PlayContext.
@@ -43,10 +54,14 @@ class Context<FillerParams> {
    * Creates and initializes an instance of PlayContext.
    * @param params - The parameters for the PlayContext.
    * @returns A promise that resolves to an instance of PlayContext.
+   * @throws Error - If the worker was stopped before initialization completed.
    */
   public static async create<FillerParams>(params: PlayerContextParams<FillerParams>) {
     const instance = new Context(params)
-    await instance.init()
+    if (!(await instance.init())) {
+      instance.finish()
+      throw new Error('Worker was stopped before initialization completed.')
+    }
     return instance
   }
 
@@ -55,30 +70,43 @@ class Context<FillerParams> {
    * @param ev - The message event from the worker.
    */
   private handleWorkerMessage(ev: MessageEvent<MessageToStrategy>): void {
-    if (ev.data.type === 'stop') {
-      this._node.stop(ev.data.stopFrames)
+    switch (ev.data.type) {
+      case 'stop':
+        void this._node.stop(ev.data.stopFrames)
+        break
+      case 'stop-done':
+        this.finish()
+        break
+      default:
+        break
     }
   }
 
   /**
    * Initializes the PlayContext by sending the 'init' message to the worker.
-   * @returns A promise that resolves when initialization is complete.
+   * Resolves with false when the worker acknowledged a stop before initialization
+   * completed, so the caller does not wait for a message that will never arrive.
+   * @returns A promise that resolves to true when initialization is complete.
    */
-  private init() {
-    return new Promise<void>((resolve) => {
+  private init(): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
       const message: MessageToWorker<FillerParams> = {
         type: 'init',
         config: this._bufferContext,
         fillerParams: this._fillerParam,
       }
-      this._worker.postMessage(message)
       const listener = (ev: MessageEvent<MessageToStrategy>) => {
         if (ev.data.type === 'init-done') {
           this._worker.removeEventListener('message', listener)
-          resolve()
+          resolve(true)
+        }
+        else if (ev.data.type === 'stop-done') {
+          this._worker.removeEventListener('message', listener)
+          resolve(false)
         }
       }
       this._worker.addEventListener('message', listener)
+      this._worker.postMessage(message)
     })
   }
 
@@ -86,6 +114,9 @@ class Context<FillerParams> {
    * Starts the buffer filling process by sending the 'start' message to the worker.
    */
   public start() {
+    if (this._terminated) {
+      return
+    }
     const message: MessageToWorker<FillerParams> = {
       type: 'start',
     }
@@ -93,11 +124,47 @@ class Context<FillerParams> {
   }
 
   /**
-   * Stops the worker and terminates it.
+   * Stops the worker: requests a stop, waits for the worker acknowledgement,
+   * then terminates it. Repeated calls reuse the same promise and never throw.
+   * A worker that is already fully initialized answers the stop request directly;
+   * the acknowledgement is always resolved through {@link finish}, so a late
+   * message after termination cannot settle the promise twice.
    */
-  public stopped() {
+  public stopped(): Promise<void> {
+    if (this._stopPromise) {
+      return this._stopPromise
+    }
+    this._stopPromise = new Promise<void>((resolve) => {
+      this._resolveStop = resolve
+      if (this._terminated) {
+        resolve()
+        return
+      }
+      const message: MessageToWorker<FillerParams> = { type: 'stop' }
+      this._worker.postMessage(message)
+      this._stopTimerId = window.setTimeout(() => this.finish(), STOP_ACKNOWLEDGEMENT_TIMEOUT_MS)
+    })
+    return this._stopPromise
+  }
+
+  /**
+   * Terminates the worker and settles the stop promise.
+   * This is idempotent so that a late acknowledgement after termination is harmless.
+   */
+  private finish(): void {
+    if (this._terminated) {
+      return
+    }
+    this._terminated = true
+    if (this._stopTimerId) {
+      window.clearTimeout(this._stopTimerId)
+      this._stopTimerId = 0
+    }
     this._worker.onmessage = null
     this._worker.terminate()
+    const resolve = this._resolveStop
+    this._resolveStop = null
+    resolve?.()
   }
 }
 
@@ -108,6 +175,8 @@ class Context<FillerParams> {
 export class WorkerBufferWriteStrategy<FillerParam> implements BufferWriteStrategy {
   private readonly _createPlayContext: (node: OutputStreamNode) => Promise<Context<FillerParam>>
   private _context: Context<FillerParam> | null = null
+  private _contextPromise: Promise<Context<FillerParam>> | null = null
+  private _stopped = false
 
   /**
    * Creates an instance of WorkerBufferWriteStrategy.
@@ -121,11 +190,33 @@ export class WorkerBufferWriteStrategy<FillerParam> implements BufferWriteStrate
 
   /**
    * Initializes the strategy.
+   * When the strategy is stopped before initialization completes, the worker is
+   * terminated and this method reports failure instead of leaving it running.
    * @param node - The OutputStreamNode instance.
    * @returns A promise that resolves to true when initialization is complete.
    */
   async onInit(node: OutputStreamNode): Promise<boolean> {
-    this._context = await this._createPlayContext(node)
+    if (this._stopped) {
+      return false
+    }
+    const contextPromise = this._createPlayContext(node)
+    this._contextPromise = contextPromise
+    let context: Context<FillerParam>
+    try {
+      context = await contextPromise
+    }
+    catch (error) {
+      if (this._stopped) {
+        return false
+      }
+      throw error
+    }
+    if (this._stopped) {
+      // A stop request arrived while the worker was still initializing.
+      await context.stopped()
+      return false
+    }
+    this._context = context
     return true
   }
 
@@ -143,12 +234,28 @@ export class WorkerBufferWriteStrategy<FillerParam> implements BufferWriteStrate
   }
 
   /**
-   * Stops the strategy.
+   * Stops the strategy by stopping and terminating its worker.
+   * This is idempotent and also covers a stop requested while initialization
+   * is still in flight: the pending worker is stopped as soon as it is ready.
    */
-  onStopped(): void {
-    if (!this._context) {
-      throw new Error('Invalid state: context is null.')
+  async onStopped(): Promise<void> {
+    this._stopped = true
+    const context = this._context
+    this._context = null
+    if (context) {
+      await context.stopped()
+      return
     }
-    this._context.stopped()
+    const pending = this._contextPromise
+    if (!pending) {
+      return
+    }
+    try {
+      const pendingContext = await pending
+      await pendingContext.stopped()
+    }
+    catch {
+      // The pending initialization failed on its own; nothing is left to release.
+    }
   }
 }

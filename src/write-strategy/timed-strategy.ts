@@ -10,6 +10,9 @@ import type { OutputStreamNode } from '../output-stream-node'
  */
 class PlayContext {
   private _timerId: number = 0
+  private readonly _node: OutputStreamNode
+  private readonly _writer: FrameBufferWriter
+  private readonly _filler: FrameBufferFiller
 
   /**
    * Creates an instance of PlayContext.
@@ -19,20 +22,35 @@ class PlayContext {
    * @param fillInterval - The interval in milliseconds for filling the buffer.
    */
   constructor(node: OutputStreamNode, writer: FrameBufferWriter, filler: FrameBufferFiller, fillInterval: number) {
-    this._timerId = window.setInterval(() => {
-      if (!this._timerId || !node.isStart) {
-        return
-      }
-      try {
-        if (!filler.fill(writer)) {
-          node.stop(writer.totalFrames)
-        }
-      }
-      catch {
+    this._node = node
+    this._writer = writer
+    this._filler = filler
+    this._timerId = window.setInterval(() => this.onTick(), fillInterval)
+  }
+
+  /**
+   * Runs a single fill step.
+   * Every terminal outcome (filler returned false, filler threw, or the node is no
+   * longer playing) goes through the same cleanup path so no timer is left behind.
+   */
+  private onTick(): void {
+    if (!this._timerId) {
+      return
+    }
+    if (!this._node.isStart) {
+      this.cleanup()
+      return
+    }
+    try {
+      if (!this._filler.fill(this._writer)) {
         this.cleanup()
-        node.stop()
+        void this._node.stop(this._writer.totalFrames)
       }
-    }, fillInterval)
+    }
+    catch {
+      this.cleanup()
+      void this._node.stop()
+    }
   }
 
   /**
@@ -40,7 +58,7 @@ class PlayContext {
    */
   public cleanup() {
     if (this._timerId) {
-      clearInterval(this._timerId)
+      window.clearInterval(this._timerId)
       this._timerId = 0
     }
   }
@@ -95,6 +113,7 @@ export class TimedBufferWriteStrategy implements BufferWriteStrategy {
 
   /**
    * Stops the strategy.
+   * This is idempotent so that repeated stop requests do not leave a timer behind.
    */
   onStopped(): void {
     this._context?.cleanup()

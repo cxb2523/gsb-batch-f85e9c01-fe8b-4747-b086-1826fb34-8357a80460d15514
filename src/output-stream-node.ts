@@ -28,6 +28,9 @@ export class OutputStreamNode extends AudioWorkletNode {
   private readonly _totalReadFrames: BigUint64Array
   private readonly _strategy: BufferWriteStrategy
   private _state: StreamState = 'ready'
+  private _stopPromise: Promise<void> | null = null
+  private _stopResolve: (() => void) | null = null
+  private _finalized = false
 
   /**
    * Creates an instance of OutputStreamNode.
@@ -60,7 +63,16 @@ export class OutputStreamNode extends AudioWorkletNode {
    */
   public static async create(audioContext: BaseAudioContext, context: FrameBufferContext, strategy: BufferWriteStrategy): Promise<OutputStreamNode> {
     const node = new OutputStreamNode(audioContext, context, strategy)
-    if (!(await strategy.onInit(node))) {
+    let initialized = false
+    try {
+      initialized = await strategy.onInit(node)
+    }
+    catch (error) {
+      node.abortInitialization()
+      throw error
+    }
+    if (!initialized) {
+      node.abortInitialization()
       throw new Error('Failed to onInit.')
     }
     return node
@@ -102,26 +114,24 @@ export class OutputStreamNode extends AudioWorkletNode {
    */
   public stop(framePosition: bigint = BigInt(0)): Promise<void> {
     switch (this._state) {
-      case 'started':
-        return new Promise((resolve) => {
-          this._state = 'stopping'
-          const message: MessageToProcessor = { type: 'stop', framePosition: framePosition }
-          this.port.postMessage(message)
-          this.addEventListener(StopEvent.type, () => {
-            resolve()
-          }, { once: true })
-        })
+      case 'started': {
+        const message: MessageToProcessor = { type: 'stop', framePosition: framePosition }
+        this._state = 'stopping'
+        this.ensureStopPromise()
+        this.port.postMessage(message)
+        return this._stopPromise!
+      }
       case 'ready':
-        this.handleStopped()
-        break
+        // The node never played, so its playback position is still 0.
+        return this.finalize(this.totalReadFrames)
       case 'stopped':
-        break
+        return this._stopPromise ?? Promise.resolve()
       case 'stopping':
-        break
+        // Reuse the pending stop promise so that repeated calls do not dispatch StopEvent again.
+        return this._stopPromise ?? Promise.resolve()
       default:
         throw new Error(`Cannot stop playback. Current state: ${this._state}`)
     }
-    return Promise.resolve()
   }
 
   /**
@@ -131,8 +141,7 @@ export class OutputStreamNode extends AudioWorkletNode {
   private handleMessage(event: MessageEvent<MessageToAudioNode>): void {
     switch (event.data.type) {
       case 'stop':
-        this.handleStopped()
-        this.dispatchEvent(new StopEvent(event.data.totalProcessedFrames))
+        void this.finalize(event.data.totalProcessedFrames)
         break
       case 'underrun':
         this.dispatchEvent(new UnderrunEvent(event.data.underrunFrameCount))
@@ -143,15 +152,99 @@ export class OutputStreamNode extends AudioWorkletNode {
   }
 
   /**
-   * Handles the stopping of the node.
-   * Disconnects the node and closes the port.
+   * Ensures that a single stop promise exists for this node.
    */
-  private handleStopped() {
-    this._strategy.onStopped()
-    this.disconnect()
-    this.port.close()
-    this.port.onmessage = null
+  private ensureStopPromise(): void {
+    if (!this._stopPromise) {
+      this._stopPromise = new Promise<void>((resolve) => {
+        this._stopResolve = resolve
+      })
+    }
+  }
+
+  /**
+   * Releases the node after a failed initialization.
+   * The node never started and never played, so no {@link StopEvent} is dispatched;
+   * only the acquired resources are released.
+   */
+  private abortInitialization(): void {
+    if (this._finalized) {
+      return
+    }
+    this._finalized = true
     this._state = 'stopped'
+    this.port.onmessage = null
+    try {
+      void Promise.resolve(this._strategy.onStopped()).catch(() => {
+        // Ignore teardown errors.
+      })
+    }
+    catch {
+      // Ignore teardown errors.
+    }
+    try {
+      this.disconnect()
+    }
+    catch {
+      // The node may already be disconnected.
+    }
+    this.port.close()
+  }
+
+  /**
+   * Performs the one-time teardown of the node and settles the stop promise.
+   * This releases the strategy resources (timers, workers, ...), disconnects the node,
+   * closes the port and dispatches {@link StopEvent} exactly once,
+   * no matter which path led here.
+   * Any subsequent invocation is a no-op that returns the same promise.
+   * @param stoppedAtFrame - The frame position reported by the StopEvent.
+   * @returns A promise that resolves when the teardown is complete.
+   */
+  private finalize(stoppedAtFrame: bigint): Promise<void> {
+    this.ensureStopPromise()
+    if (this._finalized) {
+      return this._stopPromise!
+    }
+    this._finalized = true
+    this._state = 'stopped'
+    this.port.onmessage = null
+
+    const complete = () => {
+      try {
+        this.disconnect()
+      }
+      catch {
+        // The node may already be disconnected.
+      }
+      this.port.close()
+      const resolve = this._stopResolve
+      this._stopResolve = null
+      this.dispatchEvent(new StopEvent(stoppedAtFrame))
+      resolve?.()
+    }
+
+    let teardown: void | Promise<void>
+    try {
+      teardown = this._strategy.onStopped()
+    }
+    catch {
+      // Teardown errors must not prevent the node from reaching the stopped state.
+      teardown = undefined
+    }
+
+    if (teardown && typeof teardown.then === 'function') {
+      // A strategy with asynchronous teardown finishes the stop once it settles.
+      void teardown
+        .catch(() => {
+          // Ignore teardown errors.
+        })
+        .then(complete)
+    }
+    else {
+      complete()
+    }
+
+    return this._stopPromise!
   }
 
   /**

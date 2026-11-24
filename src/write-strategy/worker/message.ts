@@ -35,6 +35,9 @@ export type MessageToWorker<FillerParams>
  * For 'stop' messages:
  * @property stopFrames - The position in frames to stop at.
  *
+ * For 'stop-done' messages:
+ * Acknowledges that the worker has stopped its fill timer and is ready to be terminated.
+ *
  * Example:
  * ```typescript
  * const message: MessageToStrategy = {
@@ -46,3 +49,4 @@ export type MessageToWorker<FillerParams>
 export type MessageToStrategy
   = | { type: 'init-done' }
     | { type: 'stop', stopFrames: bigint }
+    | { type: 'stop-done' }
