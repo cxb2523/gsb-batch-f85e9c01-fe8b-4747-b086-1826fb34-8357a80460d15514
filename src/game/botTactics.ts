@@ -217,19 +217,27 @@ export function botObjective(actor:Actor,state:GameSnapshot,includePlayer=false,
   return {point:{x:lanes[(actor.id+state.round+cycle)%3],z:(cycle%2===0?1:-1)*(actor.team==='blue'?-14:14)},role:'patrol'};
  }
  const bomb=state.bomb,allies=state.actors.filter(a=>a.team===actor.team&&a.health>0);
+ if(bomb.status==='dropped'&&actor.faction==='t')return {point:bomb,role:'recover'};
  if(bomb.status==='planted'){
   if(actor.faction==='ct'){
+   // The bomb position is public once planted. Every defender still alive has
+   // the same duty: reach it and defuse. The nearest capable bot leads; the
+   // rest close in rather than patrolling or chasing a distant gunfight.
    const candidates=allies.filter(a=>includePlayer||!a.player||a.id===bomb.defuserId);
    const defuser=candidates.find(a=>a.id===bomb.defuserId)??candidates.sort((a,b)=>
     (Math.hypot(a.x-bomb.x,a.z-bomb.z)-(a.defuseKit?3:0))-(Math.hypot(b.x-bomb.x,b.z-bomb.z)-(b.defuseKit?3:0))||a.id-b.id)[0];
    if(defuser?.id===actor.id)return {point:bomb,role:'defuse'};
+   // Defenders who arrive after the chosen defuser keep their position and
+   // hold security, but their goal stays on the bomb so they never loop back
+   // to a spawn patrol far away from the objective.
+   const slot=allies.findIndex(a=>a.id===actor.id),angle=(slot/Math.max(3,allies.length))*Math.PI*2,radius=3+slot%2;
+   return {point:objectiveFloor({x:bomb.x+Math.cos(angle)*radius,y:bomb.y,z:bomb.z+Math.sin(angle)*radius}),role:'guard'};
   }
-  // 炸弹位置由规则公开；警戒点分散，避免所有人挤到炸弹上。
+  // Terrorists hold the planted bomb; position is public rule knowledge.
   const slot=allies.findIndex(a=>a.id===actor.id),angle=(slot/Math.max(3,allies.length))*Math.PI*2,radius=3+slot%2;
   return {point:objectiveFloor({x:bomb.x+Math.cos(angle)*radius,y:bomb.y,z:bomb.z+Math.sin(angle)*radius}),role:'guard'};
  }
  if(actor.faction==='t'){
-  if(bomb.status==='dropped')return {point:bomb,role:'recover'};
   const site=state.sites[state.round%state.sites.length];
   if(actor.hasBomb)return {point:site,role:'plant'};
   const carrier=allies.find(a=>a.hasBomb);
