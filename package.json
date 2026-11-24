@@ -1,0 +1,59 @@
+{
+  "name": "dittytoy",
+  "version": "1.0.8",
+  "description": "",
+  "keywords": [
+    "Web Audio",
+    "Web Audio API",
+    "Synthesis",
+    "Audio Synthesis",
+    "Algorithmic Composition",
+    "Algorave",
+    "Playback",
+    "Music",
+    "DSP",
+    "Signal Processing",
+    "Generative Music",
+    "Dittytoy",
+    "Sonic Pi",
+    "Supercollider"
+  ],
+  "repository": "git@github.com:reindernijhoff/dittytoy-package.git",
+  "author": "Reinder Nijhoff <reinder@infi.nl>",
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "dist/**/*",
+    "README.md"
+  ],
+  "main": "./dist/dittytoy.umd.cjs",
+  "module": "./dist/dittytoy.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/dittytoy.js",
+      "require": "./dist/dittytoy.umd.cjs",
+      "types": "./index.d.ts"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "clean": "shx rm -rf dist node_modules/.cache/.tsbuildinfo",
+    "prepare-publish": "tsx ./scripts/preparePublish.ts"
+  },
+  "devDependencies": {
+    "@types/shelljs": "^0.10.0",
+    "shelljs": "^0.10.0",
+    "shx": "^0.4.0",
+    "tsx": "^4.7.1",
+    "typescript": "^5.4.2",
+    "vite": "^7.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
