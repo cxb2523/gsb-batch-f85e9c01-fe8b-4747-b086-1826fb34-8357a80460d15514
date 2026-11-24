@@ -1,23 +1,22 @@
 import React, { useEffect } from 'react'
 import { AppContext } from '../../../context/AppContext'
-import { useAtom, useSetAtom } from 'jotai'
-import { deleteSpritesAction, selectedSpriteIdsState } from '../../../state/SpritesState'
+import { useSetAtom } from 'jotai'
+import { deleteSelectedSpritesAction } from '../../../state/SpritesState'
 import { useNotification } from '../../../hooks/useNotification'
 
 interface Props {}
 
 const DeleteListener = ({}: Props): React.JSX.Element => {
   const { hotkeys } = React.useContext(AppContext)
-  const [selectedSpriteIds, setSelectedSpriteIds] = useAtom(selectedSpriteIdsState)
   const notify = useNotification()
-  const deleteSprites = useSetAtom(deleteSpritesAction)
+  const deleteSelectedSprites = useSetAtom(deleteSelectedSpritesAction)
 
   const onDelete = () => {
-    const numberOfSprites = selectedSpriteIds.length
+    // The action reads the selection from state at dispatch time and removes
+    // the sprites from the canvas and the selection together.
+    const numberOfSprites = deleteSelectedSprites()
     if (numberOfSprites <= 0) return
 
-    deleteSprites(selectedSpriteIds)
-    setSelectedSpriteIds([])
     notify.success(`Deleted ${numberOfSprites} sprite${numberOfSprites > 1 ? 's' : ''}`)
   }
 

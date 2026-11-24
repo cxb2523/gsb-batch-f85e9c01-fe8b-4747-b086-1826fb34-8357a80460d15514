@@ -3,6 +3,7 @@ import { useAtom, useAtomValue } from 'jotai'
 import {
   selectedSpriteIdsState,
   spriteDatasWithId,
+  spriteIdsState,
   spriteMetasWithId,
 } from '../../../state/SpritesState'
 import { Box, Checkbox, Heading } from 'dracula-ui'
@@ -55,12 +56,19 @@ const getDerivedValues = (
   }
 }
 
-export const InspectorSection = (): React.JSX.Element => {
-  const [selectionId] = useAtomValue(selectedSpriteIdsState)
-  const [spriteData, setSpriteData] = useAtom(spriteDatasWithId(selectionId))
-  const spriteMeta = useAtomValue(spriteMetasWithId(selectionId))
+export const InspectorSection = (): React.JSX.Element | null => {
+  const selectedSpriteIds = useAtomValue(selectedSpriteIdsState)
+  const spriteIds = useAtomValue(spriteIdsState)
+  const selectionId = selectedSpriteIds[0]
+  // Only bind to a sprite that actually exists on the canvas.
+  // With no (valid) selection the inspector must not read or write any sprite.
+  const hasSelection = selectionId !== undefined && spriteIds.includes(selectionId)
+  const [spriteData, setSpriteData] = useAtom(spriteDatasWithId(selectionId ?? ''))
+  const spriteMeta = useAtomValue(spriteMetasWithId(selectionId ?? ''))
 
   const onChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!hasSelection) return
+
     const { id, value, checked, type } = e.target
     let newValue = type === 'checkbox' ? checked : value
 
@@ -71,6 +79,8 @@ export const InspectorSection = (): React.JSX.Element => {
       return newData
     })
   }
+
+  if (!hasSelection) return null
 
   return (
     <Section title="Inspector" color="pink" flexGrow={1} style={{ maxHeight: 'inherit' }}>

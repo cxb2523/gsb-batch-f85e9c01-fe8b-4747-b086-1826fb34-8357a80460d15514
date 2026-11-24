@@ -1,57 +1,32 @@
 import React, { useEffect } from 'react'
-import { useAtom, useAtomValue, useSetAtom } from 'jotai'
+import { useSetAtom } from 'jotai'
 import { AppContext } from '../../../context/AppContext'
-import {
-  allSpritesState,
-  copiedSpritesState,
-  selectedSpriteIdsState,
-  selectedSpritesState,
-} from '../../../state/SpritesState'
-import { v4 as uuidv4 } from 'uuid'
+import { copySpritesAction, pasteSpritesAction } from '../../../state/SpritesState'
 import { useNotification } from '../../../hooks/useNotification'
 
 interface Props {}
 
 const CopyAndPasteListener = ({}: Props): React.JSX.Element => {
   const { hotkeys } = React.useContext(AppContext)
-  const setAllSprites = useSetAtom(allSpritesState)
-  const setSelectedSpriteIds = useSetAtom(selectedSpriteIdsState)
-  const [copiedSprites, setCopiedSprites] = useAtom(copiedSpritesState)
-  const selectedSprites = useAtomValue(selectedSpritesState)
+  const copySprites = useSetAtom(copySpritesAction)
+  const pasteSprites = useSetAtom(pasteSpritesAction)
   const notify = useNotification()
 
   const onCopy = () => {
-    const numberOfSprites = selectedSprites.datas.length
+    // The action snapshots the current selection and returns how many it stored.
+    const numberOfSprites = copySprites()
     if (numberOfSprites <= 0) return
 
-    setCopiedSprites(selectedSprites)
     notify.success(`Copied ${numberOfSprites} sprite${numberOfSprites > 1 ? 's' : ''}`)
   }
 
   const onPaste = () => {
-    const numberOfSprites = copiedSprites.datas.length
-    if (numberOfSprites <= 0) return
+    // The action reads the clipboard at dispatch time, so there is no stale
+    // state captured in this closure.
+    const newIds = pasteSprites()
+    if (newIds.length <= 0) return
 
-    // Generate new IDs
-    const newIds = new Map<string, string>()
-    copiedSprites.datas.forEach((spriteData) => newIds.set(spriteData.id, uuidv4()))
-
-    // Create collection of copied sprites
-    const uniquelyCopiedSprites: Sprites = {
-      datas: copiedSprites.datas.map((d) => ({ ...d, id: newIds.get(d.id) as string })),
-      metas: copiedSprites.metas.map((m) => ({ ...m, id: newIds.get(m.id) as string })),
-    }
-
-    // Add the new copies to state
-    setAllSprites((allSprites) => ({
-      datas: [...allSprites.datas, ...uniquelyCopiedSprites.datas],
-      metas: [...allSprites.metas, ...uniquelyCopiedSprites.metas],
-    }))
-
-    // Select the new copies
-    setSelectedSpriteIds(uniquelyCopiedSprites.datas.map((d) => d.id))
-
-    notify.success(`Pasted ${numberOfSprites} sprite${numberOfSprites > 1 ? 's' : ''}`)
+    notify.success(`Pasted ${newIds.length} sprite${newIds.length > 1 ? 's' : ''}`)
   }
 
   useEffect(() => {
