@@ -27,8 +27,9 @@ if(!app.requestSingleInstanceLock()){app.quit()}else{
    }return cache.action(id,action);
   });
   handle('cache-concurrency',(value:number)=>cache.setConcurrency(value));
+  handle('cache-quality',(value:VideoQuality)=>cache.setQuality(value));
   handle('cache-limits',value=>cache.setLimits(value));handle('cache-priority',(id,priority)=>cache.setPriority(id,priority));
-  handle('video-quality',(quality:VideoQuality)=>{media.setQuality(quality);return true});
+  handle('video-quality',async(quality:VideoQuality)=>{await cache.setQuality(quality);return true});
   handle('diagnostics-export',async()=>{if(!window)throw new AppError('DIAGNOSTICS_WINDOW','请先打开主窗口');const selection=await dialog.showSaveDialog(window,{title:'导出脱敏诊断',defaultPath:'Hongguo-Manju-diagnostics.json',filters:[{name:'JSON 诊断文件',extensions:['json']}]});if(selection.canceled||!selection.filePath)return {saved:false};try{await writeFile(selection.filePath,JSON.stringify(diagnostics.snapshot(app.getVersion()),null,2));return {saved:true}}catch{throw new AppError('DIAGNOSTICS_WRITE','诊断文件无法保存，请选择其他位置')}});
   handle('cache-delete-watched',async()=>{
    if(!window)throw new AppError('CACHE_WINDOW','请先打开主窗口');const snapshot=await cache.snapshot(),tasks=snapshot.tasks.filter(task=>task.watched);if(!tasks.length)return snapshot;

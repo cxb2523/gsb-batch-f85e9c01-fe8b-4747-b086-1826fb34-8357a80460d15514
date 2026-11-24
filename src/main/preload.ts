@@ -3,7 +3,7 @@ const api:DesktopApi={
  bufferEpisodes:ids=>ipcRenderer.invoke('buffer-episodes',ids),
  bufferState:()=>ipcRenderer.invoke('buffer-state'),retryBuffer:()=>ipcRenderer.invoke('buffer-retry'),
  cacheState:()=>ipcRenderer.invoke('cache-state'),cacheAdd:id=>ipcRenderer.invoke('cache-add',id),cacheAction:(id,action)=>ipcRenderer.invoke('cache-action',id,action),
- cacheConcurrency:value=>ipcRenderer.invoke('cache-concurrency',value),cacheDeleteWatched:()=>ipcRenderer.invoke('cache-delete-watched'),recommendations:(id,refresh)=>ipcRenderer.invoke('recommendations',id,refresh),
+ cacheConcurrency:value=>ipcRenderer.invoke('cache-concurrency',value),cacheQuality:quality=>ipcRenderer.invoke('cache-quality',quality),cacheDeleteWatched:()=>ipcRenderer.invoke('cache-delete-watched'),recommendations:(id,refresh)=>ipcRenderer.invoke('recommendations',id,refresh),
  cacheLimits:value=>ipcRenderer.invoke('cache-limits',value),cachePriority:(id,priority)=>ipcRenderer.invoke('cache-priority',id,priority),videoQuality:quality=>ipcRenderer.invoke('video-quality',quality),exportDiagnostics:()=>ipcRenderer.invoke('diagnostics-export'),
  cacheChooseDirectory:()=>ipcRenderer.invoke('cache-directory'),cacheOpenDirectory:()=>ipcRenderer.invoke('cache-open-directory'),cacheCloseToTray:enabled=>ipcRenderer.invoke('cache-close-to-tray',enabled),
  onBackground:listener=>{const handler=(_event:Electron.IpcRendererEvent,background:boolean)=>listener(background);ipcRenderer.on('window-background',handler);return()=>{ipcRenderer.removeListener('window-background',handler)}},

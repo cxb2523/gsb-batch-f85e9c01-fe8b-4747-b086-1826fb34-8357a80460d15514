@@ -1,10 +1,12 @@
 import {mkdir,readFile,writeFile,rename,copyFile} from 'node:fs/promises';
 import {constants} from 'node:fs';import path from 'node:path';import {randomUUID} from 'node:crypto';
-import type {Series,CacheOverview,Progress,CacheLimits,CachePriority} from '../shared/types';import {MediaCache} from './media';import {validId} from './library';import {AppError} from './errors';
+import type {Series,CacheOverview,Progress,CacheLimits,CachePriority,VideoQuality} from '../shared/types';import {MediaCache} from './media';import {validId} from './library';import {AppError} from './errors';
 
 interface Task {series:Series;paused:boolean;createdAt:number;priority:CachePriority}
-interface Settings {version:1;directory:string;closeToTray:boolean;tasks:Task[];concurrency:number;knownSeries:Series[];limits:CacheLimits}
+interface Settings {version:1;directory:string;closeToTray:boolean;tasks:Task[];concurrency:number;knownSeries:Series[];limits:CacheLimits;quality:VideoQuality}
+const QUALITIES:VideoQuality[]=['auto','1080p','720p','540p','480p','360p'];
 const defaultLimits=():CacheLimits=>({maxGiB:20,bandwidthMiB:0});
+const cleanQuality=(value:unknown):VideoQuality=>QUALITIES.includes(value as VideoQuality)?value as VideoQuality:'auto';
 function cleanLimits(value:CacheLimits):CacheLimits{
  if(!value||!Number.isFinite(value.maxGiB)||value.maxGiB<0||value.maxGiB>10000||!Number.isFinite(value.bandwidthMiB)||value.bandwidthMiB<0||value.bandwidthMiB>1000)throw new AppError('INVALID_INPUT','缓存总额度须为 0–10000 GiB，总下载限速须为 0–1000 MiB/s；0 表示不限制');
  return {maxGiB:value.maxGiB,bandwidthMiB:value.bandwidthMiB};
@@ -25,11 +27,12 @@ function parse(source:string,profile:string):Settings{
  if(raw.knownSeries!==undefined&&(!Array.isArray(raw.knownSeries)||raw.knownSeries.length>100))throw Error('INVALID_CACHE_INDEX');
  const knownSeries=(raw.knownSeries??[]).map(cleanSeries);if(new Set(knownSeries.map((item:Series)=>item.id)).size!==knownSeries.length)throw Error('DUPLICATE_CACHE_INDEX');
  const limits=raw.limits===undefined?defaultLimits():cleanLimits(raw.limits);
- return {version:1,directory,closeToTray:raw.closeToTray,tasks,concurrency,knownSeries,limits};
+ const quality=cleanQuality(raw.quality);
+ return {version:1,directory,closeToTray:raw.closeToTray,tasks,concurrency,knownSeries,limits,quality};
 }
 export class CacheManager {
  private value:Settings;private pending:Promise<unknown>=Promise.resolve();private message='';private migrating=false;
- constructor(private profile:string,private media:MediaCache,private history:()=>Progress[]=()=>[]){this.value={version:1,directory:media.location,closeToTray:true,tasks:[],concurrency:4,knownSeries:[],limits:defaultLimits()}}
+ constructor(private profile:string,private media:MediaCache,private history:()=>Progress[]=()=>[]){this.value={version:1,directory:media.location,closeToTray:true,tasks:[],concurrency:4,knownSeries:[],limits:defaultLimits(),quality:'auto'}}
  static async directory(profile:string){try{return parse(await readFile(path.join(profile,'cache-settings.json'),'utf8'),profile).directory}catch{return path.join(profile,'media-cache')}}
  async init(){
   const file=path.join(this.profile,'cache-settings.json');await mkdir(this.profile,{recursive:true});
@@ -39,6 +42,8 @@ export class CacheManager {
     catch{throw new AppError('CACHE_SETTINGS','缓存设置无法读取或备份，请检查应用数据目录权限')}
    }
   }
+  // Restore the persisted quality without purging same-quality breakpoints.
+  this.media.restoreQuality?.(this.value.quality);
   this.sync();
  }
  get closeToTray(){return this.value.closeToTray}
@@ -48,9 +53,9 @@ export class CacheManager {
  async snapshot():Promise<CacheOverview>{
   let freeBytes=0;try{freeBytes=await this.media.freeBytes()}catch{}
   const history=new Map(this.history().map(item=>[item.seriesId,item]));
-  return {directory:this.media.location,freeBytes,usedBytes:this.media.usedBytes,migrating:this.migrating,closeToTray:this.closeToTray,message:this.message,concurrency:this.value.concurrency,limits:{...this.value.limits},bytesPerSecond:this.media.downloadBytesPerSecond,tasks:this.listedTasks().map(task=>({...structuredClone(task),watched:this.watched(task,history),state:this.media.stateFor(task.series.episodes.map(e=>e.id))}))};
+  return {directory:this.media.location,freeBytes,usedBytes:this.media.usedBytes,migrating:this.migrating,closeToTray:this.closeToTray,message:this.message,concurrency:this.value.concurrency,limits:{...this.value.limits},quality:this.media.quality??this.value.quality,bytesPerSecond:this.media.downloadBytesPerSecond,tasks:this.listedTasks().map(task=>({...structuredClone(task),watched:this.watched(task,history),state:this.media.stateFor(task.series.episodes.map(e=>e.id))}))};
  }
- private listedTasks(){return [...this.value.tasks.map(task=>({...task,registered:true})),...this.value.knownSeries.filter(series=>{if(this.value.tasks.some(task=>task.series.id===series.id))return false;const ids=series.episodes.map(e=>e.id),state=this.media.stateFor(ids);return state.ready>0||(state.cachedBytes||0)>0||this.media.hasDeletionPending?.(ids)}).map(series=>({series,paused:true,createdAt:0,registered:false}))]}
+ private listedTasks(){return [...this.value.tasks.map(task=>({...task,registered:true})),...this.value.knownSeries.filter(series=>{if(this.value.tasks.some(task=>task.series.id===series.id))return false;const ids=series.episodes.map(e=>e.id),state=this.media.stateFor(ids);return state.ready>0||(state.cachedBytes||0)>0||this.media.hasRetainedFiles?.(ids)||this.media.hasDeletionPending?.(ids)}).map(series=>({series,paused:true,createdAt:0,registered:false}))]}
  remember(series:Series){const clean=cleanSeries(series);return this.mutate(draft=>{draft.knownSeries=[...draft.knownSeries.filter(item=>item.id!==clean.id),clean].slice(-100)})}
  add(series:Series){const clean=cleanSeries(series);return this.mutate(draft=>{const task=draft.tasks.find(task=>task.series.id===clean.id);if(task){task.series=clean;return}if(draft.tasks.length>=100)throw new AppError('CACHE_LIMIT','最多添加 100 部缓存作品，请先移除已不需要的任务');draft.tasks.push({series:clean,paused:false,createdAt:Date.now(),priority:'normal'})})}
  private watched(task:{series:Series},history:Map<string,Progress>){const last=task.series.episodes.at(-1),progress=history.get(task.series.id);return !!(last&&progress&&progress.episodeId===last.id&&progress.order===last.order&&progress.duration>0&&progress.time/progress.duration>=.95)}
@@ -80,6 +85,15 @@ export class CacheManager {
  }
  async setConcurrency(value:number){if(![2,4,6].includes(value))throw new AppError('INVALID_INPUT','请选择 2、4 或 6 路并行准备');return this.mutate(draft=>{draft.concurrency=value})}
  async setLimits(value:CacheLimits){const limits=cleanLimits(value);return this.mutate(draft=>{draft.limits=limits})}
+ async setQuality(value:VideoQuality){
+  if(!QUALITIES.includes(value))throw new AppError('INVALID_INPUT','画质选项无效');
+  // Persist first: a settings write failure must not move the live media state.
+  await this.mutate(draft=>{draft.quality=value});
+  // Run the full media migration (cancel old jobs, clear failures and old
+  // breakpoints) before returning so the resulting snapshot is already settled.
+  await this.media.setQuality?.(value);
+  return this.snapshot();
+ }
  async setPriority(id:string,priority:CachePriority){if(!validId(id)||!validPriority(priority))throw new AppError('INVALID_INPUT','缓存任务优先级无效');return this.mutate(draft=>{const task=draft.tasks.find(item=>item.series.id===id);if(!task)throw new AppError('CACHE_TASK','缓存任务不存在');task.priority=priority})}
  setCloseToTray(enabled:boolean){if(typeof enabled!=='boolean')throw new AppError('INVALID_INPUT','关闭窗口设置无效');return this.mutate(draft=>{draft.closeToTray=enabled})}
  migrate(destination:string){

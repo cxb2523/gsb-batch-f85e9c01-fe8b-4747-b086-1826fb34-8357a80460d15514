@@ -22,7 +22,7 @@ export interface BufferState {
  activities?:{episodeId:string;activity?:CacheActivity}[];
 }
 export interface CacheTask { series:Series; paused:boolean; createdAt:number; state:BufferState; watched:boolean;registered:boolean;priority?:CachePriority }
-export interface CacheOverview { directory:string; freeBytes:number; usedBytes:number; migrating:boolean; tasks:CacheTask[]; closeToTray:boolean; message:string; concurrency:number; bytesPerSecond:number;limits?:CacheLimits }
+export interface CacheOverview { directory:string; freeBytes:number; usedBytes:number; migrating:boolean; tasks:CacheTask[]; closeToTray:boolean; message:string; concurrency:number; bytesPerSecond:number;limits?:CacheLimits;quality?:VideoQuality }
 export interface Result<T> { ok: boolean; data?: T; error?: { code: string; message: string } }
 export interface UpdateState {
  status: 'idle'|'checking'|'current'|'available'|'downloading'|'downloaded'|'installing'|'error'|'unsupported';
@@ -51,6 +51,7 @@ export interface DesktopApi {
  cacheDeleteWatched():Promise<Result<CacheOverview>>;
  cacheConcurrency(value:number):Promise<Result<CacheOverview>>;
  cacheLimits(limits:CacheLimits):Promise<Result<CacheOverview>>;
+ cacheQuality?(quality:VideoQuality):Promise<Result<CacheOverview>>;
  cachePriority(seriesId:string,priority:CachePriority):Promise<Result<CacheOverview>>;
  cacheChooseDirectory():Promise<Result<CacheOverview>>;
  cacheOpenDirectory():Promise<Result<boolean>>;

@@ -28,11 +28,13 @@ interface CacheEntry { key:string; file:string; episodeId:string; duration:numbe
 export interface BackgroundGroup {id:string;ids:string[];paused:boolean;priority?:CachePriority}
 // Older caches used lower-resolution-first selection and stronger compression.
 const CACHE_POLICY='highest-resolution-crf20-v1';
+const QUALITIES:VideoQuality[]=['auto','1080p','720p','540p','480p','360p'];
+const isQuality=(value:unknown):value is VideoQuality=>typeof value==='string'&&(QUALITIES as string[]).includes(value);
 interface MediaJob {
  id:string; force:boolean; foreground:boolean; controller:AbortController;
  progress?:CacheActivity;
  promise:Promise<Playback>; resolve:(value:Playback)=>void; reject:(error:unknown)=>void;
- completion?:Promise<void>;ready?:boolean;everReady?:boolean;progressivePlayback?:Playback;quality:VideoQuality;capacityBytes?:number;capacityCommitted?:boolean;processingActive?:boolean;
+ completion?:Promise<void>;ready?:boolean;everReady?:boolean;progressivePlayback?:Playback;quality:VideoQuality;generation:number;capacityBytes?:number;capacityCommitted?:boolean;processingActive?:boolean;
 }
 const CACHE_LIMIT=1024*1024*1024;
 const FILE_LIMIT=150*1024*1024;
@@ -65,7 +67,7 @@ export class MediaCache {
  private transfers=new Map<number,number>();
  private deletionMetadata=new Map<string,string>();
  private transferStarted=0;
- private quality:VideoQuality='auto';private maxBytes=0;private limiter=new TransferLimiter();private growing=new Map<string,GrowingMedia>();private partialBytes=new Map<string,number>();
+ quality:VideoQuality='auto';private qualityGeneration=0;private qualitySwitching=false;private qualitySwitch:Promise<void>|null=null;private maxBytes=0;private limiter=new TransferLimiter();private growing=new Map<string,GrowingMedia>();private partialBytes=new Map<string,number>();
  constructor(private directory:string,private ffmpeg:string,private getResource:(id:string,quality?:VideoQuality)=>Promise<Resource>,private options:{freeBytes?:()=>Promise<number>;concurrency?:number;diagnostics?:Diagnostics;progressive?:boolean}={}){}
  async init(){await mkdir(this.directory,{recursive:true});for(const name of await readdir(this.directory)){
   if(/^[a-f0-9]{32}\.json$/.test(name)){try{const e=JSON.parse(await readFile(path.join(this.directory,name),'utf8'));if(e.policy===CACHE_POLICY&&validId(e.episodeId)&&Number.isFinite(e.duration)&&e.duration>0&&typeof e.definition==='string'&&e.key===name.slice(0,32)){e.file=path.join(this.directory,e.key+'.mp4');const info=await stat(e.file);if(info.size>0&&info.size<=FILE_LIMIT){e.bytes=info.size;this.entries.set(e.episodeId,e)}}}catch{}}
@@ -92,7 +94,7 @@ export class MediaCache {
  stateFor(ids:string[]):BufferState{
   const total=ids.length,ready=ids.filter(id=>this.cached(id)).length;
   const failed=ids.filter(id=>!this.cached(id)&&this.failed.has(id)).length;
-  const activities=[...this.activeJobs].filter(job=>!job.controller.signal.aborted&&ids.includes(job.id)).map(job=>({episodeId:job.id,activity:job.progress?{...job.progress}:undefined}));
+  const activities=[...this.activeJobs].filter(job=>!job.controller.signal.aborted&&job.quality===this.quality&&ids.includes(job.id)).map(job=>({episodeId:job.id,activity:job.progress?{...job.progress}:undefined}));
   const activeId=activities[0]?.episodeId;
   const currentFailed=!this.groups.length&&this.failed.has(ids[0])&&!this.cached(ids[0]);
   const status:BufferState['status']=!total?'idle':ready===total?'complete':this.pausedMessage?'paused':currentFailed?'partial':activeId||ready+failed<total?'preparing':'partial';
@@ -126,7 +128,7 @@ export class MediaCache {
  private enqueue(id:string,force:boolean,foreground:boolean):MediaJob{
   let resolve!:MediaJob['resolve'],reject!:MediaJob['reject'];
   const promise=new Promise<Playback>((yes,no)=>{resolve=yes;reject=no});
-  const job:MediaJob={id,force,foreground,controller:new AbortController(),promise,resolve,reject,quality:this.quality};
+  const job:MediaJob={id,force,foreground,controller:new AbortController(),promise,resolve,reject,quality:this.quality,generation:this.qualityGeneration};
   this.jobs.set(id,job);
   // Background failures are isolated from playback and retried only on a later explicit request.
   void promise.catch(()=>{});return job;
@@ -143,7 +145,59 @@ export class MediaCache {
  private get concurrency(){return Math.max(1,Math.min(6,this.options.concurrency||1))}
  get downloadConcurrency(){return this.concurrency}
  private cached(id:string){const entry=this.entries.get(id);return entry&&(entry.quality??'auto')===this.quality?entry:undefined}
- setQuality(value:VideoQuality){if(!['auto','1080p','720p','540p','480p','360p'].includes(value))throw new AppError('INVALID_INPUT','画质选项无效');if(value===this.quality)return;this.quality=value;this.failed.clear();this.pausedMessage='';for(const job of this.jobs.values())this.cancel(job);this.pump()}
+ // Applies a persisted quality at startup. No jobs or breakpoints exist yet at
+ // that point, so this must not run the live-switch breakpoint purge.
+ restoreQuality(value:VideoQuality){if(!isQuality(value))throw new AppError('INVALID_INPUT','画质选项无效');this.quality=value}
+ // A quality switch is a complete state migration: every old-quality job is
+ // cancelled (and never retried or recorded as failed), failure/pause state is
+ // cleared, old breakpoints are removed, and the queue is pumped at the new
+ // quality once cancelled jobs have released their file handles.
+ setQuality(value:VideoQuality):Promise<void>{
+  if(!isQuality(value))throw new AppError('INVALID_INPUT','画质选项无效');
+  if(value===this.quality)return this.qualitySwitch??Promise.resolve();
+  this.quality=value;
+  const generation=++this.qualityGeneration;
+  this.failed.clear();this.pausedMessage='';
+  // Drop superseded breakpoint bytes from quota/snapshot accounting immediately.
+  this.partialBytes.clear();
+  this.qualitySwitching=true;
+  for(const job of new Set([...this.jobs.values(),...this.activeJobs]))this.cancel(job);
+  const transition=this.settleQualitySwitch(generation);
+  this.qualitySwitch=transition;
+  return transition;
+ }
+ private async settleQualitySwitch(generation:number){
+  try{
+   const jobs=[...new Set([...this.jobs.values(),...this.activeJobs])];
+   await Promise.allSettled(jobs.map(job=>job.completion??job.promise));
+   // A newer switch supersedes this one; its own settlement performs the purge.
+   if(generation!==this.qualityGeneration)return;
+   await this.purgeBreakpoints();
+  }finally{
+   if(generation===this.qualityGeneration){
+    this.qualitySwitching=false;this.qualitySwitch=null;this.pump();
+   }
+  }
+ }
+ // Breakpoint names are bound to (episode id, quality), so after a live switch
+ // every *.partial file belongs to a superseded quality and can never resume.
+ private async purgeBreakpoints(){
+  let names:string[]=[];
+  try{names=await readdir(this.directory)}catch{return}
+  for(const name of names){
+   if(!/^[a-f0-9]{32}\.partial\.(?:mp4|json)$/.test(name))continue;
+   await unlink(path.join(this.directory,name)).catch(()=>{});
+  }
+  // Reconcile with files that remain (e.g. locked on Windows) so quota accounting
+  // never drops real occupied bytes.
+  this.partialBytes.clear();
+  const rest=await readdir(this.directory).catch(()=>[] as string[]);
+  for(const name of rest){
+   if(!/^[a-f0-9]{32}\.partial\.mp4$/.test(name))continue;
+   const info=await stat(path.join(this.directory,name)).catch(()=>null);
+   if(info&&info.size>0)this.partialBytes.set(name,info.size);
+  }
+ }
  setLimits(value:{maxBytes:number;bytesPerSecond:number}){if(!value||!Number.isSafeInteger(value.maxBytes)||value.maxBytes<0||!Number.isSafeInteger(value.bytesPerSecond)||value.bytesPerSecond<0)throw new AppError('INVALID_INPUT','缓存额度或限速无效');const changed=this.maxBytes!==value.maxBytes;this.maxBytes=value.maxBytes;this.limiter.setRate(value.bytesPerSecond);if(changed&&this.pausedMessage.includes('缓存额度')){this.pausedMessage='';this.pump()}}
  setConcurrency(value:number){
   if(![2,4,6].includes(value))throw new AppError('INVALID_INPUT','请选择 2、4 或 6 路并行准备');
@@ -198,7 +252,19 @@ export class MediaCache {
  }
  get location(){return this.directory}
  get usedBytes(){return [...this.entries.values()].reduce((sum,entry)=>sum+(entry.bytes||0),0)+[...this.partialBytes.values()].reduce((sum,bytes)=>sum+bytes,0)}
- private retainedBytes(id:string){let bytes=this.entries.get(id)?.bytes||0;if(this.partialBytes.size)for(const quality of ['auto','1080p','720p','540p','480p','360p'] as const)bytes+=this.partialBytes.get(this.partialName(id,quality)+'.mp4')||0;return bytes}
+ private retainedBytes(id:string){
+  // Snapshot progress is quality-scoped: a completed file or breakpoint from an
+  // old quality must not masquerade as cached bytes for the current quality.
+  const entry=this.entries.get(id);
+  let bytes=entry&&(entry.quality??'auto')===this.quality?entry.bytes||0:0;
+  bytes+=this.partialBytes.get(this.partialName(id,this.quality)+'.mp4')||0;
+  return bytes;
+ }
+ // Whether any on-disk media (any quality or breakpoint generation) remains for
+ // the episodes, used to keep the read-only cleanup entry discoverable.
+ hasRetainedFiles(ids:string[]){
+  return ids.some(id=>this.entries.has(id)||QUALITIES.some(quality=>this.partialBytes.has(this.partialName(id,quality)+'.mp4')));
+ }
  // The quota covers projected retained files. Active source/working files are
  // additional temporary disk overhead; disk headroom and processor slots still apply.
  private projectedBytes(){let bytes=this.usedBytes;for(const job of this.activeJobs){if(job.controller.signal.aborted||job.capacityBytes===undefined)continue;bytes-=this.partialBytes.get(this.partialName(job.id,job.quality)+'.mp4')||0;if(!job.capacityCommitted)bytes+=job.capacityBytes-(this.entries.get(job.id)?.bytes||0)}return bytes}
@@ -231,7 +297,7 @@ export class MediaCache {
   finally{this.suspended=false;this.pump()}
  }
  private pump(){
-  if(this.closing||this.suspended)return;
+  if(this.closing||this.suspended||this.qualitySwitching)return;
   while(this.activeJobs.size<this.concurrency){
   let job=[...this.jobs.values()].find(job=>job.foreground&&!job.controller.signal.aborted&&!this.activeJobs.has(job)&&![...this.activeJobs].some(other=>other.id===job.id));
   if(!job&&!this.pausedMessage){
@@ -289,7 +355,7 @@ export class MediaCache {
    report({stage:'downloading',transferred:0,total:resource.size,percent:0});
    const downloadStart=Date.now(),fingerprint=createHash('sha256').update([resource.episodeId,resource.definition,resource.codec,resource.size,resource.encrypted,resource.spade||''].join(':')).digest('hex');
    const streamAllowed=this.options.progressive!==false&&firstAttempt&&!job.force;
-    await downloadMedia({url:resource.url,path:input,metadataPath:checkpoint,size:resource.size,fingerprint,signal,throttle:async(bytes,signal)=>{await this.limiter.consume(bytes,signal);this.transferred(bytes)},onProgress:(bytes,total)=>{this.partialBytes.set(partial+'.mp4',bytes);report({stage:'downloading',transferred:bytes,total,percent:Math.floor(bytes/total*100)})},...(streamAllowed?{onChunk:async(chunk:Uint8Array)=>{
+    await downloadMedia({url:resource.url,path:input,metadataPath:checkpoint,size:resource.size,fingerprint,signal,throttle:async(bytes,signal)=>{await this.limiter.consume(bytes,signal);this.transferred(bytes)},onProgress:(bytes,total)=>{if(job.generation===this.qualityGeneration)this.partialBytes.set(partial+'.mp4',bytes);report({stage:'downloading',transferred:bytes,total,percent:Math.floor(bytes/total*100)})},...(streamAllowed?{onChunk:async(chunk:Uint8Array)=>{
     if(encoder){await encoder.write(chunk);return}if(decided)return;
     prefix=Buffer.concat([prefix,chunk]);const candidate=streamableMp4(prefix);if(candidate===false||prefix.length>2*1024*1024){decided=true;prefix=Buffer.alloc(0);return}if(candidate!==true)return;
     decided=true;report({stage:'waiting'});release=await this.processor(signal);job.processingActive=true;check(signal);processingMs=Date.now();
@@ -326,7 +392,7 @@ export class MediaCache {
    if(previous){await unlink(path.join(this.directory,previous.key+'.json')).catch(()=>{});await unlink(previous.file).catch(()=>{})}
    await this.trim();return this.result(entry);
   }catch(error){check(signal);if(error instanceof AppError)throw error;throw new AppError('MEDIA_CACHE','视频准备失败，请检查磁盘空间后重试当前集')}
-    finally{encoder?.stop();await encoder?.finished.catch(()=>{});release?.();if(!committed){if(job.ready)this.renewPlaybackWait(job);growing?.fail();job.ready=false;job.progressivePlayback=undefined}this.growing.delete(key);contentKey?.fill(0);if(downloaded){await unlink(input).catch(()=>{});await unlink(checkpoint).catch(()=>{})}const retained=await stat(input).catch(()=>null);if(retained?.size)this.partialBytes.set(partial+'.mp4',retained.size);else this.partialBytes.delete(partial+'.mp4');await unlink(working).catch(()=>{});if(!committed){await unlink(output).catch(()=>{});await unlink(metadata).catch(()=>{})}}
+    finally{encoder?.stop();await encoder?.finished.catch(()=>{});release?.();if(!committed){if(job.ready)this.renewPlaybackWait(job);growing?.fail();job.ready=false;job.progressivePlayback=undefined}this.growing.delete(key);contentKey?.fill(0);if(downloaded){await unlink(input).catch(()=>{});await unlink(checkpoint).catch(()=>{})}const retained=await stat(input).catch(()=>null);if(job.generation===this.qualityGeneration){if(retained?.size)this.partialBytes.set(partial+'.mp4',retained.size);else this.partialBytes.delete(partial+'.mp4')}await unlink(working).catch(()=>{});if(!committed){await unlink(output).catch(()=>{});await unlink(metadata).catch(()=>{})}}
  }
  private transcode(input:string,output:string,key:Buffer|null,duration:number,signal:AbortSignal,report:(percent:number)=>void,copy=false):Promise<void>{
   check(signal);
@@ -360,5 +426,5 @@ export class MediaCache {
    }
   }
  }
- async close(){this.closing=true;this.window=[];const pending=[...new Set([...this.jobs.values(),...this.activeJobs])];for(const job of pending)this.cancel(job);this.limiter.close();await Promise.allSettled(pending.map(job=>job.completion??job.promise))}
+ async close(){this.closing=true;this.window=[];const pending=[...new Set([...this.jobs.values(),...this.activeJobs])];for(const job of pending)this.cancel(job);this.limiter.close();await Promise.allSettled(pending.map(job=>job.completion??job.promise));await this.qualitySwitch?.catch(()=>{})}
 }
