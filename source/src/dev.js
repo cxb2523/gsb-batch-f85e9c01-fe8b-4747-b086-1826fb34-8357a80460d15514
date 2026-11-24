@@ -73,7 +73,10 @@ window.abyssal = {
   fight: () => ({ hp: +meHP.toFixed(3), lost: meLost, down: +meDown.toFixed(2), back: me ? me.dead || 0 : -1, msg: meMsg, at: me ? [+me.x.toFixed(2), +me.z.toFixed(2)] : null, rivals: bots.filter((b) => !b.me && b.s === 0 && !b.gone).map((b) => ({ hp: +(b.hp === undefined ? 1 : b.hp).toFixed(3), lost: b.lost || 0, dead: b.dead ? 1 : 0, d: +hypot(b.x - me.x, b.z - me.z).toFixed(2) })) }),
   life: (hp) => { if (hp !== undefined) meHP = hp; return [+meHP.toFixed(3), meLost, meMsg, me ? me.s : -1]; },
   shade: (k) => { shadeK = k; },
-  net: (go) => { if (go) netConnect(); return { on: netOn, id: netId, names: [...netNames], peers: [...netPeers.values()].map((b) => [b.id, b.name, b.s, +b.x.toFixed(1), +b.y.toFixed(1), +b.z.toFixed(1), b.gur]) }; },
+  // the shared sea: connect now (if not already), and what the connection holds; close it as a lost connection would
+  net: (go) => { if (go) netConnect(); return { on: netOn, id: netId, full: netFull, names: [...netNames], peers: [...netPeers.values()].map((b) => [b.id, b.name, b.s, +b.x.toFixed(1), +b.y.toFixed(1), +b.z.toFixed(1), b.gur, !!b.gone]) }; },
+  netClose: () => { const ws = netWS; if (ws) { try { ws.close(); } catch {} } return !!ws; },
+  netPeer: (id) => { const b = netPeers.get(id); return b ? { id: b.id, name: b.name, s: b.s, x: b.x, y: b.y, z: b.z, gur: b.gur, lost: b.lost, dead: b.dead } : null; },
   meAt: () => (me ? [me.x, me.y, me.z, me.yaw] : null),
   netTick: (n = 1) => { meAway = false; for (let i = 0; i < n; i++) { netFrame(0.125); botStep(1 / 30); } },
   ship: (x, y, z) => +shipD(x, y, z).toFixed(2),
@@ -89,6 +92,8 @@ window.abyssal = {
   reply: (d, n = 90) => { botHold = false; botAdd(me.s, [me.x + d, me.y, me.z], 0); const b = bots[bots.length - 1]; b.mode = 0; b.rc = 0; me.gur = true; let r = false; for (let i = 0; i < n; i++) { botReplies(1 / 30); r = r || b.rw > 0 || b.rt > 0; } me.gur = false; bots.splice(bots.indexOf(b), 1); return r; },
   gur: (on, n = 0) => { menu = false; kg = on ? 1 : 0; if (me) me.gur = !!on; for (let i = 0; i < n; i++) { F[TIME] += 1 / 30; botStep(1 / 30); } return me ? [me.talk, gurN] : null; },
   menu: () => { ui(true); const m = $('m'), h = m.firstElementChild, a = $('a'), f = $('f'); return { H: m.clientHeight, W: m.clientWidth, font: m.style.fontSize, titleTop: h.offsetTop, titleW: h.offsetWidth, bottom: a.offsetTop + a.offsetHeight, links: f.style.display === 'none' ? null : f.offsetTop, highs: CRIT.map((c) => +c.high.toFixed(3)) }; },
+  // leave the menu (the dive button's own way): the creature is then in play, not away, and taken into the shared sea
+  dive: () => { ui(false); return !!me; },
   hide: (v) => { HIDE = v; },
   lod: (v) => { if (v) lk = lkT = v; return [+lk.toFixed(2), +lkT.toFixed(2), +F[GPU].toFixed(2)]; }, // the detail distances, times v (and what they are now, with the GPU time)
   // offscreen: one frame of `ms` milliseconds, finished on the GPU; and the streaming run to the end without drawing

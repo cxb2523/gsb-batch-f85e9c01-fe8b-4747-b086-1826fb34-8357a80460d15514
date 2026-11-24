@@ -169,6 +169,12 @@ their name appears on the sonar, you hear them gurgle from where they are, and y
 button like anything else. The server checks each bite and notifies the player who was bitten. The name field in the
 menu is what other players see. A page opened from a file, or from a host without the server, plays alone.
 
+A connection is a lifetime. A lost or replaced socket clears the players near, their names and the player's own id at
+once, and the creatures it brought leave the scene there and then; a new connection reports in again and takes the
+ids the server gives it. A packet with the player's own id is ignored, and a bite, a meal or a death only counts from
+someone still among the near players (a crab's shove away from a striker whose place is unknown is left out too), so
+nothing that arrives late or from someone gone can move the player.
+
 The limits are set to match each other (`source/src/bots.js`, `server/src/sea.js`, `server/openresty/sea.lua`):
 
 - The server tells you about at most the 40 nearest players, which is also how many the game draws.

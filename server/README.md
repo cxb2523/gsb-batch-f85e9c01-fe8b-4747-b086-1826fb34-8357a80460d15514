@@ -12,6 +12,9 @@ server/
   wrangler.toml    the Cloudflare configuration
   test/local.mjs   the same sea as a plain Node server, for trying at home
   test/sea.test.mjs  the protocol test: three players, then a crowd, over real WebSockets
+  test/client.test.mjs      the game's side, net.js in a VM: the connection's lifetime and a fight between players
+  test/client.sea.test.mjs  the same against this sea: connect, disconnect, reconnect, and a strike that lands
+  test/browser.test.mjs     the same in real Chrome (dev.html and its hooks), not part of npm test: npm run test:browser
   openresty/       the same sea for a server of your own: nginx with Lua instead of Cloudflare (see below)
 ```
 
@@ -21,7 +24,9 @@ server/
 cd source && npm install && npm run build     # puts the game into server/public
 cd ../server && npm install
 npm run local                                 # http://localhost:8787 - open it in two windows
-npm test                                      # the protocol test
+npm test                                      # the protocol test, and the game's side of it
+npm run test:client                           # only the game's side (net.js in a VM, and over real WebSockets)
+npm run test:browser                          # the page in real Chrome (needs dev.html and a WebGPU Chrome)
 npm run dev                                   # the real Worker, locally (wrangler dev)
 ```
 
@@ -113,6 +118,8 @@ the meal.
 
 The server trusts positions as sent (there is no terrain here to check them against); what it does check is who may
 bite whom, from how far and how often. A connection silent for 30 seconds is dropped; the client reconnects by itself.
+A new connection gets a new id: the game's side (`source/src/net.js`) clears the players near it, their names and its
+own id when a connection closes or fails, and a bite from someone no longer among its near players changes nothing.
 
 ## A resident crab (optional)
 

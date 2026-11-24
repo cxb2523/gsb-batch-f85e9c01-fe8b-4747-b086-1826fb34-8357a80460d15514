@@ -7,7 +7,10 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "local": "node test/local.mjs",
-    "test": "node test/sea.test.mjs"
+    "test": "node test/sea.test.mjs && node test/client.test.mjs && node test/client.sea.test.mjs",
+    "test:sea": "node test/sea.test.mjs",
+    "test:client": "node test/client.test.mjs && node test/client.sea.test.mjs",
+    "test:browser": "node test/browser.test.mjs"
   },
   "devDependencies": {
     "wrangler": "^4",
