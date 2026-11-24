@@ -228,7 +228,7 @@ await (async () => {
         dur: 8,
         state: () => at({ shoreDistance: 14, shoreDrop: 9, oceanSide: 1 }),
         windows: [['steady', 0.5, 8]],
-        solo: ['surf'],
+        solo: ['surf', 'seaWind'],
       },
       {
         name: 'gulls',
@@ -250,6 +250,32 @@ await (async () => {
         }),
         windows: [['steady', 0.8, 6]],
         solo: ['surf', 'wind'],
+      },
+      {
+        name: 'shore flip',
+        /* The coast road doubling back: water starts to port and swaps to
+           starboard at t=2. Both windows have to land on the matching side —
+           this is the surf/seaWind half of "the image follows oceanSide",
+           and the late balance must be the mirror of the early one. */
+        dur: 7,
+        state: t => at({
+          shoreDistance: 14, shoreDrop: 9,
+          oceanSide: t < 2 ? -1 : 1,
+        }),
+        windows: [['water left', 0.6, 1.9], ['water right', 4.4, 7]],
+        solo: ['surf', 'seaWind'],
+      },
+      {
+        name: 'shore flutter',
+        /* Worst case for the pan smoothing: oceanSide hard-alternates four
+           times a second. The full-mix dc/maxstep gates below then prove the
+           repeated exchanges neither click nor walk the signal to one rail. */
+        dur: 4,
+        state: t => at({
+          shoreDistance: 12, shoreDrop: 8,
+          oceanSide: Math.floor(t * 4) % 2 ? 1 : -1,
+        }),
+        windows: [['flutter', 0.3, 4]],
       },
 
       /* ---- the follow-ups ----------------------------------------------- */
@@ -603,10 +629,156 @@ await (async () => {
       live = 'threw: ' + (e && e.message);
     }
 
-    return { mix, layers, hot, live };
+    /* ---- ocean-side: resumable crossfade, pause, restart/rebuild -------
+     *
+     * The tables above prove the rendered surf/seaWind image through the
+     * ordinary scenario path. This block proves the state contract the bug
+     * was about: the cliff exchange amount is recorded, freezes while frames
+     * are not stepped, continues from the held value, snaps on an explicit
+     * realign / rebuilt graph, and a dispose()+start() on the same instance
+     * leaves no previous-game pan. It also renders the post-exchange echo tap
+     * against a deterministic click so "sea left -> early reflection right"
+     * is an actual signal assertion rather than only a gain-state one. */
+    const side = { checks: [], echo: null, rebuildBal: null, live: null };
+    const sck = (ok, msg) => side.checks.push({ ok: !!ok, msg });
+    const sr0 = sr;
+    const balRange = (buf, t0, t1) => {
+      const l = buf.getChannelData(0), r = buf.getChannelData(1);
+      const a = Math.max(0, Math.floor(t0 * sr0));
+      const b = Math.min(l.length, Math.floor(t1 * sr0));
+      let ql = 0, qr = 0, n = 0;
+      for (let i = a; i < b; i++) { ql += l[i] * l[i]; qr += r[i] * r[i]; n++; }
+      return 10 * Math.log10(((qr / n) + 1e-12) / ((ql / n) + 1e-12));
+    };
+    try {
+      const H7 = 1 / 60;
+
+      /* (1) offline state machine and same-instance dispose/start render. */
+      const c0 = new OfflineAudioContext(2, Math.ceil(2.4 * sr0), sr0);
+      const a0 = new Audio({ context: c0 });
+      await a0.start();
+      let st = a0.sideState();
+      sck(Math.abs(st.swap - 1) < 1e-9 && Math.abs(st.swapTarget - 1) < 1e-9,
+        'fresh graph born aligned to default sea-left (swap=1)');
+      sck(st.needsSnap === true, 'side snap armed on a fresh graph');
+      a0.update(H7, at({}));
+      sck(a0.sideState().needsSnap === false, 'first frame consumes the snap');
+      for (let i = 0; i < 8; i++) a0.update(H7, at({ oceanSide: 1 }));
+      const mid = a0.sideState().swap;
+      sck(mid > 0.15 && mid < 0.92, `flip is a recorded mid-crossfade (swap ${mid.toFixed(3)})`);
+      /* Pause: with no update() calls the virtual clock and the recorded
+         amount both hold exactly. */
+      const frozen = a0.sideState().swap;
+      sck(a0.sideState().swap === frozen, 'pause freezes the cross amount exactly');
+      for (let i = 0; i < 60 * 6; i++) a0.update(H7, at({ oceanSide: 1 }));
+      sck(a0.sideState().swap < 0.02, 'resume continues and reaches the new side');
+      /* Explicit race-restart alignment is immediate. */
+      a0.alignSide(-1);
+      st = a0.sideState();
+      sck(st.swap === 1 && st.side === -1 && st.swapTarget === 1,
+        'alignSide(-1) snaps state to the opposite endpoint');
+
+      /* dispose() then start() on the SAME instance must rebuild the graph,
+         reset the transition state and leave no old pan. */
+      a0.dispose();
+      sck(a0.ctx === null, 'dispose() drops the context');
+      await a0.start();
+      sck(!!a0.ctx && Array.isArray(a0.wetThru) && a0.wetThru.length === 2,
+        'start() after dispose() rebuilds the echo graph');
+      sck(Math.abs(a0.wetThru[0].gain.value - 0) < 1e-6 &&
+        Math.abs(a0.wetSwap[0].gain.value - 1) < 1e-6,
+        'new wet gains are born aligned to the retained side, not swap=0');
+      /* Re-render this rebuilt instance with the OPPOSITE side and solo surf,
+         so "no previous-game image" is checked on real samples in an early
+         window where a slow default fade would still be centred. */
+      const buses0 = a0.buses();
+      for (const [name, node] of Object.entries(buses0)) {
+        node.disconnect();
+        if (name === 'surf') node.connect(a0.bus);
+      }
+      for (let i = 0; i * H7 < 2.4; i++) a0.update(H7, at({ oceanSide: 1 }));
+      const rb = await c0.startRendering();
+      side.rebuildBal = +balRange(rb, 0.05, 0.5).toFixed(2);
+      sck(side.rebuildBal > 1.4,
+        `dispose/start opposite side: surf already right in the first 0.5 s (${side.rebuildBal} dB)`);
+      sck(Math.abs(a0.sideState().swap) < 1e-9,
+        'rebuilt graph hard-snapped its state on the first new-side frame');
+      a0.dispose();
+
+      /* (2) rendered cliff early reflection sits opposite the water. A
+         deterministic mono click into the real send chain; the tight window
+         catches the baked 55 ms slap before the symmetric tail dominates. */
+      const echoBal = async (oceanSide) => {
+        const dur = 1.4, clickAt = 0.5;
+        const c = new OfflineAudioContext(2, Math.ceil(dur * sr0), sr0);
+        const a = new Audio({ context: c });
+        await a.start();
+        a.limiter.disconnect();
+        a.bus.disconnect(a.send);
+        const cb = c.createBuffer(1, 32, sr0);
+        cb.getChannelData(0)[0] = 1;
+        const cs = c.createBufferSource();
+        cs.buffer = cb;
+        cs.connect(a.send);
+        cs.start(clickAt);
+        a.echoTap.connect(c.destination);
+        for (let i = 0; i * H7 < dur; i++) a.update(H7, { oceanSide, speed: 0, rpm: 0.12 });
+        const buf = await c.startRendering();
+        a.dispose();
+        /* 50-75 ms: the hard slap and its 8 ms skew, before the 105 ms return. */
+        return +balRange(buf, clickAt + 0.05, clickAt + 0.075).toFixed(2);
+      };
+      const eLeftSea = await echoBal(-1);
+      const eRightSea = await echoBal(1);
+      side.echo = { leftSea: eLeftSea, rightSea: eRightSea };
+      sck(eLeftSea > 0.5, `sea LEFT -> cliff early reflection RIGHT (${eLeftSea} dB)`);
+      sck(eRightSea < -0.5, `sea RIGHT -> cliff early reflection LEFT (${eRightSea} dB)`);
+      sck(eLeftSea > 0 && eRightSea < 0 && Math.abs(eLeftSea + eRightSea) < 0.6,
+        'the two echo images are clean mirror opposites');
+
+      /* (3) live context: wall-time pause freeze + dispose/start rebirth. */
+      try {
+        const sleep = ms => new Promise(r => setTimeout(r, ms));
+        const a = new Audio();
+        await a.start();
+        for (let i = 0; i < 5; i++) a.update(H7, at({ oceanSide: -1 }));
+        for (let i = 0; i < 10; i++) a.update(H7, at({ oceanSide: 1 }));
+        const midLive = a.sideState().swap;
+        a.stop();
+        await sleep(120);
+        const fz = a.sideState().swap;
+        await sleep(120);
+        const held = a.sideState().swap === fz;
+        await a.start();
+        const resumeKept = Math.abs(a.sideState().swap - fz) < 1e-12;
+        for (let i = 0; i < 60 * 5; i++) a.update(H7, at({ oceanSide: 1 }));
+        const settled = a.sideState().swap < 0.03;
+        a.alignSide(-1);
+        a.dispose();
+        await a.start();
+        const reborn = !!a.ctx && a.ctx.state === 'running' &&
+          Math.abs(a.sideState().swap - 1) < 1e-9;
+        a.update(H7, at({ oceanSide: 1 }));
+        const rebornSnap = Math.abs(a.sideState().swap) < 1e-9;
+        a.dispose();
+        side.live = { midLive: +midLive.toFixed(3) };
+        sck(midLive > 0.2 && midLive < 0.95, `live crossfade advances (swap ${midLive.toFixed(3)})`);
+        sck(held, 'live pause holds the cross amount across wall time');
+        sck(resumeKept, 'live resume continues from the held amount');
+        sck(settled, 'live resume reaches the target side');
+        sck(reborn, 'live dispose()+start() rebuilds running graph aligned');
+        sck(rebornSnap, 'live rebuilt graph snaps to the new side on frame one');
+      } catch (e) {
+        sck(false, 'live side lifecycle threw: ' + (e && e.message));
+      }
+    } catch (e) {
+      sck(false, 'offline side probe threw: ' + (e && e.stack || e));
+    }
+
+    return { mix, layers, hot, live, side };
   }, SR));
 
-  const { mix, layers, hot, live } = out;
+  const { mix, layers, hot, live, side } = out;
   const pad = (s, n) => String(s).padEnd(n);
   const num = (s, n) => String(s).padStart(n);
   const m = (n, w) => mix.find(r => r.name === n && (!w || r.window === w));
@@ -746,6 +918,25 @@ await (async () => {
   const breeze = L('shore near', 'seaWind', 'early');
   check(breeze.rms > 0.004, `no sea air at a standstill: rms ${breeze.rms}`);
   check(breeze.corr < 0.6, `sea air is mono: correlation ${breeze.corr}`);
+  /* seaWind follows oceanSide too, in both polarities. */
+  check(breeze.bal < -1.2, `seaWind not panned toward the (left) water: ${breeze.bal} dB`);
+  check(L('shore side', 'seaWind').bal > 1.0,
+    `seaWind does not follow oceanSide to starboard: ${L('shore side', 'seaWind').bal} dB`);
+
+  /* A mid-render side flip has to move both surf and seaWind from one side to
+     the mirror side — the resumable crossfade settling on the new target. */
+  const flipSurfL = L('shore flip', 'surf', 'water left');
+  const flipSurfR = L('shore flip', 'surf', 'water right');
+  check(flipSurfL.bal < -1.2, `flip: surf starts left: ${flipSurfL.bal} dB`);
+  check(flipSurfR.bal > 1.2, `flip: surf ends right: ${flipSurfR.bal} dB`);
+  check(flipSurfR.bal - flipSurfL.bal > 3,
+    `flip: surf image does not cross over (${flipSurfL.bal} → ${flipSurfR.bal} dB)`);
+  const flipWindL = L('shore flip', 'seaWind', 'water left');
+  const flipWindR = L('shore flip', 'seaWind', 'water right');
+  check(flipWindL.bal < -1.0, `flip: seaWind starts left: ${flipWindL.bal} dB`);
+  check(flipWindR.bal > 1.0, `flip: seaWind ends right: ${flipWindR.bal} dB`);
+  check(flipWindR.bal - flipWindL.bal > 2.5,
+    `flip: seaWind image does not cross over (${flipWindL.bal} → ${flipWindR.bal} dB)`);
 
   const gulls = L('gulls', 'gull');
   check(gulls.peak > 0.02, `no gulls in forty seconds: peak ${gulls.peak}`);
@@ -831,15 +1022,33 @@ await (async () => {
   check(live === 'running', `live AudioContext: ${live}`);
   console.log(`\n  live context after start/stop/start: ${live}`);
 
+  /* Ocean-side resumable state / pause / restart / rebuild. */
+  console.log('\n  ocean-side echo state, pause-resume and rebuild');
+  if (side?.echo) {
+    console.log('    echo early-reflection balance  sea-left: ' +
+      `${side.echo.leftSea} dB (want >0, right)   sea-right: ${side.echo.rightSea} dB (want <0, left)`);
+  }
+  if (side?.rebuildBal != null) {
+    console.log(`    dispose()+start() opposite-side early surf balance: ${side.rebuildBal} dB`);
+  }
+  for (const c of side?.checks || []) {
+    console.log('  ' + (c.ok ? '✓' : '✗') + ' ' + c.msg);
+    check(c.ok, c.msg);
+  }
+  check(Array.isArray(side?.checks) && side.checks.length >= 18,
+    `side probe incomplete: ${side?.checks?.length || 0} checks`);
+
   console.log('');
   if (fails.length) {
     for (const f of fails) console.log('  ✗ ' + f);
     bad = fails.length;
   } else {
-    console.log(`  ✓ ${mix.length} mix windows + ${layers.length} layer windows: ` +
-      'no clipping, nothing silent, brightness tracks rpm and load,\n' +
-      '    tyres and gravel gated on slip and surface, wind on speed, impacts scale\n' +
-      '    and weigh, surf tracks distance and side, gulls stay sparse, worst case clean');
+    console.log(`  ✓ ${mix.length} mix windows + ${layers.length} layer windows + ` +
+      `${side?.checks?.length || 0} side-state checks: no clipping, nothing silent,\n` +
+      '    brightness tracks rpm and load, tyres/gravel gated, wind on speed,\n' +
+      '    impacts scale and weigh, surf AND seaWind track oceanSide and flip cleanly,\n' +
+      '    cliff echo sits opposite the water and resumes/snaps/rebuilds correctly,\n' +
+      '    gulls stay sparse, worst case clean');
   }
 })();
 

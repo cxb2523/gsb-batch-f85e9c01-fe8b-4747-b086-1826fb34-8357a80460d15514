@@ -88,6 +88,26 @@ export class Audio {
        the left is the setting, and a state struct that omits the new fields
        should get the setting rather than get silence. */
     this._shore = { distance: 70, drop: 40, side: -1 };
+    /* Resumable cliff-image state.
+     *
+     * `sideTarget` is the latest authoritative oceanSide, `side` the smoothed
+     * current sea side, `swapTarget` the channel-exchange amount the target
+     * asks for (0 = IR as baked, 1 = channels exchanged) and `swap` the
+     * amount currently applied to the wet gains. `swap` is advanced ONLY by
+     * update(): stop calling update() (pause) and it holds exactly, so resume
+     * continues from the held position instead of restarting from a default.
+     * A graph rebuild (start() after dispose()) initialises both values to
+     * the aligned endpoint and arms `needsSideSnap`, so the first side the new
+     * run reports is applied immediately rather than slowly faded in. */
+    this._side = { sideTarget: -1, side: -1, swapTarget: 1, swap: 1 };
+    this._needsSideSnap = true;
+  }
+
+  /** oceanSide (-1 left, +1 right) -> cliff channel-exchange amount. The
+   *  cliff is opposite the water, and the baked IR has its slap on the left,
+   *  so left-hand water (side -1) needs a full exchange (swap 1). */
+  _swapForSide(side) {
+    return clamp((1 - clamp(side, -1, 1)) * 0.5, 0, 1);
   }
 
   /** Create and resume the context, building the graph on first call. Safe to
@@ -280,9 +300,21 @@ export class Audio {
     this.wet.connect(split);
     this.wetThru = [ctx.createGain(), ctx.createGain()];
     this.wetSwap = [ctx.createGain(), ctx.createGain()];
+    /* Born aligned to the latest known sea side, not to swap=0. The nodes are
+       new after every dispose()/start(), so initialising them at the correct
+       endpoint is what stops a rebuilt graph fading the cliff image in from a
+       hard-coded default that can agree with the surf side. */
+    const initialSwap = this._swapForSide(this._shore.side);
+    this._side = {
+      sideTarget: this._shore.side,
+      side: this._shore.side,
+      swapTarget: initialSwap,
+      swap: initialSwap,
+    };
+    this._needsSideSnap = true;
     for (let ch = 0; ch < 2; ch++) {
-      this.wetThru[ch].gain.value = 1;
-      this.wetSwap[ch].gain.value = 0;
+      this.wetThru[ch].gain.value = 1 - initialSwap;
+      this.wetSwap[ch].gain.value = initialSwap;
       split.connect(this.wetThru[ch], ch);
       split.connect(this.wetSwap[ch], ch);
       this.wetThru[ch].connect(merge, 0, ch);
@@ -290,6 +322,16 @@ export class Audio {
     }
     merge.connect(this.dcBlock);
     this.wetNet = [split, merge];
+    /* Post-exchange echo image, exposed for the offline side/pause scenarios
+       in tools/audio.mjs. It is a plain tap: it is not connected to anything
+       in the live graph, so its existence changes no mix and disconnecting it
+       during a layer solo is a no-op. A measurement render connects it
+       straight to the OfflineAudioContext destination after muting the master
+       chain — connecting it back into `bus` would close a loop through the
+       convolver. */
+    this.echoTap = ctx.createGain();
+    this.echoTap.gain.value = 1;
+    merge.connect(this.echoTap);
 
     this.send = ctx.createGain();
     this.send.gain.value = 0.5;
@@ -304,6 +346,10 @@ export class Audio {
     this.surface = new SurfaceVoices(ctx, this.bus, buffers, this.seed + 404);
     this.impacts = new Impacts(ctx, this.hits, buffers, this.seed + 7331);
     this.ambience = new Ambience(ctx, this.amb, buffers, this.seed + 8123);
+    /* Place the surf/seaWind pairs at the latest known side from sample zero.
+       Audio._needsSideSnap stays armed, so the first update of a rebuilt graph
+       still hard-aligns if the new run reports a different side. */
+    this.ambience.alignSide(this._shore.side);
     /* On the impact bus, not the car bus, and for the same reason the impacts
        are: it is downstream of the duck, so the one signal in the game that
        must be heard over a revving engine is not itself pulled down by
@@ -420,6 +466,19 @@ export class Audio {
     if (state.shoreDrop != null) sh.drop = Math.max(0, state.shoreDrop);
     if (state.oceanSide != null) sh.side = clamp(state.oceanSide, -1, 1);
 
+    /* A graph that was (re)built since the last frame gets one immediate
+       alignment to the freshly reported side. This is the "restart / start()
+       lands directly on the newest side" path: without it the new wet gains
+       and ambience pans would slowly fade from their build-time endpoint
+       whenever the new run starts on the opposite side. Direct value writes
+       are click-free here because the graph is at t≈0 and every layer gain is
+       still on its 0.0001 floor. Only the first side-bearing frame does this;
+       ordinary corner-to-corner changes keep smoothing below. */
+    if (this._needsSideSnap) {
+      this._needsSideSnap = false;
+      this._snapSide(sh.side);
+    }
+
     this.ambience.update(step, {
       speed,
       airborne,
@@ -470,12 +529,105 @@ export class Audio {
 
     /* The rock is opposite the water. Slow, because the only thing that
        changes it is the road turning, and a reverb image that moves faster
-       than the geometry does is more distracting than one that lags. */
-    const swap = clamp((1 - sh.side) * 0.5, 0, 1);
+       than the geometry does is more distracting than one that lags.
+       The crossfade amount is held in `this._side` and advanced here rather
+       than delegated entirely to an AudioParam: that makes it resumable state
+       which does not advance while update() is not being called (pause), and
+       which restart/dispose can align immediately. The 0.5 s time constant is
+       the old setTargetAtTime tau, expressed as an approach rate. The short
+       parameter tau only de-zippers the per-frame value writes. */
+    const st = this._side;
+    st.sideTarget = sh.side;
+    st.swapTarget = this._swapForSide(sh.side);
+    st.side = approach(st.side, st.sideTarget, 2.0, step);
+    st.swap = approach(st.swap, st.swapTarget, 2.0, step);
+    this._writeEchoSwap(st.swap, t, 0.06);
+  }
+
+  /** Write the recorded echo exchange amount to the wet gain pairs. */
+  _writeEchoSwap(swap, t, tau = 0.06) {
+    if (!this.wetThru) return;
     for (let ch = 0; ch < 2; ch++) {
-      this.wetThru[ch].gain.setTargetAtTime(1 - swap, t, 0.5);
-      this.wetSwap[ch].gain.setTargetAtTime(swap, t, 0.5);
+      this.wetThru[ch].gain.setTargetAtTime(1 - swap, t, tau);
+      this.wetSwap[ch].gain.setTargetAtTime(swap, t, tau);
     }
+  }
+
+  /** Hard-align all ocean-following images to `side`. State and AudioParams
+      land exactly on the endpoint; only call this for a fresh graph at t≈0
+      where a value jump is inaudible. Live callers use alignSide(). */
+  _snapSide(side) {
+    const s = clamp(Number.isFinite(side) ? side : (this._shore?.side ?? -1), -1, 1);
+    const swap = this._swapForSide(s);
+    if (this._shore) this._shore.side = s;
+    this._side = { sideTarget: s, side: s, swapTarget: swap, swap };
+    if (this.wetThru) {
+      for (let ch = 0; ch < 2; ch++) {
+        this.wetThru[ch].gain.value = 1 - swap;
+        this.wetSwap[ch].gain.value = swap;
+      }
+    }
+    this.ambience?.alignSide(s);
+  }
+
+  /**
+   * Immediately align the cliff echo and the surf/seaWind images to the
+   * latest ocean side, clearing any in-progress crossfade.
+   *
+   * This is the race-restart / explicit audio-restart entry point: a restart
+   * must sit on the new grid's sea side at once instead of crossfading from
+   * wherever the previous run was. The parameter move is a few tens of
+   * milliseconds rather than a value jump, so aligning a live, sounding graph
+   * cannot click or throw a DC step. With no built graph yet it only records
+   * the side; the subsequent start()/_build picks it up.
+   *
+   * Pause/resume must NOT call this — resume continues the held crossfade,
+   * which happens automatically because stop()/start() on an existing context
+   * leave `_side` untouched.
+   *
+   * @param {number} [side] -1 water left, +1 right; omitted uses the latched
+   * @returns {number} the aligned side
+   */
+  alignSide(side) {
+    const s = clamp(
+      Number.isFinite(side) ? side : (this._shore?.side ?? -1), -1, 1);
+    if (this._shore) this._shore.side = s;
+    const swap = this._swapForSide(s);
+    this._side = { sideTarget: s, side: s, swapTarget: swap, swap };
+    this._needsSideSnap = false;
+    if (this.ctx && this.wetThru) {
+      /* Offline writes against the virtual clock (this.now), live writes
+         against the context clock — the same split update() uses. */
+      const t = this.offline ? this.now : this.ctx.currentTime;
+      this._writeEchoSwap(swap, t, 0.02);
+      this.ambience?.alignSide(s, t, 0.03);
+    } else if (this.ambience) {
+      this.ambience.alignSide(s);
+    }
+    return s;
+  }
+
+  /** Alias for callers that phrase restart alignment as a reset/realign. */
+  realignSide(side) { return this.alignSide(side); }
+
+  /**
+   * Plain snapshot of the resumable side state, for tools/audio.mjs and
+   * lifecycle probes. `swap`/`swapTarget` are the cliff channel exchange;
+   * `side`/`sideTarget` the smoothed/latest sea side.
+   */
+  sideState() {
+    const st = this._side;
+    return {
+      side: st.side,
+      sideTarget: st.sideTarget,
+      swap: st.swap,
+      swapTarget: st.swapTarget,
+      needsSnap: !!this._needsSideSnap,
+      shoreSide: this._shore.side,
+      running: this.running,
+      offline: this.offline,
+      now: this.now,
+    };
   }
 
   /** One-shot collision. Rate limited internally; safe to call every frame. */
@@ -585,10 +737,24 @@ export class Audio {
     this.finishTones.dispose();
     this.feedback.dispose();
     for (const n of [this.bus, this.amb, this.hits, this.duck, this.send, this.verb,
-      this.wet, ...this.wetNet, ...this.wetThru, ...this.wetSwap,
-      this.comp, this.limiter, this.dcBlock, this.master]) n.disconnect();
+      this.wet, this.echoTap, ...this.wetNet, ...this.wetThru, ...this.wetSwap,
+      this.comp, this.limiter, this.dcBlock, this.master]) {
+      if (n) n.disconnect();
+    }
     if (this._ownsContext && this.ctx.close) this.ctx.close().catch(() => {});
     this.ctx = null;
     this.running = false;
+    /* Clear the old run's crossfade progression. The latched latest side is
+       kept as the sticky default the next graph is born aligned to, but the
+       resumable values go back to the aligned endpoint and the snap flag is
+       armed: a start() that rebuilds must never inherit a mid-transition pan
+       or the previous game's stereo image. */
+    const side = this._shore ? this._shore.side : -1;
+    const swap = this._swapForSide(side);
+    this._side = { sideTarget: side, side, swapTarget: swap, swap };
+    this._needsSideSnap = true;
+    this.wetThru = null;
+    this.wetSwap = null;
+    this.echoTap = null;
   }
 }

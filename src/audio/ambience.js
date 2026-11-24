@@ -211,7 +211,78 @@ export class Ambience {
 
     this.swell = 0;
     this.near = 0;
+    /* Ocean image state. `side` is the current (smoothed) car-relative sea
+       side and `sideTarget` the latest request. The pair starts unaligned:
+       Audio calls alignSide() against its latched side while the graph is
+       built, so a fresh graph never fades in from the centred default and a
+       dispose()/start() cycle cannot inherit the previous run's pans. */
+    this.sideTarget = 0;
     this.side = 0;
+    this.sideAligned = false;
+
+    /* Stereo placement specs for the surf bands, kept next to the nodes so
+       alignSide() can write the exact endpoints update() settles on. */
+    this.placements = [
+      { b: this.boom, centre: 0.18, spread: 0.52 },
+      { b: this.wash, centre: 0.50, spread: 0.46 },
+      { b: this.foam, centre: 0.72, spread: 0.34 },
+    ];
+  }
+
+  /**
+   * Pan positions for one decorrelated pair straddling the ocean direction.
+   * @returns {[number, number]}
+   */
+  pairPans(centre, spread, side = this.side) {
+    return [
+      clamp(side * centre - spread, -1, 1),
+      clamp(side * centre + spread, -1, 1),
+    ];
+  }
+
+  /**
+   * Put every ocean-following pan exactly on `side` now.
+   *
+   * Called at graph build (no `t`: assign .value directly, sources are still
+   * at their 0.0001 floor) and on a race restart with a live graph (`t`
+   * given: a short de-click ramp instead of a sample jump). The per-frame
+   * path keeps its own slow smoothing, so this only changes where a run
+   * starts, never how a corner crossfade feels.
+   *
+   * @param {number} [side] -1 water left, +1 right; omitted keeps the latched
+   * @param {number} [t] context time; null writes values immediately
+   * @param {number} [tau] de-click time constant for a live alignment
+   */
+  alignSide(side, t = null, tau = 0.05) {
+    if (Number.isFinite(side)) {
+      const s = clamp(side, -1, 1);
+      this.side = s;
+      this.sideTarget = s;
+    }
+    this.sideAligned = true;
+    this._writePans(this.side, t, tau);
+  }
+
+  /** Write all ocean-following panners for an already-resolved side. */
+  _writePans(side, t = null, tau = 0.1) {
+    const write = (param, v) => {
+      if (t == null) param.value = v;
+      else param.setTargetAtTime(v, t, tau);
+    };
+    for (const { b, centre, spread } of this.placements) {
+      const [p0, p1] = this.pairPans(centre, spread, side);
+      write(b.pans[0].pan, p0);
+      write(b.pans[1].pan, p1);
+    }
+    /* Sea breeze pair. The pair keeps a wide spread so each ear is dominated
+       by a different one of the two decorrelated sources (the corr < 0.6
+       width gate); the modest centre coefficient shifts that wide image
+       toward the water instead of leaving it pinned symmetrically. At
+       side -1 the pans land near -1 and +0.22: clearly left-heavy balance
+       without collapsing the pair to one point. */
+    const [a0, a1] = this.pairPans(0.4, 0.62, side);
+    write(this.airL.pan.pan, a0);
+    write(this.airR.pan.pan, a1);
   }
 
   /**
@@ -274,15 +345,17 @@ export class Ambience {
      * band is placed hardest and the boom stays near the middle. The two
      * sources inside each band are not placed at the same point — they
      * straddle the nominal direction — which is what keeps the water a body of
-     * sound off to one side rather than a hard-panned loop. */
-    this.side = approach(this.side, clamp(s.oceanSide || 0, -1, 1), 2.2, dt);
-    const place = (b, centre, spread) => {
-      set(b.pans[0].pan, clamp(this.side * centre - spread, -1, 1), 0.4);
-      set(b.pans[1].pan, clamp(this.side * centre + spread, -1, 1), 0.4);
-    };
-    place(this.boom, 0.18, 0.52);
-    place(this.wash, 0.50, 0.46);
-    place(this.foam, 0.72, 0.34);
+     * sound off to one side rather than a hard-panned loop.
+     *
+     * `side` is advanced here and nowhere else: while paused update() is not
+     * called, so the value holds exactly, and on resume the approach continues
+     * from the held number instead of restarting at a default. The first side
+     * a rebuilt graph sees snaps via alignSide() rather than fading from 0. */
+    const targetSide = clamp(s.oceanSide || 0, -1, 1);
+    this.sideTarget = targetSide;
+    if (!this.sideAligned) this.alignSide(targetSide);
+    this.side = approach(this.side, targetSide, 2.2, dt);
+    this._writePans(this.side, t, 0.4);
 
     /* Sea air. Onshore, so it is stronger when the ocean is close and when
        the road is exposed; the low-pass opens a little with the car's own

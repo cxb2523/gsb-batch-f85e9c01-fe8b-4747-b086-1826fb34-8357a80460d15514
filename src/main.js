@@ -1762,6 +1762,14 @@ class Game {
     p.vertVel = 0; p.height = 0;
     this.race.reset(34);
     this.race.join(p);
+    /* Snap the coast audio image — cliff echo exchange and surf/seaWind
+       pans — to the fresh grid's sea side. Without this a restart mid-
+       crossfade carried the previous run's side state and slowly faded from
+       it, so the echo could resume on the water's side. Safe before the audio
+       graph exists: alignSide() only records the side and start() builds to
+       it. */
+    const gridCoast = this.coastState ? this.coastState(p) : null;
+    this.audio.alignSide(gridCoast && gridCoast.oceanSide);
     this.hud.clearFeedback();
     this.effects.reset();
     this.chase.started = false;
