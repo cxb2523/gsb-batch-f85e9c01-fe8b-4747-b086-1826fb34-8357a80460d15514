@@ -1,6 +1,7 @@
 import * as Tone from 'tone'
 import { DEFAULT_AUDIO_LATENCY_HINT, DEFAULT_AUDIO_LOOKAHEAD, MAX_SAFE_AUDIO_SAMPLE_RATE } from '../config/defaults'
 import { STEPS_PER_BAR } from '../core/schemas/project.schema'
+import { normalizeLoopSteps } from '../core/transport/playhead'
 
 export type AudioContextState = 'running' | 'suspended' | 'closed' | 'unsupported'
 
@@ -265,11 +266,14 @@ export function stepToTransportPosition(step: number): string {
 
 /**
  * Configures start and end points for transport looping on the project step grid.
+ *
+ * The loop end stays open — Tone wraps once the transport reaches it — so the written bounds and
+ * the playhead resolver must agree exactly. Both go through {@link normalizeLoopSteps}, which also
+ * guarantees the same minimum one-step span and integer coordinates.
  */
 export function setTransportLoop(startStep: number, endStep: number, isLooping: boolean): void {
   const transport = Tone.getTransport()
-  const start = Math.max(0, Math.round(startStep))
-  const end = Math.max(start + 1, Math.round(endStep))
+  const { startStep: start, endStep: end } = normalizeLoopSteps(startStep, endStep)
   transport.loopStart = stepToTransportPosition(start)
   transport.loopEnd = stepToTransportPosition(end)
   transport.loop = isLooping

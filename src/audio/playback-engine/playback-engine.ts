@@ -1,8 +1,7 @@
 import * as Tone from 'tone'
-import { transportSecondsToPlayheadStep } from '../../core/audio-dsp/output-latency'
 import type { ChordEvent } from '../../core/schemas/chord.schema'
 import type { AppNote } from '../../core/schemas/note.schema'
-import type { ProjectConfig } from '../../core/schemas/project.schema'
+import { STEPS_PER_BAR, type ProjectConfig } from '../../core/schemas/project.schema'
 import type { ChordPreset, LeadPreset } from '../../core/schemas/synth.schema'
 import {
   createEventGenerationTracker,
@@ -19,6 +18,14 @@ import { TrackOutputRouter, type TrackOutputRuntime } from '../output-router'
 import { pickupActiveChord } from './chord-pickup'
 import type { SynthPatch } from '../../core/synth/patch'
 import {
+  clampToProjectStep,
+  foldPlayheadStep,
+  resolvePlayheadStep,
+  type PlayheadBounds
+} from '../../core/transport/playhead'
+import { transportSecondsToPlayheadStep } from '../../core/audio-dsp/output-latency'
+import { DEFAULT_PROJECT_SETTINGS } from '../../config/defaults'
+import {
   ensureAudioContextRunning,
   getAudibleTransportSeconds,
   setTransportLoop,
@@ -29,6 +36,11 @@ import { RhythmPreviewController } from '../rhythm-preview'
 import type { CustomRhythmPattern } from '../../core/schemas/custom-rhythm.schema'
 
 export { stepToTransportPosition } from '../transport-adapter'
+
+/** How close (in seconds) the raw clock must get to the target for the seek to count as landed. */
+function seekLandingToleranceSeconds(stepSeconds: number): number {
+  return Math.max(0.01, stepSeconds * 0.25)
+}
 
 /**
  * Documented audible semantics of every transport/preview boundary. Each entry names the three
@@ -77,6 +89,44 @@ export class PlaybackEngine {
 
   private readonly expiryTimers = new Set<ReturnType<typeof setTimeout>>()
   private isDisposed = false
+
+  /**
+   * Musical bounds the rendered playhead is folded into. `schedule()` and `setLoop()` keep them in
+   * sync with the project so callers that only pass a tempo still get a loop-aware position.
+   */
+  private playheadBounds: PlayheadBounds = {
+    loopStartStep: DEFAULT_PROJECT_SETTINGS.loopStartStep,
+    loopEndStep: DEFAULT_PROJECT_SETTINGS.loopEndStep,
+    isLooping: DEFAULT_PROJECT_SETTINGS.isLooping,
+    totalSteps: DEFAULT_PROJECT_SETTINGS.bars * STEPS_PER_BAR
+  }
+
+  /**
+   * An explicit seek issued while the transport is running. Tone defers the position write to its
+   * next tick, then (with a loop) wraps an out-of-range write onto the loop start. The anchor shows
+   * the target step the listener will actually hear and releases once the raw clock reaches either
+   * the literal written position or the wrapped one. It stores only steps/seconds — never a loop
+   * offset from the pre-seek position — so no stale wrap state can leak out.
+   */
+  private seekAnchor: { step: number; releaseSeconds: number[] } | null = null
+
+  /**
+   * Right after a resume the latency-compensated clock reports positions *before* the step playback
+   * restarted from (those samples are still inside the output-latency window), which would jerk the
+   * cursor backwards exactly at resume. The hold pins the cursor to the resume step until the
+   * transport has advanced a full latency, then hands off to steady-state compensation seamlessly.
+   */
+  private resumeHold: { step: number; startSeconds: number; latencySeconds: number } | null = null
+
+  /**
+   * Last resting target written by `seekToStep`/`stop`. While the transport is not started the
+   * clock may not yet reflect the write, so the engine reports the requested target instead. Pause
+   * clears it so the frozen clock supplies the musical pause position.
+   */
+  private restingStep: number | null = null
+
+  /** Tempo used to translate a seek target step into transport seconds for anchor release. */
+  private currentBpm: number = DEFAULT_PROJECT_SETTINGS.bpm
 
   async initializeDiagnostics(): Promise<boolean> {
     const meteringReady = await this.effectsRack.initializeMetering()
@@ -145,11 +195,25 @@ export class PlaybackEngine {
     const transport = Tone.getTransport()
     if (!preserveTempoRamp) transport.bpm.value = projectConfig.bpm
     this.setTempo(projectConfig.bpm)
+    this.setPlayheadBounds(projectConfig)
     setTransportLoop(projectConfig.loopStartStep, projectConfig.loopEndStep, projectConfig.isLooping)
 
     const leadGen = this.beginTransportTrackSession('transport-lead')
     const chordGen = this.beginTransportTrackSession('transport-chord')
     this.scheduler.schedule(notes, chords, projectConfig, leadGen, chordGen)
+  }
+
+  /**
+   * Remembers the musical range the playhead may occupy. Called from every path that knows the
+   * project shape, so `getPlayheadStep(bpm)` can stay loop-aware without taking a config argument.
+   */
+  private setPlayheadBounds(projectConfig: ProjectConfig): void {
+    this.playheadBounds = {
+      loopStartStep: projectConfig.loopStartStep,
+      loopEndStep: projectConfig.loopEndStep,
+      isLooping: projectConfig.isLooping,
+      totalSteps: Math.max(0, projectConfig.bars * STEPS_PER_BAR)
+    }
   }
 
   /**
@@ -182,6 +246,7 @@ export class PlaybackEngine {
   }
 
   setTempo(bpm: number): void {
+    if (Number.isFinite(bpm) && bpm > 0) this.currentBpm = bpm
     this.synths.setTempo(bpm, Tone.now())
   }
 
@@ -259,6 +324,11 @@ export class PlaybackEngine {
     }
     if (this.isDisposed || operation !== this.startOperation) return
     this.outputRouter.blockPreviews(true)
+    // Starting from rest: pin the cursor to the position playback actually starts from until the
+    // compensated clock catches up, so stop→play and pause→play never jump backwards on resume.
+    this.beginResumeHold()
+    this.restingStep = null
+    this.seekAnchor = null
     Tone.getTransport().start()
   }
 
@@ -269,6 +339,11 @@ export class PlaybackEngine {
     this.invalidateTransportSession()
     this.truncateVoices()
     Tone.getTransport().pause()
+    // The frozen transport clock now holds the musical pause position; derive the resting step from
+    // it (no latency compensation) rather than from the last seek/stop target.
+    this.restingStep = null
+    this.seekAnchor = null
+    this.resumeHold = null
   }
 
   stop(targetStep = 0): void {
@@ -280,7 +355,11 @@ export class PlaybackEngine {
     this.clearScheduledEvents()
     this.invalidateTransportSession()
     this.truncateVoices()
-    transport.position = stepToTransportPosition(targetStep)
+    const target = clampToProjectStep(targetStep, this.playheadBounds)
+    transport.position = stepToTransportPosition(target)
+    this.restingStep = target
+    this.seekAnchor = null
+    this.resumeHold = null
   }
 
   /**
@@ -310,9 +389,18 @@ export class PlaybackEngine {
     this.midiLifecycle.cancel()
     this.scheduler.refreshLoop({ loopStartStep: startStep, loopEndStep: endStep, isLooping })
     this.outputRouter.setLoop({ loopEndStep: endStep, isLooping })
+    this.playheadBounds = { ...this.playheadBounds, loopStartStep: startStep, loopEndStep: endStep, isLooping }
     setTransportLoop(startStep, endStep, isLooping)
   }
 
+  /**
+   * Moves the playhead. Tone defers a transport jump while the clock runs (it stops and restarts
+   * on the next tick, up to one lookahead away), so a follow-up `getPlayheadStep` would still read
+   * the pre-seek position. The seek anchor reports the requested target immediately and releases
+   * once the clock lands on it; it stores only the target step, never a loop offset, so a seek can
+   * never leave stale wrap state behind. Lifecycle semantics stay those of
+   * `TRANSPORT_LIFECYCLE_SEMANTICS` `seek`: move position + release sounding voices.
+   */
   seekToStep(step: number): void {
     this.midiLifecycle.cancel()
     if (this.midiLifecycle.isExternal) this.scheduler.refreshLoop()
@@ -320,7 +408,51 @@ export class PlaybackEngine {
     this.releaseSessionVoices('transport')
     this.releaseSessionVoices('transport-lead')
     this.releaseSessionVoices('transport-chord')
-    Tone.getTransport().position = stepToTransportPosition(step)
+
+    const target = clampToProjectStep(Math.round(Number.isFinite(step) ? step : 0), this.playheadBounds)
+    const transport = Tone.getTransport()
+    const wasPlaying = transport.state === 'started'
+    // The transport holds the literal target from the write until its next tick. While a loop is
+    // active Tone then wraps an out-of-range position, so the cursor should already show the folded
+    // value the listener will hear — never the raw out-of-loop step, which would briefly leave the
+    // region. A pre-roll target before the loop start is preserved.
+    const displayTarget = foldPlayheadStep(target, this.playheadBounds, 0)
+    transport.position = stepToTransportPosition(target)
+    this.restingStep = target
+    this.resumeHold = null
+    if (wasPlaying) {
+      const stepSeconds = getStepDurationSeconds(this.currentBpm, '16n')
+      // Tone reads the literal write first, then wraps it to the loop start; release on either.
+      const releaseSeconds = [target * stepSeconds]
+      if (displayTarget !== target) releaseSeconds.push(displayTarget * stepSeconds)
+      this.seekAnchor = { step: displayTarget, releaseSeconds }
+    } else {
+      this.seekAnchor = null
+    }
+  }
+
+  /**
+   * Requested target of an in-flight seek, or null once the transport clock has landed on it. Tone
+   * sets the position absolutely on its next tick, so the audible clock reads the (literal, then
+   * possibly loop-wrapped) target right after the jump. Only the display target step is returned, so
+   * the resolver never inherits wrap state from the pre-seek position, and the anchor drops the
+   * moment the raw clock matches any release point.
+   */
+  private currentSeekAnchor(): number | null {
+    const anchor = this.seekAnchor
+    if (!anchor) return null
+    if (Tone.getTransport().state !== 'started') {
+      this.seekAnchor = null
+      return null
+    }
+    const stepSeconds = getStepDurationSeconds(this.currentBpm, '16n')
+    const tolerance = seekLandingToleranceSeconds(stepSeconds)
+    const clock = this.getCurrentTimeSeconds()
+    if (anchor.releaseSeconds.some((seconds) => Math.abs(clock - seconds) <= tolerance)) {
+      this.seekAnchor = null
+      return null
+    }
+    return anchor.step
   }
 
   // --- Audition / Preview ---
@@ -400,22 +532,83 @@ export class PlaybackEngine {
   }
 
   /**
-   * Continuous playhead position on the project step grid (fractional steps), loop-wrapped
-   * by Tone's transport and never quantized — the sole time source for smooth rendering.
-   * Compensated for output-protection latency during active playback so the cursor matches the audible sample.
+   * Continuous playhead position on the project step grid (fractional steps), never quantized —
+   * the sole time source for smooth rendering.
+   *
+   * - While the transport runs the position is latency-compensated and folded into
+   *   `[loopStartStep, loopEndStep)` (or clamped to the project length when looping is off). The
+   *   open loop end wraps straight onto the loop start, so the cursor never rests on the loop end.
+   * - An in-flight seek reports its target until the clock lands on it, so the cursor reflects the
+   *   jump immediately and never carries the old loop-wrap state.
+   * - Right after a resume the cursor holds the step playback restarted from until the compensated
+   *   clock has advanced past the latency window, keeping the resume continuous.
+   * - While paused or stopped it reports the resting musical position without latency compensation,
+   *   so pause and stop land exactly on the position the transport holds.
    */
   getPlayheadStep(bpm: number): number {
     const stepSeconds = getStepDurationSeconds(bpm, '16n')
     if (stepSeconds <= 0) return 0
-    const latency = Tone.getTransport().state === 'started' ? this.getOutputLatencySeconds() : 0
-    return transportSecondsToPlayheadStep(this.getCurrentTimeSeconds(), stepSeconds, latency)
+
+    if (Tone.getTransport().state !== 'started') {
+      return this.resolveRestingStep(stepSeconds)
+    }
+
+    const anchor = this.currentSeekAnchor()
+    if (anchor !== null) return anchor
+
+    const resumeHold = this.currentResumeHold()
+    if (resumeHold !== null) return resumeHold
+
+    return resolvePlayheadStep(
+      this.getCurrentTimeSeconds(),
+      stepSeconds,
+      this.getOutputLatencySeconds(),
+      this.playheadBounds,
+      true
+    )
   }
 
+  /** Whole-step index of the continuous playhead, floored to the enclosing sixteenth. */
   getCurrentStep(bpm: number): number {
-    const stepDuration = getStepDurationSeconds(bpm, '16n')
-    if (stepDuration <= 0) return 0
-    const latency = Tone.getTransport().state === 'started' ? this.getOutputLatencySeconds() : 0
-    return Math.floor(transportSecondsToPlayheadStep(this.getCurrentTimeSeconds(), stepDuration, latency))
+    if (getStepDurationSeconds(bpm, '16n') <= 0) return 0
+    return Math.floor(this.getPlayheadStep(bpm))
+  }
+
+  /** Starts the resume hold at the step the transport is beginning from. */
+  private beginResumeHold(): void {
+    const latencySeconds = this.getOutputLatencySeconds()
+    if (latencySeconds <= 0) {
+      this.resumeHold = null
+      return
+    }
+    const stepSeconds = getStepDurationSeconds(this.currentBpm, '16n')
+    const startStep = this.restingStep ?? transportSecondsToPlayheadStep(this.getCurrentTimeSeconds(), stepSeconds, 0)
+    this.resumeHold = { step: startStep, startSeconds: this.getCurrentTimeSeconds(), latencySeconds }
+  }
+
+  /**
+   * Pins the cursor to the resume step until the transport has advanced a full latency past the
+   * origin, at which point the compensated clock and the held value coincide and the hold drops.
+   */
+  private currentResumeHold(): number | null {
+    const hold = this.resumeHold
+    if (!hold) return null
+    const elapsed = this.getCurrentTimeSeconds() - hold.startSeconds
+    if (elapsed >= hold.latencySeconds || elapsed < 0) {
+      this.resumeHold = null
+      return null
+    }
+    return foldPlayheadStep(hold.step, this.playheadBounds, 0)
+  }
+
+  /**
+   * Resting position while paused or stopped: prefer the step requested by the last seek/stop,
+   * otherwise derive it from the (uncompensated) transport clock. Only the project length
+   * constrains it — a stop to Bar 1 stays at step 0 even when a loop is enabled.
+   */
+  private resolveRestingStep(stepSeconds: number): number {
+    const raw = this.restingStep ?? transportSecondsToPlayheadStep(this.getCurrentTimeSeconds(), stepSeconds, 0)
+    return clampToProjectStep(raw, this.playheadBounds)
   }
 
   // --- Preset Selection ---
