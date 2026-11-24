@@ -1400,6 +1400,166 @@ async function jobSynthStress() {
     } catch (e) { agg.fail(`threw ${e.message}`); }
     rows.push(agg.row());
   }
+  // Voice teardown vs filter crossfade state (regression: a stolen/released voice kept filter mix
+  // coefficients, DC-blocker memory and parked flags inconsistent across the ~2 ms fade, so the next note
+  // allocated on that slot inherited residue / produced a click when a filter on↔off crossfade overlapped).
+  {
+    const agg = new Agg('synth', 'voice teardown: filter parking on release/steal/hardStop (no residue, no click)');
+    try {
+      const base = {
+        'osc1.on': true, 'osc1.drift': 0, 'osc1.phase': 'reset', 'filter.on': true, 'filter.res': 0.7,
+        'filter.drive': 0.4, 'filter.cutoff': 1200, 'aenv.a': 0.002, 'aenv.r': 0.05,
+        'reverb.on': false, 'delay.on': false, 'chorus.on': false, 'phaser.on': false, 'drive.on': false,
+      };
+      const tL = new Float32Array(128), tR = new Float32Array(128);
+      const tick = s => { tL.fill(0); tR.fill(0); s.process(tL, tR, 128); };
+      const parked = v => v.fParked === true && v.f2Parked === true && v.fMix0 === 0 && v.fMix1 === 0 &&
+        v.f2Mix0 === 0 && v.f2Mix1 === 0 && v.f2Run === 0 && v.filtIdle === 1e9 &&
+        v.dcxL === 0 && v.dcyL === 0 && v.dcxR === 0 && v.dcyR === 0 &&
+        v.filter.ld.every(x => x === 0) && v.filter.sv.every(x => x === 0) && v.filter.fmS.every(x => x === 0) &&
+        v.filter2.st.every(x => x === 0);
+      // 1) normal note end: the recycled slot is fully parked (mixes collapsed, DC + filter memory cleared)
+      {
+        const s = new M.Synth(sr);
+        s.loadPatch({ params: { ...base, 'voice.poly': 2, 'aenv.r': 0.03 }, macros: [] });
+        s.noteOn(60, 0.9);
+        for (let k = 0; k < 4; k++) tick(s);
+        const v = s.voices.find(x => x.note === 60 && x.active);
+        if (!v) agg.fail('note did not start');
+        else {
+          if (v.fParked !== false || v.fMix1 !== 1) agg.fail('sounding voice should have a live, unparked filter');
+          s.noteOff(60);
+          for (let k = 0; k < 40; k++) tick(s);
+          if (s.voices.some(x => x.active)) agg.fail('voice not recycled after the release rang out');
+          if (!parked(v)) agg.fail('recycled voice kept filter mix / DC / parked residue');
+        }
+      }
+      // 2) steal during a filter on→off and off→on crossfade: output stays continuous (no sample jump beyond
+      //    the steady-tone rate), the fade still renders, and the freed voice ends parked without NaN/Inf.
+      for (const [label, startOn] of [['on→off', true], ['off→on', false]]) {
+        const s = new M.Synth(sr);
+        s.loadPatch({ params: { ...base, 'voice.poly': 1, 'filter.on': startOn }, macros: [] });
+        s.noteOn(60, 0.9);
+        tick(s); tick(s);
+        const v = s.voices.find(x => x.active);
+        s.setParam('filter.on', !startOn); // begin the 5 ms filter crossfade
+        v.startFade(0.002);                // begin the ~2 ms steal fade so they overlap
+        const total = Math.round(0.02 * sr);
+        const L = new Float32Array(total), R = new Float32Array(total);
+        let pos = 0, nan = 0, early = 0;
+        while (pos < total) {
+          tL.fill(0); tR.fill(0);
+          s.process(tL, tR, 128);
+          const m = Math.min(128, total - pos);
+          L.set(tL.subarray(0, m), pos); R.set(tR.subarray(0, m), pos);
+          pos += m;
+        }
+        for (let i = 0; i < total; i++) if (!Number.isFinite(L[i]) || !Number.isFinite(R[i])) nan++;
+        for (let i = 0; i < Math.round(0.001 * sr); i++) early = Math.max(early, Math.abs(L[i]), Math.abs(R[i]));
+        // reference: an uninterrupted note with the same patch (no steal, no toggle)
+        const ref = new M.Synth(sr);
+        ref.loadPatch({ params: { ...base, 'voice.poly': 1, 'filter.on': startOn }, macros: [] });
+        ref.noteOn(60, 0.9); tick(ref); tick(ref);
+        const rL = new Float32Array(total), rR = new Float32Array(total);
+        let rp = 0;
+        while (rp < total) { tL.fill(0); tR.fill(0); ref.process(tL, tR, 128); const m = Math.min(128, total - rp); rL.set(tL.subarray(0, m), rp); rR.set(tR.subarray(0, m), rp); rp += m; }
+        const win = Math.round(0.004 * sr);
+        let dSteal = 0, dRef = 0;
+        for (let i = 1; i < win; i++) {
+          dSteal = Math.max(dSteal, Math.abs(L[i] - L[i - 1]), Math.abs(R[i] - R[i - 1]));
+          dRef = Math.max(dRef, Math.abs(rL[i] - rL[i - 1]), Math.abs(rR[i] - rR[i - 1]));
+        }
+        if (nan) agg.fail(`${label}: ${nan} NaN/Inf while stealing through the crossfade`);
+        if (dSteal > dRef * 1.25 + 1e-6) agg.fail(`${label}: click mid crossfade (peak Δ ${dSteal.toExponential(2)} vs steady ${dRef.toExponential(2)})`);
+        if (early <= 1e-3) agg.fail(`${label}: voice was silenced early during its fade (peak ${early})`);
+        if (v.active || !parked(v)) agg.fail(`${label}: stolen voice not parked at fade end`);
+      }
+      // 3a) hardStop then reallocation: a hard stop resets engines AND parks the filters, so the reused slot
+      //     must render the next note bit-identically to a never-used fresh voice (same seed/timeline), with
+      //     filters both off and on.
+      for (const [filtOn, f2Type] of [[false, 'off'], [true, 'lp']]) {
+        const renderB = hardFirst => {
+          const s = new M.Synth(sr);
+          s.loadPatch({ params: { ...base, 'voice.poly': 1, 'filter.on': filtOn, 'filter2.type': f2Type }, macros: [] });
+          if (hardFirst) {
+            s.noteOn(60, 0.9);
+            for (let k = 0; k < 3; k++) tick(s);
+            s.voices[0].hardStop();
+          }
+          for (let k = 0; k < 30; k++) tick(s); // idle blocks on the same timeline
+          if (hardFirst && !parked(s.voices[0])) return null;
+          s.noteOn(72, 0.7);
+          const n = Math.round(0.3 * sr), out = new Float32Array(n);
+          let p = 0;
+          while (p < n) { tL.fill(0); tR.fill(0); s.process(tL, tR, 128); const m = Math.min(128, n - p); out.set(tL.subarray(0, m), p); p += m; }
+          return out;
+        };
+        const oHard = renderB(true), oFresh = renderB(false);
+        if (!oHard) { agg.fail(`filter ${filtOn ? 'on' : 'off'}: hardStop slot not parked before realloc`); continue; }
+        let md = 0;
+        for (let i = 0; i < oHard.length; i++) md = Math.max(md, Math.abs(oHard[i] - oFresh[i]));
+        if (md !== 0) agg.fail(`filter ${filtOn ? 'on' : 'off'}: hardStop reuse differs from a fresh voice (max |Δ| ${md})`);
+      }
+      // 3b) the natural recycle path keeps the engines' memory (so noteOn preserves the exact onset sample);
+      //     it must still be deterministic and leave the slot fully parked before the reallocation.
+      {
+        const renderNatural = () => {
+          const s = new M.Synth(sr);
+          s.loadPatch({ params: { ...base, 'voice.poly': 1, 'filter2.type': 'lp' }, macros: [] });
+          s.noteOn(60, 0.9);
+          for (let k = 0; k < 3; k++) tick(s);
+          s.noteOff(60);
+          for (let k = 0; k < 30; k++) tick(s);
+          if (!parked(s.voices[0])) return null;
+          s.noteOn(72, 0.7);
+          const n = Math.round(0.3 * sr), out = new Float32Array(n);
+          let p = 0;
+          while (p < n) { tL.fill(0); tR.fill(0); s.process(tL, tR, 128); const m = Math.min(128, n - p); out.set(tL.subarray(0, m), p); p += m; }
+          return out;
+        };
+        const a = renderNatural(), b = renderNatural();
+        if (!a || !b) agg.fail('natural recycle: slot not parked before realloc');
+        else {
+          let md = 0;
+          for (let i = 0; i < a.length; i++) md = Math.max(md, Math.abs(a[i] - b[i]));
+          if (md !== 0) agg.fail(`natural recycle is non-deterministic (max |Δ| ${md})`);
+        }
+      }
+      // 4) alternating steals and releases: every recycled slot stays parked; active voices' parked flags
+      //    always agree with their crossfade mixes.
+      {
+        const s = new M.Synth(sr);
+        s.loadPatch({ params: { ...base, 'voice.poly': 2, 'aenv.r': 0.4 }, macros: [] });
+        const everUsed = new Set();
+        let bad = 0;
+        for (let k = 0; k < 24; k++) {
+          const note = 48 + (k % 12);
+          s.noteOn(note, 0.85);
+          for (let b = 0, n = 1 + (k % 3); b < n; b++) tick(s);
+          for (const x of s.voices) if (x.active || everUsed.has(x)) everUsed.add(x);
+          if (k % 2 === 0) {
+            const victim = s.voices.find(x => x.active && !x.fading);
+            if (victim) victim.startFade(0.002);
+            for (let b = 0; b < 8; b++) tick(s); // fade completes → hardStop teardown
+          } else { s.noteOff(note); tick(s); tick(s); }
+          for (const x of s.voices) {
+            if (everUsed.has(x) && !x.active && !parked(x)) bad++;
+            if (x.active) {
+              if (x.fParked !== (x.fMix0 === 0 && x.fMix1 === 0)) bad++;
+              if (x.f2Parked !== (x.f2Mix0 === 0 && x.f2Mix1 === 0)) bad++;
+            }
+          }
+        }
+        s.allNotesOff(false);
+        for (let k = 0; k < 240; k++) tick(s); // > aenv.r ring-out
+        const allParked = s.voices.filter(x => everUsed.has(x)).every(x => !x.active && parked(x));
+        if (bad) agg.fail(`${bad} parked/mix inconsistencies across 24 steal/release cycles`);
+        if (!allParked) agg.fail('pool not fully parked after allNotesOff + ring-out');
+      }
+      agg.sample('teardown', { peak: 0, nan: 0, dc: 0 });
+    } catch (e) { agg.fail(`threw ${String(e?.stack || e).split('\n').slice(0, 2).join(' ')}`); }
+    rows.push(agg.row());
+  }
   return rows;
 }
 

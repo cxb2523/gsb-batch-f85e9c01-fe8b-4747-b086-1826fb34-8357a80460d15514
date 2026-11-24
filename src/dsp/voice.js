@@ -322,21 +322,70 @@ export class Voice {
     this.fadeStep = 1 / Math.max(1, timeSec * this.sr);
   }
 
-  /** Immediate hard stop (no fade). */
-  hardStop() {
+  /**
+   * Immediate hard stop (no fade). The single shared teardown: steal cuts, panic, the NaN/Inf guard and the
+   * silent recycle paths (envelope done / engines rung out) all end here, so a recycled slot never carries
+   * filter or per-note control state into its next allocation.
+   *
+   * @param {boolean} [resetEngines=true]
+   *   A truly immediate stop (steal cut, panic, NaN/Inf guard) resets the engines too — their next note
+   *   starts a fresh preroll. A silent natural recycle passes false: the engines' memory is kept so the next
+   *   noteOn() crossfades from the (already silent) waveform, preserving the note's exact onset sample
+   *   (resetting here switched the preroll path and shifted onsets by a few samples). Either way the
+   *   filters, DC blocker, crossfade mixes and all per-note control state are parked/cleared identically.
+   */
+  hardStop(resetEngines = true) {
     this.active = false;
     this.gate = false;
     this.fading = false;
+    this.fadeT = 0;
+    this.fadeGain = 1;
     this.pending = P_NONE;
     this.pendingRelease = false;
     this.controlled = false;
-    for (let s = 0; s < NSRC; s++) { this.engines[s].reset(); this.started[s] = 0; }
-    this.filter.reset(); this.filter2.reset();
-    this.dcxL = this.dcyL = this.dcxR = this.dcyR = 0;
+    this.silentBlocks = 0;
+    for (let s = 0; s < NSRC; s++) {
+      if (resetEngines) this.engines[s].reset();
+      this.started[s] = 0; this.proc[s] = 0;
+    }
     this.aenv.reset(); this.fenv.reset(); this.menv.reset();
     this.g0.fill(0); this.g1.fill(0);
+    this.panCache.fill(NaN);
     this.a0L = this.a0R = this.a1L = this.a1R = 0;
-    this.glideOff = 0;
+    this.ampPanCache = NaN; this.apL = 1; this.apR = 1;
+    this.blockEnergy = 0;
+    // pitch / vibrato
+    this.glideOff = 0; this.glideT = -1; this.glideCoef = 0;
+    this.vibPhase = 0;
+    // smoothed filter parameter memory (fresh notes reinitialise these, but a recycled slot must not hold
+    // the previous note's smoothed values either)
+    this.lcS = 10; this.l2S = 10;
+    this.cut0 = 1000; this.cut1 = 1000;
+    this.fRes = 0; this.fDrive = 0; this.fVowel = 0; this.f2Cut = 1000; this.f2Res = 0;
+    this.fType = 0; this.f2Mode = -1;
+    // Filters must leave with the same parked state as a fresh voice: mixes collapsed, internal memory and
+    // the DC blocker cleared, parked flags set. Otherwise the next note inherits stale crossfade
+    // coefficients / residue (e.g. a filter faded back in swells the old note's memory up again).
+    this._parkFilters();
+  }
+
+  /**
+   * Park both filters and all state surrounding them. Every teardown route — hardStop() (steal cut, panic,
+   * NaN/Inf guard) and the silent recycle paths in _endOfBlock() (released note rung out, engines silent) —
+   * funnels through here, so release and steal share one consistent filter shutdown:
+   *   · fMix / f2Mix crossfade coefficients collapse to 0 (no inherited mix on the next allocation);
+   *   · both filters' internal state and the main filter's DC blocker are cleared;
+   *   · fParked / f2Parked are set and filtIdle is marked idle, matching the constructed-voice defaults.
+   */
+  _parkFilters() {
+    this.fMix0 = 0; this.fMix1 = 0;
+    this.f2Mix0 = 0; this.f2Mix1 = 0;
+    this.f2Run = 0;
+    this.filter.reset();
+    this.filter2.reset();
+    this.dcxL = this.dcyL = this.dcxR = this.dcyR = 0;
+    this.fParked = true; this.f2Parked = true;
+    this.filtIdle = 1e9;
   }
 
   get stageName() {
@@ -557,6 +606,7 @@ export class Voice {
     if (fresh) {
       this.fRes = tRes; this.fDrive = tDrive; this.fVowel = tVowel; this.l2S = l2; this.f2Res = tRes2;
       this.fMix0 = this.fMix1 = fOnT; this.f2Mix0 = this.f2Mix1 = f2OnT;
+      this.f2Run = f2OnT ? m2 : 0; // no inherited run mode from a parked previous note
     } else {
       this.fRes += (tRes - this.fRes) * kS; this.fDrive += (tDrive - this.fDrive) * kS;
       this.fVowel += (tVowel - this.fVowel) * kS; this.l2S += (l2 - this.l2S) * kS; this.f2Res += (tRes2 - this.f2Res) * kS;
@@ -730,9 +780,10 @@ export class Voice {
     if (!(e === e) || e === Infinity) { this.hardStop(); return false; } // NaN/Inf guard
     if (this.fading && this.fadeGain <= 0) { this.hardStop(); return false; }
     if (this.aenv.done && this.pending === P_NONE) {
-      // amp envelope finished → voice is silent
-      this.active = false; this.gate = false;
-      for (let s = 0; s < NSRC; s++) this.started[s] = 0;
+      // amp envelope finished → voice is silent. Release and steal share the same closing path (hardStop),
+      // which parks the filters and clears every per-note state; the engines are kept so the next noteOn
+      // preserves its exact onset (see hardStop's resetEngines note).
+      this.hardStop(false);
       return false;
     }
     // engines rung out (e.g. plucked phys / one-shot noise) and output silent → free early
@@ -742,9 +793,8 @@ export class Voice {
     }
     if (!anyActive && e < 1e-12 && this.aenv.stage !== ENV_ATTACK) {
       if (++this.silentBlocks > 48) {
-        this.active = false; this.gate = false;
-        for (let s = 0; s < NSRC; s++) this.started[s] = 0;
-        this.aenv.reset(); this.fenv.reset(); this.menv.reset();
+        // same shared teardown: filters + DC blocker + mixes parked and per-note state cleared; engines kept
+        this.hardStop(false);
         return false;
       }
     } else this.silentBlocks = 0;
