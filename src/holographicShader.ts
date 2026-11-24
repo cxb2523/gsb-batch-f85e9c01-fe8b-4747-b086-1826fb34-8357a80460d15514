@@ -248,13 +248,20 @@ export function createHolographicPassMaterial(
   return { material, uniforms }
 }
 
+export interface ContactShadowMaterialHandle {
+  material: THREE.ShaderMaterial
+  setDarkTheme: (isDark: boolean) => void
+  /** Re-points the alpha cutout at the current front-face diffuse map after a re-edition. */
+  setAlphaMap: (texture: THREE.Texture) => void
+}
+
 /**
  * Creates a real-time deforming soft contact shadow material that mirrors the exact Verlet mesh
  * (both upper pass and peeling/falling lower stub) onto the studio backdrop plane!
  */
 export function createContactShadowMaterial(
   frontMap: THREE.Texture
-): { material: THREE.ShaderMaterial; setDarkTheme: (isDark: boolean) => void } {
+): ContactShadowMaterialHandle {
   const uniforms = {
     uAlphaMap: { value: frontMap },
     uShadowOpacity: { value: 0.22 },
@@ -304,6 +311,10 @@ export function createContactShadowMaterial(
     setDarkTheme: (isDark: boolean) => {
       uniforms.uShadowOpacity.value = isDark ? 0.52 : 0.19
       uniforms.uShadowColor.value.set(isDark ? '#020305' : '#1E1B16')
+    },
+    setAlphaMap: (texture: THREE.Texture) => {
+      // Keep the shadow's silhouette locked to whatever front face is currently printed
+      uniforms.uAlphaMap.value = texture
     }
   }
 }

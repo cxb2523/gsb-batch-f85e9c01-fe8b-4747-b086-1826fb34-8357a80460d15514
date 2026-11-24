@@ -462,10 +462,8 @@ export class VerletPaperEngine {
    */
   public resetPass(animateEntrance = true): void {
     this.isFullyDetached = false
-    this.autoTearActive = false
-    this.grabbedIndex = -1
-    this.isDraggingStub = false
-    this.pullAccumulator = 0
+    this.cancelAutoTear()
+    this.clearGrabState()
     this.seamIntact.fill(true)
     this.seamStrain.fill(0)
     this.vertexStrain.fill(0)
@@ -509,6 +507,25 @@ export class VerletPaperEngine {
       if (this.seamIntact[c]) count++
     }
     return count
+  }
+
+  /** True while the automated zipper tear timer is still advancing columns. */
+  public get isAutoTearing(): boolean {
+    return this.autoTearActive
+  }
+
+  /** Stops any in-flight automated zipper tear without touching the seam state. */
+  public cancelAutoTear(): void {
+    this.autoTearActive = false
+    this.autoTearTimer = 0
+  }
+
+  /** Releases pointer-grab / stub-pull interaction state held by the engine. */
+  public clearGrabState(): void {
+    this.grabbedIndex = -1
+    this.isDraggingStub = false
+    this.pullAccumulator = 0
+    this.seamStrain.fill(0)
   }
 
   public getMetrics(): PhysicsMetrics {

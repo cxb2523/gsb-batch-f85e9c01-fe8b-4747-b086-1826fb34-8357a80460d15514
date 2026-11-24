@@ -38,6 +38,7 @@ class HolographicTicketApp {
   private xrayLines: THREE.LineSegments
   private passUniforms: ReturnType<typeof createHolographicPassMaterial>['uniforms']
   private setShadowDarkTheme: (isDark: boolean) => void
+  private setShadowAlphaMap: (texture: THREE.Texture) => void
 
   private raycaster = new THREE.Raycaster()
   private pointerNdc = new THREE.Vector2()
@@ -93,6 +94,7 @@ class HolographicTicketApp {
     // 4. Create Deforming Soft Contact Shadow Mesh (mirrors live Verlet geometry)
     const shadowMatObj = createContactShadowMaterial(this.texGen.textures.frontMap)
     this.setShadowDarkTheme = shadowMatObj.setDarkTheme
+    this.setShadowAlphaMap = shadowMatObj.setAlphaMap
     this.shadowMesh = new THREE.Mesh(this.verlet.geometry, shadowMatObj.material)
     this.shadowMesh.renderOrder = 1
     this.scene.add(this.shadowMesh)
@@ -126,7 +128,8 @@ class HolographicTicketApp {
     // Wait for web fonts to settle so canvas typography is ultra-sharp
     if (document.fonts && document.fonts.ready) {
       document.fonts.ready.then(() => {
-        this.texGen.updateTicket(this.currentTier, this.currentSeat)
+        // Redraw in place and keep every texture consumer pointed at the live canvases
+        this.refreshTicketTextures()
       })
     }
 
@@ -274,9 +277,65 @@ class HolographicTicketApp {
     })
   }
 
+  /**
+   * Redraws all four ticket canvases in place and re-points every texture consumer at them.
+   * The CanvasTexture objects themselves are reused for the lifetime of the app, so repeated
+   * edition switches never allocate new canvases or GPU textures.
+   */
+  private refreshTicketTextures(): void {
+    this.texGen.updateTicket(this.currentTier, this.currentSeat)
+    // Re-point every texture consumer at the freshly drawn maps. The CanvasTexture objects are
+    // reused across editions, but assigning them here keeps the invariant explicit and makes the
+    // foil shader + contact shadow impossible to leave behind on an older print.
+    const tex = this.texGen.textures
+    this.passUniforms.uFrontMap.value = tex.frontMap
+    this.passUniforms.uFrontFoilMap.value = tex.frontFoilMap
+    this.passUniforms.uBackMap.value = tex.backMap
+    this.passUniforms.uBackFoilMap.value = tex.backFoilMap
+    // Keep the foil shader locked to the edition that is currently printed
+    this.passUniforms.uFoilMode.value = this.currentTier.foilMode
+    // The contact shadow must always sample the live front-face alpha silhouette
+    this.setShadowAlphaMap(tex.frontMap)
+  }
+
+  /** Releases pointer / slice / grab interaction state held outside the physics engine. */
+  private clearStageInteractionState(): void {
+    this.isPointerDown = false
+    this.isSlicingSeam = false
+    this.lastSliceU = null
+    this.seamHoverAmount = 0
+    this.verlet.hoverTiltX = 0
+    this.verlet.hoverTiltY = 0
+    this.verlet.clearGrabState()
+    document.getElementById('seam-cursor-pill')?.classList.remove('is-visible')
+  }
+
+  private hasTearProgress(): boolean {
+    return (
+      this.verlet.isFullyDetached ||
+      this.verlet.isAutoTearing ||
+      this.verlet.getIntactSeamCount() < NUM_COLS
+    )
+  }
+
+  /**
+   * Single entry point for changing the printed face (edition, seat or URL tier).
+   * If the previous ticket was already (partly) torn or auto-tearing, the physical card,
+   * fiber strip, status badge and X-Ray telemetry are all collapsed back to a fresh pass so
+   * no torn-face / verified-badge hybrid state can survive a re-print.
+   */
+  private reprintSelection(): void {
+    this.refreshTicketTextures()
+    if (this.hasTearProgress()) {
+      this.clearStageInteractionState()
+      this.verlet.resetPass(false)
+    }
+    this.syncPerforationUI()
+    this.updateXRayTelemetryDOM()
+  }
+
   public selectTier(tierId: TierEditionId): void {
     this.currentTier = TIER_SPECS[tierId]
-    this.passUniforms.uFoilMode.value = this.currentTier.foilMode
 
     document.querySelectorAll<HTMLButtonElement>('.tier-option').forEach((btn) => {
       const active = btn.dataset.tier === tierId
@@ -284,7 +343,7 @@ class HolographicTicketApp {
       btn.setAttribute('aria-checked', String(active))
     })
 
-    this.texGen.updateTicket(this.currentTier, this.currentSeat)
+    this.reprintSelection()
     this.updateCheckoutSummaryText()
     this.sound.playCardFlexWhoosh(0.45)
 
@@ -307,7 +366,7 @@ class HolographicTicketApp {
     const gateEl = document.getElementById('active-gate-label')
     if (gateEl) gateEl.textContent = seat.gate
 
-    this.texGen.updateTicket(this.currentTier, this.currentSeat)
+    this.reprintSelection()
     this.updateCheckoutSummaryText()
     this.sound.playCardFlexWhoosh(0.35)
   }
@@ -348,9 +407,13 @@ class HolographicTicketApp {
   }
 
   public issueFreshPass(): void {
+    // Drop any in-flight auto-tear timer, grab and slice state before a new pass slides in,
+    // so no stale callback can fire a fiber sound or UI update against the fresh ticket.
+    this.clearStageInteractionState()
     this.verlet.resetPass(true)
     this.sound.playCardFlexWhoosh(0.8)
     this.syncPerforationUI()
+    this.updateXRayTelemetryDOM()
   }
 
   private bindStageInteractions(): void {
