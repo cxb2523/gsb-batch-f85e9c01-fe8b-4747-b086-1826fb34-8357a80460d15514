@@ -4,7 +4,7 @@ import { Sounds } from '/imports/api/sounds.js';
 import { Songs } from '/imports/api/songs.js';
 
 import React from 'react';
-import { find, times, random } from 'lodash';
+import { find } from 'lodash';
 
 import AddSound from '../sound/AddSound.jsx';
 import Sound from '../sound/Sound.jsx';
@@ -26,29 +26,31 @@ export class MainScreen extends React.Component {
   constructor(props){
     super(props)
     this.state = {
-      songSounds: [],
-      selectedSong: false,
-      tones: []
+      codeErrors: false
     }
   }
 
-  componentWillUpdate(nextProps, nextState) {
-    // get the selected song and its related sounds
-    let selectedSong = find(nextProps.songs, {selected: true})
-    let songSounds = times(selectedSong.sounds.length, id => Sounds.findOne(selectedSong.sounds[id]))
-
-    nextState.songSounds = songSounds
-    nextState.selectedSong = selectedSong
+  // Song sounds are derived during render from the reactive Sounds cache.
+  // withTracker above depends on Sounds.find(), so any sound change (mute,
+  // code, delete) re-renders this screen and Player receives a fresh list.
+  getSongSounds () {
+    let selectedSong = find(this.props.songs, {selected: true})
+    if (!selectedSong || !selectedSong.sounds) return []
+    return selectedSong.sounds
+      .map(id => Sounds.findOne(id))
+      .filter(sound => !!sound)
   }
 
 	render() {
+    let songSounds = this.getSongSounds()
+
 		return (
       <div className="MainsScreen">
         <css.Panel w={23}>
           <Bpm />
           <p> SOUNDS SONG </p>
           <ul>
-            {this.state.songSounds.map(sound => {
+            {songSounds.map(sound => {
                 return <Sound key={`${sound._id}-songSound`} sound={sound} type="songSound"/>
               }
             )}
@@ -67,7 +69,7 @@ export class MainScreen extends React.Component {
           <Editor
             sound={this.props.selectedSound} />
 
-          <Player sounds={this.state.songSounds} />
+          <Player sounds={songSounds} />
         </css.Panel>
 
         <css.Panel w={23}>

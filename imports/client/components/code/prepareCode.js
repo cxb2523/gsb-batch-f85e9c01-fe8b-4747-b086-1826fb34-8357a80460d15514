@@ -2,6 +2,7 @@ import esprima from 'esprima'
 import { intersection, filter } from 'lodash'
 
 export let prepareCode = (code) => {
+  let result
   try {
     result = esprima.parseModule(code)
 

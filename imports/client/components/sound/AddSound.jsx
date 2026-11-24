@@ -4,9 +4,7 @@ import dedent from 'dedent-js';
 
 import { Meteor } from 'meteor/meteor'
 
-let notes = ['A2','B2','C2','D2','E2','F2','G2']
-let timeNotes = ['2n','4n','8n','16n']
-let times = ['0.5','1','1.5','2','2.5']
+let notes = ['A2','B2','C3','D3','E3','F3','G3']
 
 import * as css from '/imports/client/components/css/styles.js'
 
@@ -17,19 +15,29 @@ export default class AddSound extends React.Component {
   }
 
   createSound = () => {
+    let note = notes[random(notes.length - 1)]
     let codeDefault = dedent(`
-      let freeverb = new Tone.Freeverb().toMaster();
-      freeverb.dampening.value = ${random(1000,5000)};
-      let synth = new Tone.AMSynth().connect(freeverb);
-      Tone.Transport.schedule(time => {
-        synth.triggerAttackRelease('${notes[random(notes.length - 1)]}', '${timeNotes[random(timeNotes.length - 1)]}', time)
-      }, ${times[random(times.length - 1)]})`)
+      let filter = new Tone.Filter(1200, 'lowpass').toMaster();
+      let synth = new Tone.Synth({
+        oscillator: { type: 'square' },
+        envelope: { attack: 0.02, decay: 0.2, sustain: 0.3, release: 0.8 }
+      }).connect(filter);
+      let c = new Tone.Loop(time => {
+        synth.triggerAttackRelease('${note}', '8n', time);
+      }, '4n');
+      let o = {
+        vars: [
+          ['cutoff', filter.frequency, 100, 6000, 1, 1200],
+          ['attack', synth.envelope, 0.001, 0.5, 0.001, 0.02]
+        ]
+      };
+    `)
 
     Meteor.call('sounds.insert', codeDefault);
   }
 
-	render() {
-		return (
+  render() {
+    return (
       <css.Button onClick={this.createSound}>
         addSound
       </css.Button>
