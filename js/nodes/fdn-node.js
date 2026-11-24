@@ -10,8 +10,13 @@ export class FDNNodeUI extends DSPNode {
         this.delays = [];
         this.feedbackGains = [];
         this.dampers = [];
+        this.dcBlockers = [];
         this.lfos = [];
         this.lfoGains = [];
+
+        this.inputGain = null;
+        this.outputMixer = null;
+        this.matrixSum = null;
 
         const sampleRate = 48000;
 
@@ -29,14 +34,61 @@ export class FDNNodeUI extends DSPNode {
         // LFO Tuning Offsets (in Hz) for Modulation Diversity
         this.lfoTuningOffsets = [0, 0.01, 0.0142, 0.02, 0.025, 0.028235, 0.03151, 0.0343341];
 
+        // Stored parameter state. initAudio() rebuilds the graph from these
+        // values, so re-initialization never falls back to defaults.
         this.currentSize = 1.0;
         this.currentDecay = 2.0;
+        this.currentDamping = 8000;
         this.modRateBase = 0.1;
         this.modRateSpread = 0.05;
         this.modAmount = 0.5;
     }
 
+    // Single teardown path shared by initAudio() (rebuild) and onRemoved().
+    // Stops every oscillator and disconnects every node created by the last
+    // initAudio() call so no residual audio or modulation can survive.
+    cleanupAudio() {
+        if (this.lfos) {
+            this.lfos.forEach(osc => {
+                try { osc.stop(); } catch (e) { }
+                try { osc.disconnect(); } catch (e) { }
+            });
+        }
+        const disconnectAll = (list) => {
+            if (!list) return;
+            list.forEach(node => {
+                try { node.disconnect(); } catch (e) { }
+            });
+        };
+        disconnectAll(this.lfoGains);
+        disconnectAll(this.delays);
+        disconnectAll(this.feedbackGains);
+        disconnectAll(this.dampers);
+        disconnectAll(this.dcBlockers);
+        [this.inputGain, this.outputMixer, this.matrixSum].forEach(node => {
+            if (!node) return;
+            try { node.disconnect(); } catch (e) { }
+        });
+
+        this.delays = [];
+        this.feedbackGains = [];
+        this.dampers = [];
+        this.dcBlockers = [];
+        this.lfos = [];
+        this.lfoGains = [];
+        this.inputGain = null;
+        this.outputMixer = null;
+        this.matrixSum = null;
+    }
+
+    onRemoved() {
+        this.cleanupAudio();
+    }
+
     initAudio(ctx) {
+        // --- 0. Teardown any previous graph (repeat-safe init) ---
+        this.cleanupAudio();
+
         // --- 1. Master I/O ---
         this.inputGain = ctx.createGain();
         this.outputMixer = ctx.createGain();
@@ -45,17 +97,10 @@ export class FDNNodeUI extends DSPNode {
         // Formula: Output = Input - (2/N * Sum)
         this.matrixSum = ctx.createGain();
 
-        // CRITICAL FIX: Dynamic scaling based on N. 
+        // CRITICAL FIX: Dynamic scaling based on N.
         // For N=8, this becomes -0.25. For N=4, it was -0.5.
         const scalingFactor = -2.0 / this.N;
         this.matrixSum.gain.value = scalingFactor;
-
-        // Cleanup
-        this.delays = [];
-        this.feedbackGains = [];
-        this.dampers = [];
-        this.lfos = [];
-        this.lfoGains = [];
 
         // --- 3. Construct the Feedback Loops ---
         for (let i = 0; i < this.N; i++) {
@@ -68,7 +113,6 @@ export class FDNNodeUI extends DSPNode {
             const lfo = ctx.createOscillator();
             const freq = Math.max(0.01, this.modRateBase + (i * this.modRateSpread) + this.lfoTuningOffsets[i]);
             lfo.frequency.value = freq;
-            lfo.phase = Math.random() * Math.PI * 2; // Random start phase
             const lfoGain = ctx.createGain();
             const depth = Math.max(0, this.modAmount) * 0.001;
             lfoGain.gain.value = depth;
@@ -90,13 +134,14 @@ export class FDNNodeUI extends DSPNode {
             hpf.type = 'highpass';
             hpf.frequency.value = 20;
             hpf.Q.value = -3; // Standard Butterworth-ish response
+            this.dcBlockers.push(hpf);
 
             // 2. Lowpass (Damping)
-            // STABILITY FIX: Q=0 is physically accurate (1-pole). 
+            // STABILITY FIX: Q=0 is physically accurate (1-pole).
             // Q=-3 is a hack that isn't needed with correct matrix scaling.
             const lpf = ctx.createBiquadFilter();
             lpf.type = 'lowpass';
-            lpf.frequency.value = 15000;
+            lpf.frequency.value = this.currentDamping;
             lpf.Q.value = -3;
             this.dampers.push(lpf);
 
@@ -126,17 +171,20 @@ export class FDNNodeUI extends DSPNode {
         this.inputs = [{ name: 'In', id: 0, node: this.inputGain }];
         this.outputs = [{ name: 'Out', id: 0, node: this.outputMixer }];
 
+        // Param widgets are seeded from the stored state (not hardcoded
+        // defaults) so the UI and the audio graph stay in sync across
+        // rebuilds, preset loads and node duplication.
         this.params = [
             {
-                label: 'Size (Scale)', type: 'range', value: 1.0, min: 0.1, max: 2.0, scale: 'linear',
+                label: 'Size (Scale)', type: 'range', value: this.currentSize, min: 0.1, max: 2.0, scale: 'linear',
                 onChange: (v) => this.setSize(v, ctx)
             },
             {
-                label: 'Decay (s)', type: 'range', value: 2.0, min: 0.1, max: 10.0, scale: 'log',
+                label: 'Decay (s)', type: 'range', value: this.currentDecay, min: 0.1, max: 10.0, scale: 'log',
                 onChange: (v) => this.setDecayTime(v, ctx)
             },
             {
-                label: 'Damping', type: 'range', value: 8000, min: 500, max: 20000, scale: 'log',
+                label: 'Damping', type: 'range', value: this.currentDamping, min: 500, max: 20000, scale: 'log',
                 onChange: (v) => this.setDamping(v, ctx)
             },
             {
@@ -152,8 +200,12 @@ export class FDNNodeUI extends DSPNode {
         this.initializeParams();
         this.computeHeight();
 
-        // Initial setup
-        this.setSize(1.0, ctx);
+        // Apply the stored state to the fresh graph. Order matters: size
+        // first (it recomputes decay gains from currentDecay internally),
+        // then decay/damping/modulation so nothing overrides them afterwards.
+        this.setSize(this.currentSize, ctx);
+        this.setDecayTime(this.currentDecay, ctx);
+        this.setDamping(this.currentDamping, ctx);
         this.setModulationRate(this.modRateBase, ctx);
         this.setModulationAmount(this.modAmount, ctx);
     }
@@ -188,6 +240,7 @@ export class FDNNodeUI extends DSPNode {
     }
 
     setDamping(freq, ctx) {
+        this.currentDamping = freq;
         this.dampers.forEach(lpf => lpf.frequency.setTargetAtTime(freq, ctx.currentTime, 0.02));
     }
 

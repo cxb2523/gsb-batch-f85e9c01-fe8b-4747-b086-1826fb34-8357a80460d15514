@@ -9,6 +9,13 @@ export class DiffuserNodeUI extends DSPNode {
         this.baseFrequencies = [500, 1200, 2500, 4000];
         this.modOscillators = [];
         this.modGains = [];
+
+        this.inputGain = null;
+        this.outputGain = null;
+
+        // Stored parameter state. initAudio() rebuilds the graph from these
+        // values, so re-initialization never falls back to defaults.
+        this.currentQ = 2.0;
         this.modDepthValue = 0;
         this.modRateValue = 0.35;
         this.modRateSpread = 0.05;
@@ -16,7 +23,9 @@ export class DiffuserNodeUI extends DSPNode {
     }
 
     initAudio(ctx) {
-        this.cleanupModulation();
+        // --- 0. Teardown any previous graph (repeat-safe init) ---
+        this.cleanupAudio();
+
         // --- 1. Create Input and Output Gains ---
         this.inputGain = ctx.createGain();
         this.outputGain = ctx.createGain();
@@ -24,8 +33,6 @@ export class DiffuserNodeUI extends DSPNode {
         // --- 2. Define Allpass Filter Parameters ---
         // These short, non-harmonic delay times prevent metallic ringing.
         // We simulate a series of first-order APFs by staggering the Biquad center frequencies.
-        // This is the default Q value, controlling the amount of phase shift.
-        const defaultQ = 2.0;
 
         // --- 3. Build the Internal Filter Chain (Cascade) ---
         let previousNode = this.inputGain;
@@ -36,7 +43,7 @@ export class DiffuserNodeUI extends DSPNode {
             const ap = ctx.createBiquadFilter();
             ap.type = 'allpass';
             ap.frequency.value = freq;
-            ap.Q.value = defaultQ;
+            ap.Q.value = this.currentQ;
 
             const modGain = ctx.createGain();
             modGain.gain.value = 0;
@@ -45,7 +52,6 @@ export class DiffuserNodeUI extends DSPNode {
             const lfo = ctx.createOscillator();
             lfo.type = 'sine';
             lfo.frequency.value = Math.max(0.01, this.modRateValue + (index * this.modRateSpread) + this.lfoTuningOffsets[index]);
-            lfo.phase = Math.random() * Math.PI * 2;
             lfo.connect(modGain);
             modGain.connect(ap.frequency);
             lfo.start();
@@ -65,18 +71,19 @@ export class DiffuserNodeUI extends DSPNode {
         this.outputs = [{ name: 'Out', id: 0, node: this.outputGain }];
 
         // --- 6. Define User Parameters ---
+        // Param widgets are seeded from the stored state (not hardcoded
+        // defaults) so the UI and the audio graph stay in sync across
+        // rebuilds, preset loads and node duplication.
         this.params = [
             {
                 label: 'Smear Q',
                 type: 'range',
-                value: defaultQ,
+                value: this.currentQ,
                 min: 0.1,
                 max: 10,
                 scale: 'linear',
                 // When the user changes the Q slider, update ALL internal filters
-                onChange: (v) => {
-                    this.filterChain.forEach(ap => ap.Q.setTargetAtTime(v, ctx.currentTime, 0.01));
-                }
+                onChange: (v) => this.setQ(v, ctx)
             },
             {
                 label: 'Mod Depth',
@@ -100,8 +107,19 @@ export class DiffuserNodeUI extends DSPNode {
 
         this.initializeParams();
         this.computeHeight();
+
+        // Apply the stored state to the fresh graph.
+        this.setQ(this.currentQ, ctx);
         this.setModDepth(this.modDepthValue, ctx);
         this.setModRate(this.modRateValue, ctx);
+    }
+
+    setQ(value, ctx) {
+        this.currentQ = Math.max(0.1, value);
+        const context = ctx || (this.app && this.app.audioCtx);
+        if (!context) return;
+        const now = context.currentTime;
+        this.filterChain.forEach(ap => ap.Q.setTargetAtTime(this.currentQ, now, 0.01));
     }
 
     setModDepth(value, ctx) {
@@ -144,7 +162,26 @@ export class DiffuserNodeUI extends DSPNode {
         this.modGains = [];
     }
 
-    onRemoved() {
+    // Single teardown path shared by initAudio() (rebuild) and onRemoved().
+    // Stops every oscillator and disconnects every node created by the last
+    // initAudio() call so no residual audio or modulation can survive.
+    cleanupAudio() {
         this.cleanupModulation();
+        if (this.filterChain) {
+            this.filterChain.forEach(ap => {
+                try { ap.disconnect(); } catch (e) { }
+            });
+        }
+        [this.inputGain, this.outputGain].forEach(node => {
+            if (!node) return;
+            try { node.disconnect(); } catch (e) { }
+        });
+        this.filterChain = [];
+        this.inputGain = null;
+        this.outputGain = null;
+    }
+
+    onRemoved() {
+        this.cleanupAudio();
     }
 }
