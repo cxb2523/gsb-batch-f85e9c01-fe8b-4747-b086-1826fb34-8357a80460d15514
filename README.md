@@ -119,6 +119,8 @@ flowchart LR
 
 `createEffectRecipe()` turns a seed and the high-level controls into a complete recipe. `AbilityEffect` clones that recipe, builds deterministic pixel details, and draws any point in the animation timeline. The loop renderer uses periodic motion for all motifs, while the export path samples exactly one cycle at `frameIndex / frameCount`. The preview and downloaded frames use the same renderer. Older one-shot recipes can still use the original renderer by setting `looping: false`.
 
+Exports are decoupled from live editing. When the user starts an export, `main.js` clones the current recipe and export settings into a frozen snapshot; frame rendering, filenames and `recipe.json` all read from that snapshot, so changing controls mid-export cannot affect the running job. The export buttons share a lock released on success, failure and timeout, and the GIF watchdog frees the lock itself rather than waiting for the encoder's abort event.
+
 ## Renderer API
 
 The core generator can also be imported from [`js/AbilityEffect.js`](./js/AbilityEffect.js) in another browser module.
@@ -172,10 +174,15 @@ pixel-ability-fx-forge/
 ├── js/
 │   ├── AbilityEffect.js      # Recipe generator and Canvas 2D renderer
 │   ├── main.js               # UI state, playback, and exporters
+│   ├── exportSession.js      # Export snapshots, button lock, GIF watchdog
 │   ├── gif.worker.js         # Local gif.js encoding worker
 │   └── vendor/               # Version-pinned, same-origin exporter libraries
 ├── tests/
-│   └── effect-harness.html   # Browser-based deterministic render checks
+│   ├── effect-harness.html   # Browser-based deterministic render checks
+│   ├── preview-convergence-harness.html
+│   ├── preview-real-convergence-harness.html
+│   ├── export-session-harness.html
+│   └── export-e2e-harness.html
 ├── website/
 │   └── index.html            # Self-contained project landing page
 ├── index.html                # Main application
@@ -214,6 +221,15 @@ The harness prints a JSON report and sets `"passed": true` when all checks succe
 Because these tests use Canvas APIs, they run in a browser rather than a Node.js test runner.
 
 Open `tests/loop-art-harness.html` for dedicated seam checks across all 50 motifs and three seeds each. It checks exact periodicity, the visible transition from the last exported frame to the first, non-empty frames, transparent frame edges, distinct rendered frames, and export dimensions. `tests/motif-gallery.html` shows all 50 motifs together for visual review.
+
+### Preview rebuild and export robustness
+
+Four additional harnesses cover the asynchronous preview pipeline and the export session:
+
+- `tests/preview-convergence-harness.html` drives `Renderer` with an injectable frame renderer. It checks that a recipe, frame-count or canvas-size change advances the generation; that stale results are never committed; that a discarded or rejected build re-marks the preview dirty so the latest recipe converges; that failures do not escape as unhandled rejections and are not retried every frame; and that rapid successive changes settle on the newest recipe.
+- `tests/preview-real-convergence-harness.html` repeats the convergence checks against the real `renderSeamlessLoopFrames` renderer and asserts, from committed pixels, that the preview shows the newest palette.
+- `tests/export-session-harness.html` covers snapshots (isolation from live edits, bounds), the export lock, and the GIF watchdog (success, encoder abort, constructor/render throw, and a timeout where the encoder never emits an abort event).
+- `tests/export-e2e-harness.html` loads the real `index.html` in an iframe and verifies that changing a control updates the preview, that a ZIP exported while the recipe is edited mid-flight still contains the recipe.json and frame count captured at start, that a failed export releases the lock, and that a stalled GIF export times out, frees the buttons, and can be retried. It passes `?gifTimeoutMs=900` so the timeout path runs in under a second.
 
 ## Deploying to GitHub Pages
 

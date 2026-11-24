@@ -15,15 +15,52 @@ export default class Renderer {
         this.blendMode = 'source-over';
         this.timeScale = 1.0;
 
+        // Preview state is declared before any setter can run so the accessors
+        // below always have a generation to advance.
         this.framePreviewMode = false;
-        this.frameCount = 8;
         this.frameDuration = 1.25;
         this.previewTime = 0;
         this._previewFrames = null;
+        this._previewFrameSize = { width: 0, height: 0 };
+        this._previewSize = { width: canvas.width, height: canvas.height };
         this._previewDirty = true;
         this._rebuilding = false;
         this._previewGeneration = 0;
+        this._frameCount = 8;
+        // Injectable so preview convergence can be exercised without touching
+        // the real canvas renderer (for example, to simulate a failing build).
+        this._renderFrames = options.renderFrames || renderSeamlessLoopFrames;
         this._theme = null;
+    }
+
+    get frameCount() {
+        return this._frameCount;
+    }
+
+    // Frame count is part of the preview identity: changing it must invalidate
+    // any in-flight build, exactly like changing the recipe.
+    set frameCount(value) {
+        if (Object.is(value, this._frameCount)) return;
+        this._frameCount = value;
+        this.markPreviewDirty();
+    }
+
+    // The canvas can be resized from outside the renderer (responsive layout,
+    // device-pixel changes). A size change invalidates any in-flight build, so
+    // treat it exactly like a recipe change: advance the generation and mark
+    // the preview dirty.
+    _syncPreviewCanvasSize() {
+        const width = this.canvas.width;
+        const height = this.canvas.height;
+        if (width === this._previewSize.width && height === this._previewSize.height) return;
+        this._previewSize = { width, height };
+        this.markPreviewDirty();
+    }
+
+    setCanvasSize(width, height) {
+        if (width !== undefined) this.canvas.width = width;
+        if (height !== undefined) this.canvas.height = height;
+        this._syncPreviewCanvasSize();
     }
 
     // getComputedStyle forces a style recalculation; the theme is static for a
@@ -56,13 +93,18 @@ export default class Renderer {
         this.lastTime = time;
 
         if (this.framePreviewMode) {
+            // Canvas size is part of the preview validity contract: if it moved,
+            // the current frames no longer match and the generation must advance.
+            this._syncPreviewCanvasSize();
             this.clear();
 
             if (this._previewDirty && !this._rebuilding) {
                 this._rebuildPreviewFrames();
             }
 
-            if (this._previewFrames && this._previewFrames.length === this.frameCount) {
+            if (this._previewFrames && this._previewFrames.length === this.frameCount
+                && this._previewFrameSize.width === this.canvas.width
+                && this._previewFrameSize.height === this.canvas.height) {
                 this.previewTime += deltaTime;
                 if (this.previewTime >= this.frameDuration) {
                     this.previewTime -= this.frameDuration;
@@ -110,35 +152,70 @@ export default class Renderer {
         context.restore();
     }
 
+    // A build result may only be committed when it was produced for the recipe,
+    // frame count and canvas that are still current when it resolves.
+    _previewBuildMatches(generation, frameCount, width, height) {
+        return generation === this._previewGeneration
+            && frameCount === this.frameCount
+            && width === this.canvas.width
+            && height === this.canvas.height;
+    }
+
     async _rebuildPreviewFrames() {
         const generation = this._previewGeneration;
         const { frameCount } = this;
-        const size = this.canvas.width;
+        const width = this.canvas.width;
+        const height = this.canvas.height;
+        // Clear the dirty flag for this attempt only. If the attempt is
+        // superseded or fails for newer parameters, the flag is restored below
+        // so the newest configuration always ends up rendered.
         this._rebuilding = true;
         this._previewDirty = false;
 
         try {
-            const { frames } = await renderSeamlessLoopFrames({
+            const { frames } = await this._renderFrames({
                 config: this.emitter.config,
-                width: size,
-                height: size,
+                width,
+                height,
                 frameCount
             });
 
-            // Discard results produced for configuration or dimensions that have
-            // since changed, and never let a rejected build escape as an
-            // unhandled promise rejection from the animation loop.
-            if (generation !== this._previewGeneration
-                || frameCount !== this.frameCount
-                || size !== this.canvas.width) return;
+            // Commit only frames that still describe the current configuration
+            // and canvas. Anything else is discarded untouched.
+            if (!this._previewBuildMatches(generation, frameCount, width, height)) {
+                // A superseded build must not overwrite newer frames, but it also
+                // must not swallow the request: re-open the dirty flag so the
+                // latest recipe is rebuilt on the next animation tick.
+                this._previewDirty = true;
+                return;
+            }
+
+            // A renderer that returns the wrong count cannot drive the preview;
+            // drop the result without retrying forever on stable parameters.
+            if (!Array.isArray(frames) || frames.length !== frameCount) {
+                console.error('Seamless loop preview returned an unexpected frame count.', {
+                    expected: frameCount,
+                    received: Array.isArray(frames) ? frames.length : frames
+                });
+                return;
+            }
 
             this._previewFrames = frames.map((frameCanvas) => (
-                frameCanvas.getContext('2d').getImageData(0, 0, size, size)
+                frameCanvas.getContext('2d').getImageData(0, 0, width, height)
             ));
+            this._previewFrameSize = { width, height };
         } catch (error) {
+            // Never let a rejected build escape as an unhandled rejection from
+            // the animation loop.
             console.error('Seamless loop preview could not be rebuilt.', error);
-            // A later configuration change marks the preview dirty again; retrying
-            // every frame here would spin on a permanently failing encoder.
+            // A failure for parameters that have since changed still owes the
+            // user a rebuild of the latest recipe, so restore the request. A
+            // failure for the current parameters leaves the flag cleared: the
+            // next parameter change calls markPreviewDirty() and retries, while
+            // a permanently failing renderer is not retried every frame.
+            if (!this._previewBuildMatches(generation, frameCount, width, height)) {
+                this._previewDirty = true;
+            }
         } finally {
             this._rebuilding = false;
         }

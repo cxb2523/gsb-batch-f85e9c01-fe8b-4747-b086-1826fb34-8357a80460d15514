@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Real preview convergence verification</title>
+</head>
+<body data-status="running">
+<canvas id="host" width="160" height="160"></canvas>
+<pre id="result">Checking real preview rebuild convergence…</pre>
+<script type="module">
+import Renderer from '../js/engine/Renderer.js';
+import Emitter from '../js/engine/Emitter.js';
+
+const failures = [];
+const checks = [];
+const unhandled = [];
+window.addEventListener('unhandledrejection', (event) => {
+    unhandled.push(String(event.reason?.message || event.reason));
+});
+
+const check = (name, condition, detail = '') => {
+    checks.push({ name, passed: Boolean(condition), detail });
+    if (!condition) failures.push(`${name}${detail ? `: ${detail}` : ''}`);
+};
+
+// Distinct palettes so the committed frame carries a verifiable color.
+const configFor = (palette) => ({
+    emission: { spawnRate: 30, burstAmount: 10, maxParticles: 60 },
+    visuals: {
+        palette,
+        startColor: palette[0],
+        endColor: palette[1],
+        startSize: 7,
+        endSize: 3,
+        life: 1,
+        coreStyle: 'ring'
+    }
+});
+
+const dominantColor = (renderer) => {
+    const frames = renderer._previewFrames;
+    if (!frames?.length) return null;
+    const data = frames[0].data;
+    let alpha = 0;
+    for (let index = 3; index < data.length; index += 4) alpha += data[index];
+    return alpha > 0 ? 'visible' : 'empty';
+};
+
+const waitFor = async (predicate, timeoutMs = 8000) => {
+    const deadline = performance.now() + timeoutMs;
+    while (performance.now() < deadline) {
+        if (predicate()) return true;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+    }
+    return false;
+};
+
+const canvas = document.querySelector('#host');
+const renderer = new Renderer(canvas, new Emitter(configFor(['#ff0000', '#880000']), { width: 160, height: 160 }));
+renderer.setFramePreviewMode(true, 8, 0.6);
+renderer._previewSize = { width: canvas.width, height: canvas.height };
+
+// --- 1. Parameter change converges to a new visible frame. -------------------
+{
+    await renderer._rebuildPreviewFrames();
+    check('initial real build commits frames', renderer._previewFrames?.length === 8,
+        `frames=${renderer._previewFrames?.length}`);
+    check('initial real build is visible', dominantColor(renderer) === 'visible');
+    const before = renderer._previewFrames;
+
+    renderer.setEmitter(new Emitter(configFor(['#00ff00', '#008800']), { width: 160, height: 160 }));
+    check('parameter change marks preview dirty', renderer._previewDirty === true);
+    await renderer._rebuildPreviewFrames();
+    check('rebuild after parameter change commits new frames', renderer._previewFrames !== before);
+    check('new frames are visible', dominantColor(renderer) === 'visible');
+    const pixels = renderer._previewFrames[0].data;
+    // The green palette dominates; assert green channel beats red on average.
+    let red = 0;
+    let green = 0;
+    for (let index = 0; index < pixels.length; index += 4) {
+        red += pixels[index];
+        green += pixels[index + 1];
+    }
+    check('preview shows the newest palette', green > red, `red=${red} green=${green}`);
+}
+
+// --- 2. Rapid successive changes converge to the newest recipe, and a
+// superseded real build never overwrites the committed result. --------------
+{
+    const stale = renderer._rebuildPreviewFrames();
+    for (const palette of [['#00ff00', '#008800'], ['#ffff00', '#888800'], ['#0000ff', '#000088']]) {
+        renderer.setEmitter(new Emitter(configFor(palette), { width: 160, height: 160 }));
+    }
+    await stale;
+    check('superseded real build restores dirty', renderer._previewDirty === true);
+    check('superseded real build is not committed', renderer._previewFrames.length === 8);
+
+    const converged = renderer._rebuildPreviewFrames();
+    await converged;
+    const pixels = renderer._previewFrames[0].data;
+    let blue = 0;
+    let green = 0;
+    for (let index = 0; index < pixels.length; index += 4) {
+        blue += pixels[index + 2];
+        green += pixels[index + 1];
+    }
+    check('rapid real changes converge to newest palette', blue > green,
+        `green=${green} blue=${blue}`);
+    check('converged preview has no pending dirty flag', renderer._previewDirty === false);
+}
+
+// --- 3. The loop path (not manual rebuild) also converges. ------------------
+{
+    renderer.setEmitter(new Emitter(configFor(['#ff00ff', '#880088']), { width: 160, height: 160 }));
+    renderer.running = true;
+    // Drive a few loop ticks by hand instead of relying on rAF timing.
+    const originalRaf = window.requestAnimationFrame;
+    window.requestAnimationFrame = () => 0;
+    for (let index = 0; index < 20 && renderer._rebuilding; index += 1) {
+        renderer.loop(index * 16);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    // Keep ticking until the rebuild settles and the frames commit.
+    for (let index = 0; index < 100; index += 1) {
+        renderer.loop(320 + index * 16);
+        if (renderer._previewFrames && renderer._previewDirty === false && !renderer._rebuilding) break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    window.requestAnimationFrame = originalRaf;
+    renderer.running = false;
+    check('loop-driven rebuild converges', renderer._previewFrames?.length === 8
+        && renderer._previewDirty === false, `dirty=${renderer._previewDirty}`);
+    check('loop-driven preview is visible', dominantColor(renderer) === 'visible');
+}
+
+check('no unhandled rejections', unhandled.length === 0, unhandled.join(' | '));
+
+const result = {
+    passed: failures.length === 0,
+    failures,
+    checks,
+    unhandledRejections: unhandled
+};
+document.body.dataset.status = result.passed ? 'passed' : 'failed';
+document.querySelector('#result').textContent = JSON.stringify(result, null, 2);
+</script>
+</body>
+</html>

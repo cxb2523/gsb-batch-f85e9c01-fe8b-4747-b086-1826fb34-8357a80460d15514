@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Preview rebuild convergence verification</title>
+</head>
+<body data-status="running">
+<canvas id="host" width="160" height="160"></canvas>
+<pre id="result">Checking preview rebuild convergence…</pre>
+<script type="module">
+import Renderer from '../js/engine/Renderer.js';
+import Emitter from '../js/engine/Emitter.js';
+
+const failures = [];
+const checks = [];
+const canvas = document.querySelector('#host');
+
+const unhandled = [];
+window.addEventListener('unhandledrejection', (event) => {
+    unhandled.push(String(event.reason?.message || event.reason));
+});
+
+const deferred = () => {
+    let resolve;
+    let reject;
+    const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+    return { promise, resolve, reject };
+};
+
+const makeFrames = (size, count, rgb) => Array.from({ length: count }, () => {
+    const frame = document.createElement('canvas');
+    frame.width = size;
+    frame.height = size;
+    const context = frame.getContext('2d');
+    context.fillStyle = `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
+    context.fillRect(0, 0, size, size);
+    return frame;
+});
+
+const tagOf = (renderer) => {
+    const frames = renderer._previewFrames;
+    if (!frames?.length) return null;
+    const [r, g, b] = frames[0].data;
+    return `${r},${g},${b}`;
+};
+
+const emitterWith = (color) => new Emitter({
+    visuals: { startColor: color, endColor: color, palette: [color] }
+}, { width: 160, height: 160 });
+
+const createProbe = (canvasElement) => {
+    const calls = [];
+    const renderFrames = (args) => {
+        const entry = { args, deferred: deferred() };
+        calls.push(entry);
+        return entry.deferred.promise;
+    };
+    const renderer = new Renderer(canvasElement, emitterWith('#111111'), { renderFrames });
+    renderer.setFramePreviewMode(true, 8);
+    return { renderer, calls, lastCall: () => calls.at(-1) };
+};
+
+const check = (name, condition, detail = '') => {
+    checks.push({ name, passed: Boolean(condition), detail });
+    if (!condition) failures.push(`${name}${detail ? `: ${detail}` : ''}`);
+};
+
+// The canvas is shared across probes; reset size explicitly per probe.
+const freshCanvas = () => {
+    canvas.width = 160;
+    canvas.height = 160;
+    return canvas;
+};
+
+// --- 1. A superseded build is discarded but re-marks the preview dirty, and
+// the next build (latest recipe) commits. -------------------------------------
+{
+    const { renderer, calls } = createProbe(freshCanvas());
+    const stale = renderer._rebuildPreviewFrames();
+    const firstCall = calls.at(-1);
+    check('build captures emitter config at start', firstCall.args.config.visuals.startColor === '#111111');
+
+    renderer.setEmitter(emitterWith('#222222'));
+    check('setEmitter advances generation', renderer._previewGeneration > 1);
+
+    firstCall.deferred.resolve({ frames: makeFrames(160, 8, [255, 0, 0]) });
+    await stale;
+    check('superseded build does not commit frames', renderer._previewFrames === null,
+        `tag=${tagOf(renderer)}`);
+    check('superseded build restores dirty flag', renderer._previewDirty === true);
+    check('superseded build clears rebuilding flag', renderer._rebuilding === false);
+
+    const latest = renderer._rebuildPreviewFrames();
+    calls.at(-1).deferred.resolve({ frames: makeFrames(160, 8, [0, 255, 0]) });
+    await latest;
+    check('latest recipe commits after convergence', tagOf(renderer) === '0,255,0',
+        `tag=${tagOf(renderer)}`);
+    check('dirty flag cleared after commit', renderer._previewDirty === false);
+    check('preview frame size recorded', renderer._previewFrameSize.width === 160
+        && renderer._previewFrameSize.height === 160);
+}
+
+// --- 2. Frame-count changes advance the generation and invalidate in-flight
+// builds; the converged build uses the newest count. --------------------------
+{
+    const { renderer, calls } = createProbe(freshCanvas());
+    const initialGeneration = renderer._previewGeneration;
+    renderer.frameCount = 12;
+    check('frameCount setter advances generation', renderer._previewGeneration > initialGeneration);
+    check('frameCount setter marks dirty', renderer._previewDirty === true);
+
+    const stale = renderer._rebuildPreviewFrames();
+    const call = calls.at(-1);
+    check('build uses requested frame count', call.args.frameCount === 12);
+    renderer.frameCount = 16;
+    call.deferred.resolve({ frames: makeFrames(160, 12, [255, 0, 0]) });
+    await stale;
+    check('frame-count-stale build is discarded', renderer._previewFrames === null);
+    check('frame-count-stale build restores dirty', renderer._previewDirty === true);
+
+    const converged = renderer._rebuildPreviewFrames();
+    calls.at(-1).deferred.resolve({ frames: makeFrames(160, 16, [0, 0, 255]) });
+    await converged;
+    check('newest frame count commits', renderer._previewFrames?.length === 16,
+        `frames=${renderer._previewFrames?.length}`);
+    check('frame count convergence clears dirty', renderer._previewDirty === false);
+}
+
+// --- 3. Canvas size changes advance the generation too. ----------------------
+{
+    canvas.width = 160;
+    canvas.height = 160;
+    const { renderer, calls } = createProbe(canvas);
+    renderer._previewSize = { width: 160, height: 160 };
+    const stale = renderer._rebuildPreviewFrames();
+    const call = calls.at(-1);
+    renderer.setCanvasSize(192, 192);
+    check('canvas size change advances generation', renderer._previewGeneration > 1);
+    check('canvas size change marks dirty', renderer._previewDirty === true);
+
+    call.deferred.resolve({ frames: makeFrames(160, 8, [90, 90, 90]) });
+    await stale;
+    check('size-stale build is discarded', renderer._previewFrames === null);
+    check('size-stale build restores dirty', renderer._previewDirty === true);
+
+    const converged = renderer._rebuildPreviewFrames();
+    check('rebuild requests current canvas size', calls.at(-1).args.width === 192);
+    calls.at(-1).deferred.resolve({ frames: makeFrames(192, 8, [10, 20, 30]) });
+    await converged;
+    check('new canvas size commits', renderer._previewFrameSize.width === 192
+        && renderer._previewFrameSize.height === 192);
+    check('size convergence clears dirty', renderer._previewDirty === false);
+
+    // External size change (outside setCanvasSize) is detected by the loop.
+    const generations = renderer._previewGeneration;
+    canvas.width = 128;
+    canvas.height = 128;
+    renderer._syncPreviewCanvasSize();
+    check('external canvas resize advances generation', renderer._previewGeneration > generations);
+}
+
+// --- 4. A failing build does not escape and is not retried every frame; a
+// later parameter change retries it. -----------------------------------------
+{
+    canvas.width = 160;
+    canvas.height = 160;
+    const { renderer, calls } = createProbe(canvas);
+    renderer._previewSize = { width: 160, height: 160 };
+    renderer.setEmitter(emitterWith('#333333'));
+    check('parameter change arms a rebuild', renderer._previewDirty === true);
+
+    const failing = renderer._rebuildPreviewFrames();
+    calls.at(-1).deferred.reject(new Error('synthetic frame failure'));
+    await failing;
+    check('failing build resolves instead of throwing', renderer._rebuilding === false);
+    check('failing build leaves dirty clear on current params', renderer._previewDirty === false);
+
+    // Calling the loop repeatedly must not spin on the failed build.
+    const requestAnimationFrame = window.requestAnimationFrame;
+    window.requestAnimationFrame = () => 0;
+    const buildsBefore = calls.length;
+    for (let index = 0; index < 5; index += 1) renderer.loop(index * 16);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    check('failed build is not retried every frame', calls.length === buildsBefore,
+        `builds=${calls.length - buildsBefore}`);
+    window.requestAnimationFrame = requestAnimationFrame;
+
+    check('failed build produces no unhandled rejection', unhandled.length === 0,
+        unhandled.join(' | '));
+
+    renderer.setEmitter(emitterWith('#444444'));
+    check('next parameter change re-arms rebuild', renderer._previewDirty === true);
+    const retry = renderer._rebuildPreviewFrames();
+    calls.at(-1).deferred.resolve({ frames: makeFrames(160, 8, [1, 2, 3]) });
+    await retry;
+    check('retry after failure commits', tagOf(renderer) === '1,2,3');
+    check('retry after failure clears dirty', renderer._previewDirty === false);
+}
+
+// --- 5. A build that fails after being superseded still restores the dirty
+// flag so the latest parameters get rendered. ---------------------------------
+{
+    canvas.width = 160;
+    canvas.height = 160;
+    const { renderer, calls } = createProbe(canvas);
+    renderer._previewSize = { width: 160, height: 160 };
+    const stale = renderer._rebuildPreviewFrames();
+    const call = calls.at(-1);
+    renderer.setEmitter(emitterWith('#555555'));
+    call.deferred.reject(new Error('stale failure'));
+    await stale;
+    check('stale failure restores dirty flag', renderer._previewDirty === true);
+    check('stale failure produces no unhandled rejection', unhandled.length === 0,
+        unhandled.join(' | '));
+
+    const retry = renderer._rebuildPreviewFrames();
+    calls.at(-1).deferred.resolve({ frames: makeFrames(160, 8, [7, 8, 9]) });
+    await retry;
+    check('stale failure converges on retry', tagOf(renderer) === '7,8,9');
+}
+
+// --- 6. Rapid successive changes converge to the newest build. --------------
+{
+    canvas.width = 160;
+    canvas.height = 160;
+    const { renderer, calls } = createProbe(canvas);
+    renderer._previewSize = { width: 160, height: 160 };
+    const inFlight = renderer._rebuildPreviewFrames();
+    for (const color of ['#660000', '#770000', '#880000', '#990000']) {
+        renderer.setEmitter(emitterWith(color));
+    }
+    calls.at(-1).deferred.resolve({ frames: makeFrames(160, 8, [200, 0, 0]) });
+    await inFlight;
+    const before = calls.length;
+    const converge = renderer._rebuildPreviewFrames();
+    check('converging build uses newest generation', calls.length === before + 1);
+    calls.at(-1).deferred.resolve({ frames: makeFrames(160, 8, [0, 200, 0]) });
+    await converge;
+    check('rapid changes converge to newest frames', tagOf(renderer) === '0,200,0');
+    check('convergence leaves no pending dirty', renderer._previewDirty === false);
+}
+
+const result = {
+    passed: failures.length === 0,
+    failures,
+    checks,
+    unhandledRejections: unhandled
+};
+document.body.dataset.status = result.passed ? 'passed' : 'failed';
+document.querySelector('#result').textContent = JSON.stringify(result, null, 2);
+</script>
+</body>
+</html>

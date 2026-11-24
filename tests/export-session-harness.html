@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Export snapshot, lock and GIF watchdog verification</title>
+</head>
+<body data-status="running">
+<pre id="result">Checking export session helpers…</pre>
+<script type="module">
+import {
+    GIF_CANCELLED_MESSAGE,
+    GIF_TIMEOUT_MESSAGE,
+    createExportLock,
+    createExportSnapshot,
+    encodeGif,
+    normalizeExportSettings
+} from '../js/exportSession.js';
+
+const failures = [];
+const checks = [];
+
+const check = (name, condition, detail = '') => {
+    checks.push({ name, passed: Boolean(condition), detail });
+    if (!condition) failures.push(`${name}${detail ? `: ${detail}` : ''}`);
+};
+
+const unhandled = [];
+window.addEventListener('unhandledrejection', (event) => {
+    unhandled.push(String(event.reason?.message || event.reason));
+    event.preventDefault();
+});
+
+const settle = async (promise) => {
+    try {
+        return { status: 'fulfilled', value: await promise };
+    } catch (error) {
+        return { status: 'rejected', error };
+    }
+};
+
+// --- Snapshot isolation ------------------------------------------------------
+{
+    const live = { name: 'Impact', motif: 'mandala', palette: ['#111111', '#222222'] };
+    const snapshot = createExportSnapshot(live, { size: 9999, frameCount: 'nope', fps: '7' });
+
+    live.motif = 'heart';
+    live.palette[0] = '#ffffff';
+    check('snapshot recipe is isolated from live edits', snapshot.recipe.motif === 'mandala'
+        && snapshot.recipe.palette[0] === '#111111');
+    check('snapshot is frozen', Object.isFrozen(snapshot));
+    check('snapshot clamps oversized canvas', snapshot.settings.size === 256, `size=${snapshot.settings.size}`);
+    check('snapshot falls back for invalid frame count', snapshot.settings.frameCount === 32,
+        `frameCount=${snapshot.settings.frameCount}`);
+    check('snapshot clamps low fps', snapshot.settings.fps === 12, `fps=${snapshot.settings.fps}`);
+    check('normalize handles missing input', normalizeExportSettings().size === 160
+        && normalizeExportSettings().frameCount === 32 && normalizeExportSettings().fps === 16);
+}
+
+// --- Lock releases on every outcome -----------------------------------------
+{
+    const lock = createExportLock();
+    check('lock acquires once', lock.tryAcquire() === true && lock.locked === true);
+    check('lock refuses a second owner', lock.tryAcquire() === false);
+    lock.release();
+    check('lock can be reacquired after release', lock.tryAcquire() === true && lock.locked === true);
+    lock.release();
+    check('lock reports unlocked after release', lock.locked === false);
+}
+
+// --- GIF success -------------------------------------------------------------
+const fakeGif = ({ onRender = () => {} } = {}) => {
+    const instance = {
+        handlers: {},
+        aborted: 0,
+        frames: 0,
+        on(event, callback) { this.handlers[event] = callback; },
+        addFrame() { this.frames += 1; },
+        abort() { this.aborted += 1; },
+        render() { onRender(this); }
+    };
+    return instance;
+};
+
+{
+    const gif = fakeGif({
+        onRender(instance) {
+            queueMicrotask(() => instance.handlers.finished(new Blob(['gif'], { type: 'image/gif' })));
+        }
+    });
+    const outcome = await settle(encodeGif({
+        frames: ['a', 'b'],
+        fps: 16,
+        timeoutMs: 500,
+        gifFactory: () => gif
+    }));
+    check('successful encode resolves with blob', outcome.status === 'fulfilled'
+        && outcome.value instanceof Blob);
+    check('successful encode registered every frame', gif.frames === 2, `frames=${gif.frames}`);
+    check('successful encode does not abort', gif.aborted === 0);
+}
+
+// --- GIF watchdog timeout where abort never emits an event -------------------
+{
+    // Simulates a worker that never starts and never acks abort(): no event from
+    // abort(). The watchdog must still reject so the caller can free the lock.
+    const gif = fakeGif();
+    const started = performance.now();
+    const outcome = await settle(encodeGif({
+        frames: ['a'],
+        fps: 16,
+        timeoutMs: 90,
+        gifFactory: () => gif
+    }));
+    const elapsed = performance.now() - started;
+    check('timeout rejects instead of hanging', outcome.status === 'rejected');
+    check('timeout uses the timeout message', outcome.error?.message === GIF_TIMEOUT_MESSAGE,
+        outcome.error?.message);
+    check('timeout calls abort', gif.aborted === 1, `aborted=${gif.aborted}`);
+    check('timeout settles near the deadline', elapsed >= 70 && elapsed < 2000, `elapsed=${Math.round(elapsed)}ms`);
+}
+
+// --- GIF abort event ---------------------------------------------------------
+{
+    const gif = fakeGif({
+        onRender(instance) { queueMicrotask(() => instance.handlers.abort()); }
+    });
+    const outcome = await settle(encodeGif({
+        frames: ['a'],
+        fps: 16,
+        timeoutMs: 500,
+        gifFactory: () => gif
+    }));
+    check('abort event rejects as cancelled', outcome.status === 'rejected'
+        && outcome.error?.message === GIF_CANCELLED_MESSAGE);
+}
+
+// --- GIF constructor / render throw -----------------------------------------
+{
+    const outcome = await settle(encodeGif({
+        frames: ['a'],
+        fps: 16,
+        timeoutMs: 500,
+        gifFactory: () => { throw new Error('encoder unavailable'); }
+    }));
+    check('constructor throw rejects', outcome.status === 'rejected'
+        && outcome.error?.message === 'encoder unavailable');
+}
+{
+    const gif = fakeGif({ onRender() { throw new Error('render failed'); } });
+    const outcome = await settle(encodeGif({
+        frames: ['a'],
+        fps: 16,
+        timeoutMs: 500,
+        gifFactory: () => gif
+    }));
+    check('render throw rejects', outcome.status === 'rejected'
+        && outcome.error?.message === 'render failed');
+}
+
+// --- Settles exactly once ----------------------------------------------------
+{
+    const gif = fakeGif({
+        onRender(instance) {
+            queueMicrotask(() => instance.handlers.finished(new Blob(['ok'])));
+        }
+    });
+    const outcome = await settle(encodeGif({
+        frames: ['a'],
+        fps: 16,
+        timeoutMs: 60,
+        gifFactory: () => gif
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    check('late watchdog does not override a finished encode', outcome.status === 'fulfilled');
+    check('finished encode never aborts', gif.aborted === 0, `aborted=${gif.aborted}`);
+}
+
+check('no unhandled rejections', unhandled.length === 0, unhandled.join(' | '));
+
+const result = { passed: failures.length === 0, failures, checks, unhandledRejections: unhandled };
+document.body.dataset.status = result.passed ? 'passed' : 'failed';
+document.querySelector('#result').textContent = JSON.stringify(result, null, 2);
+</script>
+</body>
+</html>

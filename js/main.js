@@ -13,10 +13,25 @@ import {
     renderEffectFrames
 } from './AbilityEffect.js?v=13';
 import { LOOP_MOTIFS, LOOP_MOTIF_GROUPS } from './engine/LoopArt.js?v=3';
+import {
+    createExportLock,
+    createExportSnapshot,
+    encodeGif,
+    normalizeExportSettings
+} from './exportSession.js?v=1';
 
 const GIF_WORKER_URL = new URL('./gif.worker.js', import.meta.url).href;
 const GIF_TRANSPARENT_COLOR = 0x010203;
 const GIF_MATTE_COLOR = '#010203';
+// The watchdog must free the export lock on its own; it cannot wait for the
+// encoder to acknowledge an abort. The override exists so the timeout branch
+// can be exercised by the browser harness in seconds instead of minutes.
+const GIF_TIMEOUT_MS = (() => {
+    const requested = Number(new URLSearchParams(window.location.search).get('gifTimeoutMs'));
+    return Number.isFinite(requested) && requested > 0
+        ? Math.min(600_000, Math.max(100, Math.round(requested)))
+        : 120_000;
+})();
 
 const canvas = document.querySelector('#fxCanvas');
 const context = canvas.getContext('2d');
@@ -97,7 +112,6 @@ let frozenTime = 0;
 let playing = true;
 let noticeTimer;
 let seedInputTimer;
-let exportInProgress = false;
 let atlasPreviewUrl;
 let lastRenderedTime = Number.NaN;
 let lastProgressStep = -1;
@@ -269,7 +283,8 @@ const sanitizeFilename = (value) => String(value ?? '')
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '') || 'ability-fx';
 
-const exportName = () => `${sanitizeFilename(baseRecipe.name)}-${sanitizeFilename(baseRecipe.motif)}`;
+const exportName = (recipe = baseRecipe) =>
+    `${sanitizeFilename(recipe.name)}-${sanitizeFilename(recipe.motif)}`;
 
 const timestamp = () => new Date().toISOString().replace(/[:.]/g, '-');
 
@@ -295,32 +310,68 @@ const releaseAtlasPreview = () => {
     atlasPreviewUrl = null;
 };
 
-// Export dimensions are select values, but they still bound the amount of canvas
-// memory a single export can allocate. Reject non-finite or out-of-range values.
-const boundedSetting = (value, fallback, minimum, maximum) => {
-    const numeric = Number(value);
-    return Number.isFinite(numeric) ? Math.min(maximum, Math.max(minimum, numeric)) : fallback;
-};
-
-const currentExportOptions = () => ({
-    size: Math.round(boundedSetting(canvasSizeSelect.value, 160, 128, 256)),
-    frameCount: Math.round(boundedSetting(frameCountSelect.value, 32, 24, 48)),
-    fps: Math.round(boundedSetting(fpsSelect.value, 16, 12, 24))
+const currentExportOptions = () => normalizeExportSettings({
+    size: canvasSizeSelect.value,
+    frameCount: frameCountSelect.value,
+    fps: fpsSelect.value
 });
 
+const exportLock = createExportLock();
+const setExportButtonsDisabled = (disabled) => {
+    exportButtons.forEach((button) => { button.disabled = disabled; });
+};
+
 const beginExport = () => {
-    if (exportInProgress) {
+    if (!exportLock.tryAcquire()) {
         setNotice('An export is already in progress.', 'default');
         return false;
     }
-    exportInProgress = true;
-    exportButtons.forEach((button) => { button.disabled = true; });
+    setExportButtonsDisabled(true);
     return true;
 };
 
 const endExport = () => {
-    exportInProgress = false;
-    exportButtons.forEach((button) => { button.disabled = false; });
+    exportLock.release();
+    setExportButtonsDisabled(false);
+};
+
+// Generous ceiling for the canvas-based exporters. The GIF watchdog is
+// configurable because it can be stalled by a worker that never reports back.
+const EXPORT_TIMEOUT_MS = 300_000;
+
+// Runs one export under the button lock. The lock is released exactly once on
+// success, failure and timeout; a watchdog bounds the whole run so a stalled
+// stage cannot leave the buttons disabled forever.
+const runExport = async ({ timeoutMs, timeoutNotice, onTimeout, task }) => {
+    if (!beginExport()) return;
+    let settled = false;
+    let watchdog;
+    const release = () => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(watchdog);
+        endExport();
+    };
+    watchdog = window.setTimeout(() => {
+        if (settled) return;
+        setNotice(timeoutNotice, 'danger');
+        try {
+            onTimeout?.();
+        } catch (error) {
+            console.error(error);
+        }
+        release();
+    }, timeoutMs);
+    try {
+        await task({ isReleased: () => settled });
+    } catch (error) {
+        console.error(error);
+        // If the watchdog already settled this export its notice is
+        // authoritative; don't overwrite it.
+        if (!settled) setNotice(error.message, 'danger');
+    } finally {
+        release();
+    }
 };
 
 const updateRecipeReadout = () => {
@@ -459,15 +510,19 @@ const prepareGifFrame = (frame) => {
     return prepared;
 };
 
-const captureFrames = async () => {
-    const settings = currentExportOptions();
+// Snapshot everything an export needs at the moment the user starts it. The
+// user keeps editing controls afterwards; this copy is the only state the
+// export (frames, filenames, recipe.json) reads from then on.
+const snapshotExport = () => createExportSnapshot(baseRecipe, currentExportOptions());
+
+const captureFrames = async (snapshot) => {
     setNotice('Rendering seamless loop…');
     const result = await renderEffectFrames({
-        recipe: baseRecipe,
-        size: settings.size,
-        frameCount: settings.frameCount
+        recipe: snapshot.recipe,
+        size: snapshot.settings.size,
+        frameCount: snapshot.settings.frameCount
     });
-    return { ...result, ...settings };
+    return { ...result, ...snapshot.settings };
 };
 
 // A download must keep its object URL alive until the browser has consumed it;
@@ -476,12 +531,16 @@ const releaseAfterDownload = (url) => {
     window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
 };
 
-const exportAtlas = async () => {
-    if (!beginExport()) return;
-    try {
-        const { frames, size } = await captureFrames();
+const exportAtlas = () => runExport({
+    timeoutMs: EXPORT_TIMEOUT_MS,
+    timeoutNotice: 'Sprite atlas export timed out.',
+    task: async ({ isReleased }) => {
+        const snapshot = snapshotExport();
+        const { frames, size } = await captureFrames(snapshot);
+        if (isReleased()) return;
         const atlas = createAtlas(frames, size);
         const blob = await canvasToBlob(atlas);
+        if (isReleased()) return;
         releaseAtlasPreview();
         // Separate URLs prevent a recipe change (which releases the preview) from
         // invalidating the object URL the browser is still streaming to disk.
@@ -490,102 +549,80 @@ const exportAtlas = async () => {
         atlasPreviewUrl = previewUrl;
         const image = new Image();
         image.src = previewUrl;
-        image.alt = `${baseRecipe.name} sprite atlas`;
+        image.alt = `${snapshot.recipe.name} sprite atlas`;
         atlasPreview.replaceChildren(image);
         atlasPreviewShell.hidden = false;
-        downloadUrl(downloadBlobUrl, `atlas-${exportName()}-${timestamp()}.png`);
+        downloadUrl(downloadBlobUrl, `atlas-${exportName(snapshot.recipe)}-${timestamp()}.png`);
         releaseAfterDownload(downloadBlobUrl);
         setNotice('Sprite atlas exported', 'success');
-    } catch (error) {
-        console.error(error);
-        setNotice(error.message, 'danger');
-    } finally {
-        endExport();
     }
-};
+});
 
-const exportFramesZip = async () => {
+const exportFramesZip = () => {
     if (!globalThis.JSZip) {
         setNotice('ZIP exporter is still loading.', 'danger');
         return;
     }
-    if (!beginExport()) return;
-    try {
-        const { frames } = await captureFrames();
-        const zip = new JSZip();
-        const blobs = await Promise.all(frames.map((frame) => canvasToBlob(frame)));
-        blobs.forEach((blob, index) => {
-            zip.file(`frame-${String(index).padStart(3, '0')}.png`, blob);
-        });
-        zip.file('recipe.json', JSON.stringify(baseRecipe, null, 2));
-        const blob = await zip.generateAsync({ type: 'blob' });
-        const url = URL.createObjectURL(blob);
-        downloadUrl(url, `frames-${exportName()}-${timestamp()}.zip`);
-        releaseAfterDownload(url);
-        setNotice('PNG sequence exported', 'success');
-    } catch (error) {
-        console.error(error);
-        setNotice(error.message, 'danger');
-    } finally {
-        endExport();
-    }
+    return runExport({
+        timeoutMs: EXPORT_TIMEOUT_MS,
+        timeoutNotice: 'PNG sequence export timed out.',
+        task: async ({ isReleased }) => {
+            const snapshot = snapshotExport();
+            const { frames } = await captureFrames(snapshot);
+            if (isReleased()) return;
+            const zip = new JSZip();
+            const blobs = await Promise.all(frames.map((frame) => canvasToBlob(frame)));
+            if (isReleased()) return;
+            blobs.forEach((blob, index) => {
+                zip.file(`frame-${String(index).padStart(3, '0')}.png`, blob);
+            });
+            zip.file('recipe.json', JSON.stringify(snapshot.recipe, null, 2));
+            const blob = await zip.generateAsync({ type: 'blob' });
+            if (isReleased()) return;
+            const url = URL.createObjectURL(blob);
+            downloadUrl(url, `frames-${exportName(snapshot.recipe)}-${timestamp()}.zip`);
+            releaseAfterDownload(url);
+            setNotice('PNG sequence exported', 'success');
+        }
+    });
 };
 
-const exportGif = async () => {
+const exportGif = () => {
     if (!globalThis.GIF) {
         setNotice('GIF exporter is still loading.', 'danger');
         return;
     }
-    if (!beginExport()) return;
-
-    let gif;
-    let watchdog;
-    const finish = () => {
-        window.clearTimeout(watchdog);
-        endExport();
-    };
-
-    try {
-        const { frames, fps } = await captureFrames();
-        setNotice('Encoding transparent GIF…');
-        gif = new GIF({
-            workers: 2,
-            quality: 10,
-            repeat: 0,
-            transparent: GIF_TRANSPARENT_COLOR,
-            workerScript: GIF_WORKER_URL
-        });
-        frames.forEach((frame) => {
-            gif.addFrame(prepareGifFrame(frame), {
-                copy: true,
-                delay: Math.round(1000 / fps)
+    let gif = null;
+    return runExport({
+        timeoutMs: GIF_TIMEOUT_MS,
+        timeoutNotice: 'GIF export timed out.',
+        // The encoder may not acknowledge abort(); the watchdog frees the lock
+        // regardless, and this just asks the workers to stop.
+        onTimeout: () => gif?.abort(),
+        task: async ({ isReleased }) => {
+            const snapshot = snapshotExport();
+            const { frames, fps } = await captureFrames(snapshot);
+            if (isReleased()) return;
+            setNotice('Encoding transparent GIF…');
+            const blob = await encodeGif({
+                frames,
+                fps,
+                gifFactory: (options) => {
+                    gif = new GIF(options);
+                    return gif;
+                },
+                prepareFrame: prepareGifFrame,
+                timeoutMs: GIF_TIMEOUT_MS,
+                workerScript: GIF_WORKER_URL,
+                transparent: GIF_TRANSPARENT_COLOR
             });
-        });
-        gif.on('finished', (blob) => {
-            try {
-                const url = URL.createObjectURL(blob);
-                downloadUrl(url, `loop-${exportName()}-${timestamp()}.gif`);
-                releaseAfterDownload(url);
-                setNotice('Transparent GIF exported', 'success');
-            } finally {
-                finish();
-            }
-        });
-        gif.on('abort', () => {
-            setNotice('GIF export was cancelled.', 'danger');
-            finish();
-        });
-        // Bounds the export lock if a worker never starts or never reports back.
-        watchdog = window.setTimeout(() => {
-            setNotice('GIF export timed out.', 'danger');
-            gif.abort();
-        }, 120_000);
-        gif.render();
-    } catch (error) {
-        console.error(error);
-        setNotice(error.message, 'danger');
-        finish();
-    }
+            if (isReleased()) return;
+            const url = URL.createObjectURL(blob);
+            downloadUrl(url, `loop-${exportName(snapshot.recipe)}-${timestamp()}.gif`);
+            releaseAfterDownload(url);
+            setNotice('Transparent GIF exported', 'success');
+        }
+    });
 };
 
 const bindStructureControls = () => {
