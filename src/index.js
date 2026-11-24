@@ -1,9 +1,5 @@
 /*
- * @description:
- * @Author: ljc
- * @Date: 2021-07-13 14:22:35
- * @LastEditors: ljc
- * @LastEditTime: 2021-07-30 11:07:31
+ * @description: canvas 混剪播放器入口
  */
 import Vue from "vue";
 import Play from "./canvasPlayer.vue";
@@ -14,7 +10,12 @@ let seed = 1;
 
 const component = (options) => {
   if (Vue.prototype.$isServer || seed !== 1) return;
-  options = options || videoObj;
+  // 兼容 $canvasVideoPlayer(list) 数组入参与 $canvasVideoPlayer({ list, logo, ... }) 对象入参
+  if (Array.isArray(options)) {
+    options = { list: options };
+  } else if (!options || !options.list) {
+    options = videoObj;
+  }
   instance = new Player({
     data: options,
   });
@@ -25,9 +26,10 @@ const component = (options) => {
   instance.vm.init();
   instance.dom.style.zIndex = seed + 1001;
   seed = 2;
-  instance.vm.setFree = function () {
+  // 组件自身的 setFree 负责释放 rAF / 定时器 / 节点，这里只在销毁后恢复单例开关
+  instance.vm.$once("hook:beforeDestroy", () => {
     seed = 1;
-  };
+  });
   return instance.vm;
 };
 

@@ -87,5 +87,20 @@ export default {
 
 [ ] Add more video transition effects (Fade, Wipe, etc.)
 
+## 🧪 Local Tests
+
+The playback chain (seek positioning, automatic fragment switching, pause/resume,
+replay, and resource release) is covered by a zero-dependency test suite under `test/`.
+It runs against the real `src/canvasPlayer.vue` / `src/index.js` with a fully local,
+controllable mock DOM, `<video>`, canvas and `requestAnimationFrame` — no network
+resources are required.
+
+```bash
+npm test
+```
+
+The mock video advances on a virtual clock (one `timeupdate` per 250ms, 0.25s per
+step), so fragment boundaries and accumulated progress are fully deterministic.
+
 📄 License
 MIT License

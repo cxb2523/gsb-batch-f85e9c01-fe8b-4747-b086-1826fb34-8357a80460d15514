@@ -1,0 +1,5 @@
+{
+  "type": "commonjs",
+  "private": true,
+  "comment": "测试目录固定按 CommonJS 加载，配合 test/sfc-loader.js 对 src 下 ESM 源码做运行时转换，无需安装依赖"
+}
