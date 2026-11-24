@@ -208,14 +208,35 @@ index.html              the entire game
 PROMPTS.md              the prompts that specify it, verbatim
 screenshots/            images used by this README
 tools/test-harness.js   collision, weapon and AI test suite
+tools/test-weapon-gating.js  weapon/input state-machine acceptance tests
 tools/autoplay-bot.js   pathfinding bot for unattended regression runs
 ```
 
-The two files in `tools/` are development-only. Neither is referenced by `index.html`; they
+The files in `tools/` are development-only. None is referenced by `index.html`; they
 are pasted into the console or injected over the DevTools protocol. The harness exposes
 collision audits, weapon accuracy and hit-fidelity tests, map boundary probes and an enemy
-watchdog. The bot plays full rounds on its own with configurable aim error and reaction
-delay, which is how the collision and AI fixes were regression tested.
+watchdog. `test-weapon-gating.js` drives the real input path (dispatched mouse/key events
+plus the game loop) and asserts that fire is correctly gated through reload, pump, bolt,
+swap and ADS transitions; paste it in and run `await WeaponGate.run()`. The bot plays full
+rounds on its own with configurable aim error and reaction delay, which is how the
+collision and AI fixes were regression tested.
+
+### Trigger and weapon-state contract
+
+Firing is resolved against the weapon's real state, not the raw button. While the gun is
+cycling — reloading, pumping, working the bolt, drawing a swapped weapon — no round,
+muzzle flash, casing or hit statistic can be produced; a press received during that window
+stays latched and is spent the instant the state clears. After the transition, full auto
+keeps firing while the trigger is held, while semi/pump/bolt fire exactly one round per
+press — the press survives the transition instead of being swallowed.
+
+Two further rules fall out of that. A shot taken before the 0.2s ADS ease has settled uses
+the **hipfire** cone and recoil, never the partially blended aimed cone, so a player cannot
+buy aimed accuracy before the sight is up (`player.adsSettled` gates this in
+`currentSpreadMult`). And a reload is all-or-nothing: `startReload` only arms it, and the
+magazine/reserve are moved together in `finishReload`. A swap or an ADS request during a
+reload calls `cancelReload`, which discards the timer and moves no ammo — the magazine can
+never end up topped up with the reserve unmoved.
 
 ## License
 

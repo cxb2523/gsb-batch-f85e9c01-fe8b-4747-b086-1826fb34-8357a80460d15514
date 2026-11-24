@@ -4411,8 +4411,14 @@ const player = {
   burstCount:0, burstIdle:0, fovKick:0,
   weapon:0, switching:0, switchTo:-1,
   reloadT:0, pumpT:0, boltT:0, boltPhase:0, fireCooldown:0,
-  triggerHeld:false, triggerReleased:true, clickBuf:0,
-  ads:false, adsK:0, adsEase:0,
+  reloadWeapon:-1,
+  /* Trigger state is split in three so a press survives a blocked weapon state:
+     held is the physical button, edge is an unconsumed press that fires the
+     moment the state clears, and clickBuf is the short grace for a tap that
+     lands (or is released) between frames. */
+  triggerHeld:false, triggerEdge:false, triggerReleased:true, clickBuf:0,
+  lastShotSpread:0, lastShotAdsSettled:false,   // diagnostics for the dev harness
+  ads:false, adsK:0, adsEase:0, adsSettled:false,
   breath:0, breathHeld:false, breathLock:false, swayT:0,
   jumpsLeft:0, spaceEdge:false,
   mantleT:0, mantleDur:0, mantleFrom:new THREE.Vector3(), mantleTo:new THREE.Vector3(),
@@ -4756,11 +4762,25 @@ addEventListener('mousedown', e=>{
      quick taps at 140fps — used to set triggerHeld and clear it again before
      the update loop ever looked, and the shot simply never happened. The
      buffer also lets a click land in the last moments of a reload or the
-     cooldown between rounds, so the gun answers the instant it is able. */
-  if (e.button===0){ player.triggerHeld=true; player.clickBuf=0.12; }
+     cooldown between rounds, so the gun answers the instant it is able.
+     triggerEdge is the press itself: it is consumed by the first round it
+     produces and survives every blocked weapon state (reload, pump, bolt,
+     swap, aim ease) so a trigger held through a transition is not swallowed. */
+  if (e.button===0){
+    player.triggerHeld=true; player.triggerEdge=true;
+    player.clickBuf=0.12;
+  }
   if (e.button===2){ e.preventDefault(); toggleADS(); }
 });
-addEventListener('mouseup', e=>{ if (e.button===0){ player.triggerHeld=false; player.triggerReleased=true; } });
+addEventListener('mouseup', e=>{
+  if (e.button===0){
+    player.triggerHeld=false; player.triggerReleased=true;
+    /* A held press only earns a shot while it is still held. A press that is
+       released during a long transition is dropped; a tap that released
+       between frames is still honoured through clickBuf. */
+    player.triggerEdge=false;
+  }
+});
 addEventListener('wheel', e=>{
   if (!G.running) return;
   const n = WEAPONS.length;
@@ -4773,7 +4793,7 @@ document.addEventListener('pointerlockchange', ()=>{
   const locked = document.pointerLockElement === document.body;
   if (!locked && G.started && !G.over){
     G.paused = true; G.running=false;
-    player.ads=false; player.adsK=0; player.adsEase=0;
+    player.ads=false; player.adsK=0; player.adsEase=0; player.adsSettled=false;
     UI._scopeK=-1; UI.scope.style.opacity=0; compMat.uniforms.scope.value=0;
     UI.cross.classList.remove('hidden'); vmRoot.visible=true;
     UI.pause.classList.add('on');
@@ -4817,7 +4837,10 @@ function currentSpreadMult(){
   s += (speed/7) * w.moveSpread;
   if (!player.onGround) s += w.airSpread;
   if (player.crouch && speed<0.6) s *= w.crouchMult;
-  s *= lerp(1, w.adsSpread, player.adsEase);
+  /* The ADS cone only applies once the sight has actually settled. Firing
+     during the 0.2s ease must use the hipfire cone and recoil — a partial
+     lerp would let a player buy the aimed accuracy before the weapon is up. */
+  s *= lerp(1, w.adsSpread, player.adsSettled ? 1 : 0);
   return s;
 }
 
@@ -4825,17 +4848,31 @@ function currentSpreadMult(){
 function setADS(on){
   if (on === player.ads) return;
   if (on && (player.dead || !G.running)) return;
+  /* Aiming interrupts a reload. The magazine transaction only ever commits in
+     finishReload(), so cancelling here cannot leave the mag topped up with the
+     reserve unmoved — nothing has been moved yet. */
+  if (on && player.reloadT>0) cancelReload();
   player.ads = on;
   if (!on){ player.breathHeld = false; player.breathLock = false; }
 }
 function toggleADS(){ setADS(!player.ads); }
 
+/* A reload is an all-or-nothing transaction. startReload only arms it: the
+   magazine and reserve are untouched until the timer genuinely reaches zero,
+   at which point finishReload moves both in one step. Anything that interrupts
+   the reload calls cancelReload, which discards the timer and moves no ammo. */
+function cancelReload(){
+  player.reloadT = 0;
+  player.reloadPhase = 0;
+  player.reloadWeapon = -1;
+}
 function switchWeapon(i){
   if (i===player.weapon && player.switchTo<0) return;
   if (player.switching>0) return;
-  if (player.reloadT>0){ player.reloadT=0; }
+  if (player.reloadT>0) cancelReload();
   setADS(false);
   player.boltT = 0;
+  player.pumpT = 0;          // a swap abandons an unfinished pump/bolt cycle
   player.switchTo = i;
   player.switching = WEAPONS[i].drawTime + 0.22;
   player.holsterAt = 0.22;
@@ -4848,30 +4885,60 @@ function startReload(){
   setADS(false);
   player.reloadT = w.reloadTime;
   player.reloadPhase = 0;
+  player.reloadWeapon = player.weapon;
   SFX.magOut();
 }
 function finishReload(){
+  /* only ever settle the weapon the reload was started on; if the weapon
+     changed underneath us, abort rather than stealing the new gun's ammo */
+  if (player.reloadWeapon>=0 && player.reloadWeapon !== player.weapon){
+    cancelReload();
+    return;
+  }
   const w = WEAPONS[player.weapon];
   const need = w.magSize - w.mag;
   const take = Math.min(need, w.res);
   w.mag += take; w.res -= take;
+  player.reloadWeapon = -1;
   w.spread = w.spreadBase;
   updateAmmoUI();
+  /* If the trigger is still held as the gun comes back up, a round is owed to
+     that press. Re-arm the edge so semi/pump/bolt fire exactly one round on the
+     frame the reload completes (the firing gate runs after this) instead of the
+     held trigger being swallowed; full auto continues on the held button
+     regardless, and a released trigger stays silent. */
+  if (player.triggerHeld) player.triggerEdge = true;
 }
 
 /** Returns true when the press was consumed — fired or dry-fired — so a
- *  buffered click keeps waiting through a reload instead of being thrown away. */
+ *  buffered click keeps waiting through a reload instead of being thrown away.
+ *  The state gate is the single choke point: a reload, pump, bolt cycle, swap
+ *  draw or a mid-ease ADS may never produce a round, muzzle flash, casing or
+ *  hit statistic. */
 function fireWeapon(){
   const w = WEAPONS[player.weapon];
   if (player.fireCooldown>0 || player.reloadT>0 || player.switching>0 || player.pumpT>0 || player.boltT>0) return false;
+  /* the mirror of the state gate for accuracy: a shot taken before the sight
+     has settled must not borrow the aimed cone, so report the cone actually
+     used (hipfire) to the caller */
+  player.lastShotSpread = currentSpreadMult();
+  player.lastShotAdsSettled = !!player.adsSettled;
   if (w.mag<=0){
-    if (player.triggerReleased){ SFX.dryFire(); player.triggerReleased=false; }
+    /* dry fire once per held press; a dry trigger does not start a reload on
+       its own while the gun is mid-transition (the gate above already handled
+       the busy states) */
+    if (player.triggerEdge || player.clickBuf>0 || player.triggerReleased){
+      SFX.dryFire();
+      player.triggerEdge = false; player.clickBuf = 0; player.triggerReleased = false;
+    }
     if (w.res>0) startReload();
     return true;
   }
   w.mag--;
   player.fireCooldown = 60/w.rpm;
   G.shots++;
+  /* a fired round spends the press; only a still-held auto trigger re-fires */
+  player.triggerEdge = false;
   player.triggerReleased = false;
 
   /* refresh matrices so hitboxes are where they look */
@@ -4886,6 +4953,8 @@ function fireWeapon(){
     .addScaledVector(_fwd, 0.55).addScaledVector(_rgt, 0.16).addScaledVector(upv, -0.12);
 
   const spread = currentSpreadMult();
+  /* Recoil is not ADS-scaled anywhere in this build, so the kick a mid-ease
+     shot produces is already the hipfire kick — the same cone it fired from. */
   let anyHit=false, killedSomething=false, headHit=false;
   const targets = enemyHitMeshes.concat(worldSolid);
 
@@ -5793,6 +5862,9 @@ function updatePlayer(dt){
   const adsSpeed = 1 / (wpn.adsTime||0.20);
   player.adsK = clamp(player.adsK + (adsWant?adsSpeed:-adsSpeed)*dt, 0, 1);
   player.adsEase = easeInOutCubic(player.adsK);
+  /* the aimed cone only counts once the ease has actually completed; any shot
+     taken mid-transition — or during the settle-out — uses the hipfire gun */
+  player.adsSettled = adsWant && player.adsK >= 0.999;
   const scoped = !!wpn.scope && player.adsEase > 0.55;
 
   /* scope sway: two slow sines at different rates so the drift never repeats
@@ -6018,16 +6090,16 @@ function updatePlayer(dt){
   const w = WEAPONS[player.weapon];
   w.spread = Math.max(w.spreadBase, w.spread - w.spreadRecover*dt);
 
-  /* ---- firing ---- */
+  /* ---- weapon state (must resolve before the trigger) ----
+     A reload, pump cycle, bolt cycle and swap draw are all timers that gate the
+     trigger. We advance them first so the frame in which a transition ends can
+     also spend a press that was held through it — otherwise the first round
+     after the animation lands one frame late. */
   player.fireCooldown -= dt;
   /* let go of the trigger for a beat and the recoil pattern starts over */
   player.burstIdle += dt;
   if (player.burstIdle > 0.32) player.burstCount = 0;
   player.clickBuf = Math.max(0, player.clickBuf - dt);
-  if (!player.dead && (player.triggerHeld || player.clickBuf > 0)){
-    if (w.auto && !w.semi){ if (fireWeapon()) player.clickBuf = 0; }
-    else if (player.triggerReleased){ if (fireWeapon()) player.clickBuf = 0; }
-  }
 
   /* ---- reload ---- */
   if (player.reloadT>0){
@@ -6072,7 +6144,11 @@ function updatePlayer(dt){
     if (player.boltPhase===1 && k>0.60){ player.boltPhase = 2; SFX.boltCycle(1); }
     if (player.boltT<=0){ player.boltT=0; player.boltPhase=3; }
   }
-  /* ---- weapon switch ---- */
+  /* ---- weapon switch ----
+     The gun in hand does not change until the draw timer reaches the swap
+     point. Firing is gated for the whole switching window, so the old gun
+     cannot fire on its way out and the new gun cannot fire before it is drawn;
+     because the swap only touches visibility the new magazine is never spent. */
   if (player.switching>0){
     const before = player.switching;
     player.switching -= dt;
@@ -6084,6 +6160,35 @@ function updatePlayer(dt){
       updateAmmoUI();
     }
     if (player.switching<=0){ player.switching=0; }
+  }
+
+  /* ---- firing ----
+     The trigger is resolved against the weapon's now-current state. Nothing
+     may produce a round while the gun is cycling (reload, pump, bolt, swap
+     draw); a press received during that window stays latched and is spent the
+     instant the state clears. Full auto keeps firing while held; semi/pump/bolt
+     need a fresh press per round, and that press survives a transition instead
+     of being swallowed by the state that blocked it. */
+  if (!player.dead){
+    /* re-read the gun: the swap above may have changed player.weapon this very
+       frame, and the mode (auto/semi) must be the one in hand now */
+    const wNow = WEAPONS[player.weapon];
+    const busy = player.reloadT>0 || player.switching>0 || player.pumpT>0 || player.boltT>0;
+    const pressed = player.triggerHeld || player.triggerEdge || player.clickBuf > 0;
+    if (pressed && !busy && player.fireCooldown<=0){
+      const autoHeld = wNow.auto && !wNow.semi && player.triggerHeld;
+      /* a fresh press is required for the non-auto modes; auto may re-fire on
+         the held button as soon as the cooldown allows */
+      if (autoHeld || player.triggerEdge || player.triggerReleased || player.clickBuf>0){
+        if (fireWeapon()){
+          player.triggerEdge = false;
+          player.clickBuf = 0;
+        }
+      }
+    }
+    /* A press that was released while the gun was still busy is spent as far
+       as the edge is concerned — only a still-held trigger carries forward. */
+    if (!player.triggerHeld && !player.clickBuf) player.triggerEdge = false;
   }
 }
 
@@ -6286,7 +6391,9 @@ function resetWorldState(){
   player.yaw=0; player.pitch=0; player.hp=100; player.armor=50;   // face into the yard, not the fence
   player.dead=false; player.weapon=0; player.switching=0; player.switchTo=-1;
   player.reloadT=0; player.pumpT=0; player.boltT=0; player.fireCooldown=0; player.triggerHeld=false;
-  player.clickBuf=0; player.triggerReleased=true;
+  player.triggerEdge=false; player.triggerReleased=true; player.reloadWeapon=-1;
+  player.adsSettled=false; player.lastShotSpread=0; player.lastShotAdsSettled=false;
+  player.clickBuf=0;
   player.recoilPitch=player.recoilYaw=player.recoilVelP=player.recoilVelY=0;
   player.burstCount=0; player.burstIdle=0; player.fovKick=0;
   player.shake=0; player.landShake=0; player.crouch=false; player.height=STAND_H; player.eye=STAND_H;
@@ -6340,7 +6447,7 @@ function endGame(win){
   if (G.over) return;
   G.over=true; G.running=false; G.started=false;
   if (document.pointerLockElement) document.exitPointerLock();
-  player.ads=false; player.adsK=0; player.adsEase=0;
+  player.ads=false; player.adsK=0; player.adsEase=0; player.adsSettled=false;
   UI._scopeK=-1; UI.scope.style.opacity=0; compMat.uniforms.scope.value=0;
   UI.cross.classList.remove('hidden'); vmRoot.visible=true;
   UI.hud.classList.remove('on');
