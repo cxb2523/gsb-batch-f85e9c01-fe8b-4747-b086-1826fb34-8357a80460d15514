@@ -110,6 +110,14 @@ export const CFG = {
     // Set a number (20 is a good first try) to cap it. Above the cap the LOWEST-irradiance
     // in-frustum lights are dropped — dimmest first, so a bright nearby flash always
     // survives — and F3 reports `lights dropped` live so the trade is never silent.
+    //
+    // This value is only the BOOT default. At runtime use the API, which rebuilds the
+    // ladder, prewarms any newly reachable rung synchronously, and applies on the very
+    // next frame — no reload:
+    //     World.lightCull.setBudget(20)     // cap
+    //     World.lightCull.setBudget(null)   // restore the full ladder
+    // Shadow-casting lights are exempt at every budget (they sort first in the survival
+    // order), so the shadow-map count — a separate shader-cache term — never changes.
     lightBudget: null,
   },
   world: {

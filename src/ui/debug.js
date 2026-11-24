@@ -67,7 +67,11 @@ export class DebugOverlay {
 
     const lc = World.lightCull && World.lightCull.stats;
     if (lc) {
-      set('lights', `${lc.shown}/${lc.inFrustum} @${lc.rung}`);
+      // A `≤N` suffix appears while a runtime light budget is capped
+      // (World.lightCull.setBudget), so the ladder ceiling is visible next to
+      // the rung the frame actually landed on.
+      const cap = World.lightCull.budget;
+      set('lights', `${lc.shown}/${lc.inFrustum} @${lc.rung}${cap ? ` ≤${cap}` : ''}`);
       // Accumulates, so any drop that ever happened stays visible rather than flickering
       // past between two 5 Hz samples.
       set('drop', lc.droppedInFrustum > 0 ? `${lc.droppedInFrustum} THIS FRAME` : '0');

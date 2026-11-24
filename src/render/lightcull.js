@@ -123,7 +123,7 @@ import { CFG } from '../core/config.js';
 //     demand   > 28  -> lowest-irradiance in-frustum lights dropped, counted in stats
 const ALL_RUNGS = [12, 16, 20, 24, 28, 34];
 
-// The ladder actually in use. Equals ALL_RUNGS unless `CFG.graphics.lightBudget` caps it.
+// The ladder actually in use. Equals ALL_RUNGS unless a light budget caps it.
 //
 // The cap exists because the honest limit of this optimisation is a scene that genuinely
 // puts 28-34 lights in frustum — a dense fight with several spell VFX alive at once. Those
@@ -131,10 +131,35 @@ const ALL_RUNGS = [12, 16, 20, 24, 28, 34];
 // Measured cost of the top rungs on software GL: ~1.6 ms per light above 16, so a 34-light
 // frame is ~21 ms where a 16-light frame is ~10.5 ms.
 //
-// Set `lightBudget` (e.g. 20) to trade the dimmest lights of a heavy fight for frame rate.
+// Set a budget (e.g. 20) to trade the dimmest lights of a heavy fight for frame rate.
 // `stats.droppedInFrustum` counts exactly what it costs, and F3 shows it live, so the trade
 // is never silent. null = no cap = lossless.
+//
+// The budget is RUNTIME-ADJUSTABLE via `World.lightCull.setBudget(n)` — see the API below.
+// Changing it rebuilds this ladder, prewarms any newly reachable rung synchronously, and
+// takes effect on the very next frame; no reload is ever needed.
 let RUNGS = ALL_RUNGS.slice();
+
+// The active budget. null = no cap = lossless. Mirrors `CFG.graphics.lightBudget`;
+// setBudget() writes both so the boot config and the runtime state never disagree.
+let budget = null;
+
+// Rungs prewarm() has already compiled. A rung must NEVER be selectable while
+// uncompiled: Three.js keys its program cache on the light count, so reaching a
+// cold rung recompiles every material at that count (measured: 4,295 ms worst
+// frame without prewarm). setBudget() prewarms the delta BEFORE the new ladder
+// can be selected, so this set always covers every entry of RUNGS.
+const warmedRungs = new Set();
+
+/** Ladder for a budget: the rungs at or under the cap. Never empty — a budget
+ *  below the lowest rung clamps to it rather than leaving nothing to select. */
+function ladderFor(cap) {
+  if (Number.isFinite(cap) && cap > 0) {
+    const r = ALL_RUNGS.filter((v) => v <= cap);
+    return r.length ? r : [ALL_RUNGS[0]];
+  }
+  return ALL_RUNGS.slice();
+}
 
 // NO hysteresis. An earlier version held the rung high after a spike (DOWN required
 // demand to fit a lower rung for N consecutive frames) on the assumption that rung
@@ -248,7 +273,10 @@ function cull() {
 
   // Shadow-casting lights must keep a stable slot: dropping one changes the
   // shadow-map count, which is a separate term in the program cache key and
-  // would recompile even at a fixed light count.
+  // would recompile even at a fixed light count. They sort to the FRONT of _in,
+  // so they are the last lights any budget ever drops — the lowest rung (12) is
+  // far above the scene's caster count (1), so every caster stays visible at
+  // every budget by construction, and `numPointShadows` never flips.
   _in.sort((a, b) => (b.castShadow ? 1 : 0) - (a.castShadow ? 1 : 0) || b.__lcScore - a.__lcScore);
   _out.sort((a, b) => b.__lcScore - a.__lcScore);
 
@@ -315,7 +343,13 @@ function prewarm() {
   // the cull reaches it.
   const pool = _lights.slice().sort((a, b) => (b.intensity > 1e-3 ? 1 : 0) - (a.intensity > 1e-3 ? 1 : 0));
   const t0 = performance.now();
+  const compiled = [];
   for (const rung of RUNGS) {
+    // Already-warmed rungs are program-cache hits by definition; re-rendering them
+    // through the composer would only re-pay the link cost for nothing. This skip
+    // is what makes a runtime budget change cheap: setBudget(20) on a fully warmed
+    // ladder compiles nothing, and raising the cap compiles only the new rungs.
+    if (warmedRungs.has(rung)) continue;
     for (let i = 0; i < pool.length; i++) pool[i].visible = i < rung;
     renderer.compile(scene, camera);
     // Render through the COMPOSER, not `renderer.render(scene, camera)`.
@@ -330,16 +364,53 @@ function prewarm() {
     // Going through the composer also warms the post chain's own passes.
     if (World.pipeline && World.pipeline.render) World.pipeline.render(1 / 60);
     else renderer.render(scene, camera);
+    warmedRungs.add(rung);
+    compiled.push(rung);
   }
   for (let i = 0; i < _lights.length; i++) _lights[i].visible = was[i];
   const ms = performance.now() - t0;
-  return { ms: Math.round(ms), rungs: RUNGS.slice(), programs: renderer.info.programs.length };
+  return { ms: Math.round(ms), rungs: RUNGS.slice(), compiled, programs: renderer.info.programs.length };
 }
 
 const api = {
   get stats() { return { ...stats }; },
   get rungs() { return RUNGS.slice(); },
+  /** Active light budget. null = uncapped (the full ladder, lossless default). */
+  get budget() { return budget; },
   get enabled() { return enabled; },
+  /**
+   * Runtime light budget — the settings-slider entry point.
+   *
+   *   World.lightCull.setBudget(20)    // cap at 20 visible point lights
+   *   World.lightCull.setBudget(null)  // restore the full ladder (also 0/Infinity/NaN)
+   *
+   * Takes effect on the VERY NEXT frame; no reload. Three things stay in sync:
+   *
+   *   1. LADDER — rebuilt from ALL_RUNGS at or under the cap, so rungs above the
+   *      budget can never be selected again (selecting one would recompile every
+   *      material at that light count — the 4,295 ms stall this system exists to
+   *      prevent). Lowering the cap therefore SHRINKS the shader-variant space.
+   *   2. PREWARM — any newly reachable rung is compiled HERE, synchronously, before
+   *      the new ladder can be selected. Already-warmed rungs are skipped, so the
+   *      cost is only the delta: capping a fully-warmed ladder compiles nothing,
+   *      and uncapping compiles just the restored rungs. The one-time hitch lands
+   *      in the settings click, not in a later fight.
+   *   3. STATS — the next cull lands `shown` exactly on a rung of the new ladder;
+   *      `droppedInFrustum` immediately reports how many real in-frustum lights the
+   *      cap is discarding, and F3 shows it live.
+   *
+   * Shadow-casting lights are exempt at every budget: they sort ahead of all other
+   * lights in the survival order, so the shadow-map count never changes and no
+   * shadow-variant recompile is ever triggered.
+   */
+  setBudget(cap) {
+    budget = (Number.isFinite(cap) && cap > 0) ? cap : null;
+    RUNGS = ladderFor(budget);
+    CFG.graphics.lightBudget = budget;
+    lastRung = -1;               // count the ladder swap itself as one rung change
+    const pw = prewarm();        // compile the delta NOW, never on first use in play
+    return { budget, rungs: RUNGS.slice(), prewarm: pw };
+  },
   /** Toggle for same-tree A/B. Off restores every live light to visible. */
   setEnabled(on) {
     enabled = !!on;
@@ -361,15 +432,12 @@ export default {
   init(ctx) {
     scene = ctx.scene; camera = ctx.camera; renderer = ctx.renderer;
     enabled = CFG.graphics.lightCull !== false;
-    // Apply the optional budget cap. Rungs above it are removed entirely, so they are
-    // never prewarmed and never reached — the shader variant count falls with the cap.
-    const cap = CFG.graphics.lightBudget;
-    if (Number.isFinite(cap) && cap > 0) {
-      RUNGS = ALL_RUNGS.filter((r) => r <= cap);
-      if (!RUNGS.length) RUNGS = [ALL_RUNGS[0]];   // never leave the ladder empty
-    } else {
-      RUNGS = ALL_RUNGS.slice();
-    }
+    // Apply the optional boot-time budget cap through the same path the runtime
+    // API uses. Rungs above it are removed entirely, so they are never prewarmed
+    // and never reached — the shader variant count falls with the cap.
+    budget = (Number.isFinite(CFG.graphics.lightBudget) && CFG.graphics.lightBudget > 0)
+      ? CFG.graphics.lightBudget : null;
+    RUNGS = ladderFor(budget);
     dirty = true;
     World.lightCull = api;
   },
