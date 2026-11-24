@@ -8,6 +8,13 @@ export interface SchedulerHost {
   dispatch(event: MusicalEvent, audioTime: number): void;
   /** Ask the host to top up the generation horizon. */
   generate(): void;
+  /**
+   * Runs at the very start of every tick, before any dispatch. The host uses
+   * it to land clock-driven work (e.g. a style/seed transition whose musical
+   * boundary has been reached) so cutovers stay aligned with the audio clock
+   * instead of relying on a drift-prone setTimeout. Optional.
+   */
+  onTickStart?(): void;
 }
 
 /**
@@ -72,6 +79,10 @@ export class Scheduler {
 
   /** One scheduling pass — public so tests can drive it deterministically. */
   tick(): void {
+    // Let the host land clock-driven work (style/seed cutover) before this
+    // tick dispatches anything, so a boundary reached on the audio clock is
+    // applied to the very events dispatched in this pass.
+    this.host.onTickStart?.();
     const now = this.host.now();
     const dueAudio = now + this.lookahead;
     for (;;) {

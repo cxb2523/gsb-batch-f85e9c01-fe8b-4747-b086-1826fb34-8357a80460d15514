@@ -50,12 +50,14 @@ export class MusicEngine {
   private styleRandom: SeededRandom | null = null;
   private seed: string;
   private generatedUntil = 0;
+  /** True between the request and the clock-driven cutover at the boundary. */
   private transitioning = false;
   /** Latest style/seed request made while a transition was already in flight. */
   private pendingTarget: { styleId?: string; seed?: string } | null = null;
   /** Target of the transition currently in flight (kept for cancel/merge). */
   private transitionTarget: { styleId?: string; seed?: string } | null = null;
-  private transitionTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Transport time at which the in-flight transition cuts over. */
+  private transitionBoundary = 0;
   private stopTimer: ReturnType<typeof setTimeout> | null = null;
   private watchdog: ReturnType<typeof setInterval> | null = null;
   private watchdogMisses = 0;
@@ -198,7 +200,9 @@ export class MusicEngine {
 
   pause(): void {
     if (this.state.status !== 'playing') return;
-    this.cancelTransition(false);
+    // Fold the armed transition into a pending target so the intent survives
+    // the pause; resume() lands it immediately.
+    this.cancelTransition();
     this.scheduler?.stop();
     this.stopWatchdog();
     const audio = this.audio;
@@ -234,7 +238,7 @@ export class MusicEngine {
   }
 
   stop(): void {
-    this.cancelTransition(true);
+    this.cancelTransition();
     this.scheduler?.stop();
     this.stopWatchdog();
     if (this.stopTimer) clearTimeout(this.stopTimer);
@@ -282,10 +286,11 @@ export class MusicEngine {
       this.beginTransition({ seed: s });
       return;
     }
-    this.seed = s;
+    // While paused/idle a previously interrupted transition may still carry a
+    // target. Merge this request into it so neither side is lost.
+    this.applyTargetNow({ ...this.drainPendingTarget(), seed: s });
     this.teardownInstance(); // fresh deterministic replay from t=0
     if (this.state.status === 'paused') this.generatedUntil = this.pausedPosition();
-    this.eventBus.emit('seed', { seed: s });
   }
 
   useStyle(styleId: string): void {
@@ -299,11 +304,10 @@ export class MusicEngine {
       this.beginTransition({ styleId });
       return;
     }
-    this.stylePlugin = plugin;
-    this.params.init(plugin.id, plugin.parameters);
+    // Merge with any target a pause/stop-interrupted transition was carrying.
+    this.applyTargetNow({ ...this.drainPendingTarget(), styleId: plugin.id });
     this.teardownInstance();
     if (this.state.status === 'paused') this.generatedUntil = this.pausedPosition();
-    this.eventBus.emit('style', { styleId: plugin.id });
   }
 
   setParameter(name: string, value: number | string | boolean): void {
@@ -474,6 +478,9 @@ export class MusicEngine {
       this.startWatchdog();
       return;
     }
+    // Falling back to an honest paused state: preserve any in-flight
+    // transition target so resume() can still land it.
+    this.cancelTransition();
     this.state.set('paused');
     this.eventBus.emit('error', {
       scope: 'audio',
@@ -483,9 +490,8 @@ export class MusicEngine {
   }
 
   async dispose(): Promise<void> {
-    this.cancelTransition(true);
+    this.cancelTransition();
     this.stop();
-    if (this.transitionTimer) clearTimeout(this.transitionTimer);
     if (this.stopTimer) clearTimeout(this.stopTimer);
     this.teardownInstance();
     this.instruments.disposeAll();
@@ -543,6 +549,8 @@ export class MusicEngine {
     if (this.watchdogMisses >= 2) {
       this.stopWatchdog();
       this.scheduler?.stop();
+      // Preserve an in-flight transition target; resume() must still land it.
+      this.cancelTransition();
       this.state.set('paused');
       this.eventBus.emit('error', {
         scope: 'audio',
@@ -572,6 +580,7 @@ export class MusicEngine {
         audioTimeFor: (t) => this.transport.audioTimeFor(t),
         dispatch: (ev, at) => this.dispatch(ev, at),
         generate: () => this.generate(),
+        onTickStart: () => this.maybeLandTransition(),
       },
       { lookahead: this.cfg.lookAhead, intervalMs: this.cfg.scheduleInterval },
     );
@@ -604,6 +613,9 @@ export class MusicEngine {
   private instantiateStyle(): void {
     if (!this.stylePlugin || !this.audio) return;
     const plugin = this.stylePlugin;
+    // Ensure defaults exist without discarding values the user set on this
+    // style. Switch landing points call params.reset() explicitly so a newly
+    // selected style always starts from its own definitions.
     this.params.init(plugin.id, plugin.parameters);
     const params = this.params.getAll(plugin.id);
     // Seed isolation per style + version (PRD §13/§60): adding a new style
@@ -705,7 +717,19 @@ export class MusicEngine {
 
   // -------------------------------------------------------------------------
   // Graceful transitions (style switch / new seed while playing)
+  //
+  // The cutover is driven by the audio clock, not a setTimeout: every
+  // scheduler tick asks `maybeLandTransition()` whether the musical boundary
+  // has been reached. This keeps the swap sample-aligned with the timeline,
+  // works identically under throttled background timers, and freezes cleanly
+  // while the AudioContext is suspended (a paused clock simply never reaches
+  // the boundary). No Math.random anywhere on this path.
   // -------------------------------------------------------------------------
+
+  /** Earliest cutover after a request, in transport seconds (fade room). */
+  private static readonly MIN_TRANSITION_DELAY = 0.6;
+  /** Hard cap on how long a style may ring out before the cutover. */
+  private static readonly MAX_TRANSITION_DELAY = 4.0;
 
   private beginTransition(target: { styleId?: string; seed?: string }): void {
     if (!this.audio || !this.transport.isActive) return;
@@ -713,60 +737,112 @@ export class MusicEngine {
 
     const now = this.audio.ctx.currentTime;
     const pos = this.transport.positionAt(now);
-    const boundaryRaw = this.instance?.nextBoundary?.(pos) ?? null;
-    const boundary = Math.min(Math.max(boundaryRaw ?? pos + 1.0, pos + 0.6), pos + 4.0);
-    const audioBoundary = this.transport.audioTimeFor(boundary);
+
+    // The boundary must lie *beyond* every event the scheduler could already
+    // have dispatched (now + lookahead). Otherwise the same boundary notes
+    // would exist twice: once handed to an instrument ahead of time, once
+    // regenerated by the incoming style — an audible doubled note.
+    const requested = this.instance?.nextBoundary?.(pos) ?? null;
+    const earliest = pos + Math.max(this.cfg.lookAhead + 0.05, MusicEngine.MIN_TRANSITION_DELAY);
+    const boundary = Math.min(
+      Math.max(requested ?? earliest, earliest),
+      pos + MusicEngine.MAX_TRANSITION_DELAY,
+    );
 
     this.transitioning = true;
     this.transitionTarget = target;
+    this.transitionBoundary = boundary;
     this.eventBus.emit('transition', { phase: 'begin' });
-    // Ring out what is already sounding, dropping not-yet-dispatched events.
-    this.scheduler?.queue.clearFrom(boundary - 0.3);
-    this.audio.setFade(0, Math.max(now + 0.03, audioBoundary - 0.9), 0.8);
 
-    const waitMs = Math.max(0, (audioBoundary - now) * 1000 - 25);
-    this.transitionTimer = setTimeout(() => {
-      this.transitionTimer = null;
-      const a = this.audio;
-      if (!a) {
-        this.transitioning = false;
-        this.transitionTarget = null;
-        return;
-      }
-      const n2 = a.ctx.currentTime;
-      // Anything requested while this transition was in flight lands here too,
-      // so a rapid style/seed change is never silently discarded.
-      const effective: { styleId?: string; seed?: string } = {
-        ...target,
-        ...(this.pendingTarget ?? {}),
-      };
-      this.pendingTarget = null;
-      this.transitionTarget = null;
-      this.instruments.stopAll(n2 + 0.02, 0.05);
-      this.scheduler?.queue.clear();
-      this.teardownInstance();
-      if (effective.styleId) {
-        this.stylePlugin = this.validateStyle(effective.styleId);
-        this.params.init(this.stylePlugin.id, this.stylePlugin.parameters);
-        this.eventBus.emit('style', { styleId: this.stylePlugin.id });
-      }
-      if (effective.seed !== undefined) {
-        this.seed = effective.seed;
-        this.eventBus.emit('seed', { seed: this.seed });
-      }
-      this.generatedUntil = this.transport.isActive ? this.transport.positionAt(n2) : 0;
-      this.instantiateStyle();
-      a.setFade(1, n2 + 0.06, 1.1);
-      this.transitioning = false;
-      this.eventBus.emit('transition', { phase: 'end' });
-      this.scheduler?.start();
-      this.state.set('playing');
-    }, waitMs);
+    // Events at/after the boundary are regenerated by the incoming style, so
+    // drop the queued copies. Everything before the boundary is still inside
+    // the dispatch horizon and keeps playing through the fade-out.
+    this.scheduler?.queue.clearFrom(boundary);
+
+    const audioBoundary = this.transport.audioTimeFor(boundary);
+    this.audio.setFade(0, Math.max(now + 0.03, audioBoundary - 0.9), 0.8);
+  }
+
+  /** Scheduler tick hook: land the cutover once the audio clock reaches it. */
+  private maybeLandTransition(): void {
+    if (!this.transitioning || !this.audio) return;
+    const now = this.audio.ctx.currentTime;
+    const pos = this.transport.positionAt(now);
+    if (pos < this.transitionBoundary) return;
+    this.landTransition(now);
+  }
+
+  /**
+   * Performs the actual swap. Called from the scheduler tick while playing, or
+   * directly by start()/resume() when a paused/stopped transition had to be
+   * deferred. In every case the result is identical: one cutover, no doubled
+   * boundary event, no gap after it, params re-initialised from definitions.
+   */
+  private landTransition(now: number): void {
+    const audio = this.audio;
+    if (!audio) return;
+    // Merge the in-flight target with anything requested afterwards. Latest
+    // value per field wins, and both fields apply in this single landing.
+    const effective = { ...(this.transitionTarget ?? {}), ...(this.pendingTarget ?? {}) };
+    this.pendingTarget = null;
+    this.transitionTarget = null;
+    this.transitioning = false;
+
+    // Cut everything the outgoing style had scheduled/triggered. The boundary
+    // was chosen past the dispatch horizon, so the incoming regeneration
+    // below can never overlap an already-triggered outgoing note.
+    this.instruments.stopAll(now + 0.02, 0.05);
+    this.scheduler?.queue.clear();
+    this.teardownInstance();
+
+    if (effective.styleId) {
+      this.stylePlugin = this.validateStyle(effective.styleId);
+      // Re-initialise from the plugin's own definitions — a style must never
+      // inherit a previous visit's (or another style's) parameter values.
+      this.params.reset(this.stylePlugin.id, this.stylePlugin.parameters);
+      this.eventBus.emit('style', { styleId: this.stylePlugin.id });
+    }
+    if (effective.seed !== undefined) {
+      this.seed = effective.seed;
+      this.eventBus.emit('seed', { seed: this.seed });
+    }
+
+    // Regenerate from the musical boundary, not from "now": the cutover is
+    // aligned to the bar line even if a throttled tick reached it late, so no
+    // boundary-after note is ever skipped.
+    this.generatedUntil = this.transport.isActive ? this.transitionBoundary : 0;
+    this.instantiateStyle();
+    audio.setFade(1, now + 0.06, 1.1);
+    this.eventBus.emit('transition', { phase: 'end' });
   }
 
   /** Remember a request made mid-transition (latest value per field wins). */
   private queueTarget(target: { styleId?: string; seed?: string }): void {
     this.pendingTarget = { ...(this.pendingTarget ?? {}), ...target };
+  }
+
+  /** Take and clear the accumulated pending target, if any. */
+  private drainPendingTarget(): { styleId?: string; seed?: string } | null {
+    const target = this.pendingTarget;
+    this.pendingTarget = null;
+    return target;
+  }
+
+  /**
+   * Applies a style/seed target immediately (used outside active playback and
+   * on resume). Style parameters are re-initialised from plugin definitions
+   * and the UI is notified through the same events as a live cutover.
+   */
+  private applyTargetNow(target: { styleId?: string; seed?: string }): void {
+    if (target.styleId) {
+      this.stylePlugin = this.validateStyle(target.styleId);
+      this.params.reset(this.stylePlugin.id, this.stylePlugin.parameters);
+      this.eventBus.emit('style', { styleId: this.stylePlugin.id });
+    }
+    if (target.seed !== undefined) {
+      this.seed = target.seed;
+      this.eventBus.emit('seed', { seed: this.seed });
+    }
   }
 
   /**
@@ -775,37 +851,25 @@ export class MusicEngine {
    * the intent survives instead of being thrown away.
    */
   private applyPendingTarget(): void {
-    const target = this.pendingTarget;
+    const target = this.drainPendingTarget();
     if (!target) return;
-    this.pendingTarget = null;
-    if (target.styleId) {
-      this.stylePlugin = this.validateStyle(target.styleId);
-      this.params.init(this.stylePlugin.id, this.stylePlugin.parameters);
-      this.eventBus.emit('style', { styleId: this.stylePlugin.id });
-    }
-    if (target.seed !== undefined) {
-      this.seed = target.seed;
-      this.eventBus.emit('seed', { seed: this.seed });
-    }
+    this.applyTargetNow(target);
     this.teardownInstance();
     if (this.state.status === 'paused') this.generatedUntil = this.pausedPosition();
   }
 
-  private cancelTransition(immediate: boolean): void {
-    if (!this.transitioning) return;
-    if (this.transitionTimer) clearTimeout(this.transitionTimer);
-    this.transitionTimer = null;
-    this.transitioning = false;
-    // Don't lose what the interrupted transition was heading towards.
+  /**
+   * Abort the armed transition without losing its target: the in-flight target
+   * is merged (latest-wins) into the pending target, which start()/resume()
+   * then land. Always closes the 'transition' UI phase.
+   */
+  private cancelTransition(): void {
+    if (!this.transitioning && !this.transitionTarget) return;
     if (this.transitionTarget) {
       this.pendingTarget = { ...this.transitionTarget, ...(this.pendingTarget ?? {}) };
       this.transitionTarget = null;
     }
-    if (immediate && this.audio) {
-      const now = this.audio.ctx.currentTime;
-      this.instruments.stopAll(now + 0.01, 0.05);
-      this.teardownInstance();
-      this.eventBus.emit('transition', { phase: 'end' });
-    }
+    this.transitioning = false;
+    this.eventBus.emit('transition', { phase: 'end' });
   }
 }

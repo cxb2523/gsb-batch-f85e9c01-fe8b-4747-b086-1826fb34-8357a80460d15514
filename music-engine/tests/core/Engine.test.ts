@@ -57,6 +57,17 @@ function play(engine: MusicEngine, mock: MockAudioContext, seconds: number, step
   }
 }
 
+/** Tick the audio clock until a pending transition has landed. */
+function driveUntilLanded(engine: MusicEngine, mock: MockAudioContext, maxSeconds = 6): void {
+  let elapsed = 0;
+  while ((engine as any).transitioning && elapsed < maxSeconds) {
+    mock.advance(0.05);
+    (engine as any).scheduler.tick();
+    elapsed += 0.05;
+  }
+  expect((engine as any).transitioning).toBe(false);
+}
+
 describe('MusicEngine (headless with mock AudioContext)', () => {
   it('plugin → event → scheduler → instrument → audio pipeline works', async () => {
     const mock = new MockAudioContext();
@@ -153,10 +164,9 @@ describe('MusicEngine (headless with mock AudioContext)', () => {
     play(engine, mock, 0.3);
 
     engine.useStyle('zen');
-    // The engine swaps at the style's next musical boundary (≤ 4s audio,
-    // ≤ its wall-clock equivalent here). Let it happen.
-    mock.advance(1.0);
-    await sleep(2600);
+    // The engine swaps at the style's next musical boundary, driven by the
+    // audio clock through scheduler ticks (no wall-clock wait).
+    driveUntilLanded(engine, mock);
     play(engine, mock, 2.0);
 
     expect(engine.getState().styleId).toBe('zen');
@@ -165,7 +175,7 @@ describe('MusicEngine (headless with mock AudioContext)', () => {
     const zenEvents = log.filter((l) => l.event.metadata?.sourcePlugin === 'zen');
     expect(zenEvents.length).toBeGreaterThan(0);
     await engine.dispose();
-  }, 10000);
+  });
 
   it('unknown style or missing dependencies throw EngineError', async () => {
     const mock = new MockAudioContext();

@@ -84,6 +84,17 @@ function play(engine: MusicEngine, mock: MockAudioContext, seconds: number, step
   }
 }
 
+/** Tick the audio clock until a pending transition has landed. */
+function driveUntilLanded(engine: MusicEngine, mock: MockAudioContext, maxSeconds = 6): void {
+  let elapsed = 0;
+  while ((engine as any).transitioning && elapsed < maxSeconds) {
+    mock.advance(0.05);
+    (engine as any).scheduler.tick();
+    elapsed += 0.05;
+  }
+  expect((engine as any).transitioning).toBe(false);
+}
+
 describe('Scheduler under background-tab throttling', () => {
   const build = (lookahead: number, maxLate: number) => {
     let now = 100;
@@ -222,16 +233,16 @@ describe('MusicEngine field fixes', () => {
     expect(pendingSeeds).toEqual(['4242']);
     expect((engine as any).pendingTarget).toMatchObject({ styleId: 'pulse', seed: '4242' });
 
-    // Let the boundary arrive (≤ 4 s of audio clock) and the timer fire.
-    mock.advance(4.0);
-    await sleep(4200);
+    // The cutover is driven by the audio clock at the musical boundary —
+    // advance mock time and tick the scheduler, no wall-clock wait.
+    driveUntilLanded(engine, mock);
     play(engine, mock, 1.0);
 
     expect(engine.getState().styleId).toBe('pulse');
     expect(engine.getState().seed).toBe('4242');
     expect(engine.getState().status).toBe('playing');
     await engine.dispose();
-  }, 15000);
+  });
 
   it('a transition interrupted by pause still applies its target on resume', async () => {
     const mock = new MockAudioContext();
