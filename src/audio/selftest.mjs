@@ -279,6 +279,37 @@ try {
   });
   log(`steady state: ${perf.fps} fps, audio.update() median ${perf.updateMedianMs} ms / p95 ${perf.updateP95Ms} ms, ${perf.opponentVoices} spatial opponent voices`);
 
+  /* ---- live tier cycling: the acceptance path for the opponent pool + reverb ----
+   * Switch through every tier (shrink and grow, plus a low↔ultra round trip) and snapshot the
+   * real pool after each settle. This runs against the live AudioContext, so it covers the same
+   * code the player hits, not just an offline reconstruction. */
+  log('cycling quality tiers on the live audio graph…');
+  const qualityRows = await page.evaluate(async () => {
+    const nft = window.__NFT;
+    const ctx = nft.ctx;
+    const a = ctx.audio;
+    const snap = (tag) => ({
+      tag,
+      tier: ctx.settings.tier,
+      cap: a._opponentSlots.length,
+      bound: a._opponentSlots.map((s) => ({ car: s.car?.id ?? null, voice: s.voice?.def?.id ?? null })),
+      live: a.stats.opponents,
+      verbDur: a.convolver?.buffer?.duration ?? 0,
+      verbTier: a._tier.verb,
+      conBufferIsVerbBuf: a.convolver?.buffer === a._verbBuffer,
+    });
+    const rows = [snap('boot')];
+    for (const tier of ['low', 'medium', 'high', 'ultra', 'medium', 'low', 'ultra', 'high']) {
+      nft.setQuality(tier);
+      // Frame-rate independent: wait for simulated time, not a frame count. The rebind plus the
+      // voice fade needs a few update() ticks whatever the machine is running at.
+      await nft.settle(1.2);
+      rows.push(snap(`→${tier}`));
+    }
+    return rows;
+  });
+  log(`tier cycle: ${qualityRows.map((r) => `${r.tag}=${r.cap}/${r.live}v`).join('  ')}`);
+
   const rpms = frames.frames.map((f) => f.rpm);
   log(
     `state span: rpm ${Math.round(Math.min(...rpms))}–${Math.round(Math.max(...rpms))}, ` +
@@ -289,11 +320,11 @@ try {
 
   // ---- offline render + spectral analysis ----
   log('rendering offline & analysing…');
-  const report = await page.evaluate(async ({ frames, seconds }) => {
+  const report = await page.evaluate(async ({ frames, seconds, qualityRows }) => {
     const mod = await import('/src/audio/selftest.js');
     const wrapped = frames.map((f) => ({ state: f, shift: f.shift, collision: f.collision, land: f.land }));
-    return mod.runAudioSelfTest(wrapped, { seconds });
-  }, { frames: frames.frames.map((f) => f), seconds: SECONDS });
+    return mod.runAudioSelfTest(wrapped, { seconds, pageProbe: qualityRows });
+  }, { frames: frames.frames.map((f) => f), seconds: SECONDS, qualityRows });
 
   /* ------------------------------------------------------------- printout */
   const line = (s = '') => console.log(s);
@@ -363,6 +394,20 @@ try {
         `rms ${report.fullMix.rms.toFixed(4)} (${report.fullMix.dbRms.toFixed(1)} dBFS)   ` +
         `clipped samples: ${report.fullMix.clipped}`
     );
+  }
+
+  if (report.opponentPool || report.reverb || report.releasedVoice) {
+    line();
+    line('── tier-change invariants (opponent pool + reverb) ──');
+    const p = report.opponentPool;
+    if (p) line(`   pool: high cap ${p.high.cap} → medium cap ${p.medium.cap} → ultra cap ${p.ultra.cap}`);
+    if (report.releasedVoice)
+      line(`   released voice rms: ${report.releasedVoice.before} before → ${report.releasedVoice.after} after`);
+    if (report.reverb)
+      line(
+        `   reverb: high ${report.reverb.durHigh}s → medium ${report.reverb.durMed}s → ultra ${report.reverb.durUltra}s; ` +
+          `tail ${report.reverb.early} → ${report.reverb.late}`
+      );
   }
 
   line();

@@ -9,6 +9,7 @@
  */
 import { AudioSystem } from './AudioSystem.js';
 import { EngineVoice } from './EngineVoice.js';
+import { noiseBuffer } from './dsp.js';
 import { CAR_DEFS } from '../vehicle/carDefs.js';
 import { profileNameForCar } from './engineProfiles.js';
 
@@ -621,6 +622,319 @@ async function testMusic() {
   return { open: lv, ducked: lv2 };
 }
 
+/* -------------------------------------------------- H: quality-change invariants */
+
+/**
+ * Fake car instances for the voice-pool tests. Positions sit on a line in front of the listener
+ * so "nearest N" is well defined; no rendering is involved.
+ */
+function fakeCars(defs) {
+  return defs.map((def, i) => ({
+    id: `${def.id}-${i}`,
+    def,
+    state: {
+      position: { x: (i - 2) * 8, y: 0, z: -12 - i * 6 },
+      velocity: { x: 0, y: 0, z: 12 },
+      rpm: 5200,
+      gear: 3,
+      engineLoad: 0.8,
+      throttle: 1,
+      speed: 40,
+      speedKmh: 144,
+      nosActive: false,
+      airborne: false,
+      wheels: [fakeWheel(), fakeWheel(), fakeWheel(), fakeWheel()],
+    },
+  }));
+}
+
+/** Snapshot of the slot pool, so each assertion reads the same fields as the page probe. */
+export function poolSnapshot(audio) {
+  const slots = audio._opponentSlots ?? [];
+  return {
+    cap: slots.length,
+    cars: slots.map((s) => s.car),
+    voices: slots.map((s) => s.voice),
+    bound: slots.filter((s) => s.car && s.voice).length,
+    occupied: slots.filter((s) => s.car).length,
+    live: audio.stats.opponents,
+    tier: audio._tier,
+  };
+}
+
+/**
+ * H1: shrinking the pool must retire the extra voices (sources stopped, slot emptied) and make
+ * them stop counting as live; growing it must create *empty* slots that then bind fresh voices,
+ * never inheriting the previous occupant.
+ */
+async function testOpponentPool() {
+  const { AudioSystem } = await import('./AudioSystem.js');
+  const oac = new OfflineAudioContext(2, Math.ceil(SR * 0.2), SR);
+  const cars = fakeCars(CAR_DEFS.slice(0, 6));
+  const fauxCtx = {
+    bus: { on: () => () => {} },
+    cars: { player: { def: CAR_DEFS[0], state: cars[0].state }, instances: cars.slice(1) },
+    settings: { tier: 'high' },
+    camera: null,
+  };
+  const audio = new AudioSystem(fauxCtx);
+  audio.attachContext(oac, { tier: 'high', def: CAR_DEFS[0], music: false });
+  audio.offlineTime = 0;
+  audio.onQuality('high'); // attachContext does not build a pool; the live deferred path does
+
+  const step = (n = 30) => {
+    for (let i = 0; i < n; i++) {
+      audio.offlineTime += 1 / 60;
+      audio._updateOpponents(audio.offlineTime, 1 / 60, fauxCtx);
+    }
+  };
+  const unique = (arr) => new Set(arr.filter(Boolean)).size;
+
+  step(30);
+  const hi = poolSnapshot(audio);
+  const hiOk =
+    hi.cap === 4 &&
+    hi.occupied === 4 &&
+    hi.bound === 4 &&
+    unique(hi.cars) === hi.occupied &&
+    unique(hi.voices) === hi.bound;
+  check(
+    'opponent pool: high tier fills exactly 4 slots, one car and one voice each',
+    hiOk,
+    `cap ${hi.cap}, cars ${hi.occupied}, voices ${hi.bound}, unique cars ${unique(hi.cars)}`
+  );
+
+  const releasedVoices = audio._opponentSlots.slice(2).map((s) => s.voice);
+  audio.onQuality('medium');
+  audio.offlineTime += 0.05;
+  step(30);
+  const med = poolSnapshot(audio);
+  const releasedDead = releasedVoices.every((v) => !v || !v._active);
+  const releasedSlots = audio._opponentSlots.every((s) => s.car && s.voice);
+  check(
+    'opponent pool: shrinking to medium retires the extra voices',
+    med.cap === 2 && med.occupied === 2 && med.bound === 2 && releasedDead,
+    `cap ${med.cap}, live ${med.live}, released voices active: ${releasedVoices.filter((v) => v?._active).length}`
+  );
+  check(
+    'opponent pool: every surviving slot keeps exactly one valid car+voice',
+    releasedSlots && unique(med.cars) === 2 && unique(med.voices) === 2,
+    `cars ${med.occupied}, voices ${med.bound}`
+  );
+  check(
+    'opponent pool: released slots no longer count toward live voices',
+    med.live <= 2 && audio.stats.voices <= 2 + 1 + (audio.engine ? 1 : 0),
+    `stats.opponents ${med.live}, stats.voices ${audio.stats.voices}`
+  );
+
+  // Re-expansion: the newly added slots must be brand-new and empty until the binder fills them.
+  const beforeGrow = audio._opponentSlots.slice();
+  audio.onQuality('ultra');
+  const afterGrow = audio._opponentSlots;
+  const added = afterGrow.slice(beforeGrow.length);
+  const grownEmpty = afterGrow.length === 5 && added.every((s) => !s.car && !s.voice);
+  check(
+    'opponent pool: growing to ultra creates empty slots, not recycled voices',
+    grownEmpty,
+    `cap ${afterGrow.length}, ${added.length} added, pre-filled voices ${added.filter((s) => s.voice).length}`
+  );
+
+  step(30);
+  const ultra = poolSnapshot(audio);
+  check(
+    'opponent pool: ultra binds 5 distinct cars with distinct voices',
+    ultra.occupied === 5 && ultra.bound === 5 && unique(ultra.cars) === 5 && unique(ultra.voices) === 5,
+    `occupied ${ultra.occupied}, bound ${ultra.bound}, unique cars ${unique(ultra.cars)}`
+  );
+  // A voice must always match the car it is bound to.
+  const mismatched = audio._opponentSlots.filter((s) => s.car && s.voice && s.voice.def !== s.car.def);
+  check(
+    'opponent pool: every voice carries the timbre of the car it is bound to',
+    mismatched.length === 0,
+    `${mismatched.length} mismatched slots`
+  );
+
+  // A car must also lose its slot when it drops out of range: released and stopped, not merely
+  // silenced, and the whole pool stays one-car-per-slot.
+  const dropped = audio._opponentSlots[0];
+  const droppedCar = dropped.car;
+  const droppedVoice = dropped.voice;
+  droppedCar.state.position.z = -2000;
+  audio.offlineTime += 1.0; // past the rebind cooldown
+  step(30);
+  const afterDrop = audio._opponentSlots;
+  const carStillBound = afterDrop.some((s) => s.car === droppedCar);
+  check(
+    'opponent pool: a car leaving range is released and stopped',
+    !carStillBound && (!droppedVoice || !droppedVoice._active),
+    `car still bound: ${carStillBound}, released voice active: ${!!droppedVoice?._active}`
+  );
+  const uniqueAfter = new Set(afterDrop.map((s) => s.car).filter(Boolean)).size;
+  check(
+    'opponent pool: after a release every slot still holds a car+voice pair or nothing',
+    uniqueAfter === afterDrop.filter((s) => s.car).length &&
+      afterDrop.every((s) => !s.car === !s.voice),
+    `cars ${afterDrop.filter((s) => s.car).length}, unique ${uniqueAfter}`
+  );
+
+  // Shrink to zero and verify nothing keeps sounding.
+  audio.onQuality('low');
+  audio.offlineTime += 0.05;
+  step(30);
+  const low = poolSnapshot(audio);
+  check(
+    'opponent pool: low tier drops the whole pool and stops the sound',
+    low.cap === 0 && low.live === 0 && audio._opponentSlots.length === 0,
+    `cap ${low.cap}, live ${low.live}`
+  );
+
+  audio.dispose();
+  return { high: { cap: hi.cap, cars: hi.occupied }, medium: { cap: med.cap }, ultra: { cap: ultra.cap } };
+}
+
+/**
+ * H2: a released voice must actually be silent in the rendered mix, not merely unbound. A voice
+ * is driven, then released, then the render continues — the last half must be digital silence.
+ */
+async function testReleasedVoiceSilent() {
+  const { EngineVoice } = await import('./EngineVoice.js');
+  const secs = 1.6;
+  const oac = new OfflineAudioContext(2, Math.ceil(SR * secs), SR);
+  const out = oac.createGain();
+  out.connect(oac.destination);
+  const def = CAR_DEFS[0];
+  const v = new EngineVoice(oac, def, { spatial: true, dest: out, startTime: 0 });
+  const st = fakeState({ rpm: 6000, engineLoad: 1, throttle: 1 });
+  const releaseAt = 0.8;
+  for (let i = 0; i * (1 / 120) < secs; i++) {
+    const t = i / 120;
+    if (t < releaseAt) v.update(st, t, { dt: 1 / 120, gain: 0.85 });
+    if (i === Math.floor(releaseAt * 120)) v.release(t);
+  }
+  const b = await oac.startRendering();
+  const d = b.getChannelData(0);
+  const rms = (a, z) => {
+    let s = 0;
+    let n = 0;
+    for (let i = Math.floor(a * SR); i < Math.floor(z * SR); i++) {
+      s += d[i] * d[i];
+      n++;
+    }
+    return Math.sqrt(s / Math.max(1, n));
+  };
+  const before = rms(releaseAt * 0.5, releaseAt * 0.85);
+  const after = rms(releaseAt + 0.18, secs - 0.02);
+  check('released opponent voice was audible before release', before > 0.002, `rms before ${before.toFixed(5)}`);
+  check(
+    'released opponent voice is silent afterwards (no residue, no old-position sound)',
+    after < 1e-4 && after < before * 0.01,
+    `rms before ${before.toFixed(5)} → after ${after.toFixed(7)}`
+  );
+  return { before: +before.toFixed(6), after: +after.toFixed(8) };
+}
+
+/**
+ * H3: the reverb buffer follows the tier exactly (no 0.2 s tolerance), the send chain survives a
+ * rebuild, and the new IR still produces a tail.
+ */
+async function testReverbRetune() {
+  const { AudioSystem } = await import('./AudioSystem.js');
+  const secs = 2.2;
+  const oac = new OfflineAudioContext(2, Math.ceil(SR * secs), SR);
+  const audio = new AudioSystem({ bus: { on: () => () => {} }, settings: { tier: 'high' } });
+  audio.attachContext(oac, { tier: 'high', def: CAR_DEFS[0], music: false });
+  audio.offlineTime = 0;
+
+  // Rebuild to a *small* change (high 0.95 → medium 0.8) that the old 0.2 s rule ignored.
+  audio.onQuality('high');
+  const durHigh = audio.convolver.buffer.duration;
+  audio.onQuality('medium');
+  const durMed = audio.convolver.buffer.duration;
+  const connected = audio.convolver.numberOfInputs >= 0 && audio.convolver.buffer === audio._verbBuffer;
+  check(
+    'reverb: a 0.15 s tier change rebuilds the impulse response',
+    Math.abs(durMed - 0.8) < 0.02,
+    `high ${durHigh.toFixed(2)} s → medium ${durMed.toFixed(2)} s`
+  );
+  check(
+    'reverb: convolver is wired to the new buffer after the rebuild',
+    connected && audio._verbBuffer.length === Math.floor(SR * 0.8),
+    `convolver.buffer ${audio.convolver.buffer?.duration.toFixed(2)} s, owner buffer ${audio._verbBuffer?.length} frames`
+  );
+  // The send chain must still carry signal: render a burst through it.
+  const bufSrc = oac.createBufferSource();
+  bufSrc.buffer = noiseBuffer(oac, 'white', 0.4);
+  const burst = oac.createGain();
+  burst.gain.value = 0.5;
+  bufSrc.connect(burst).connect(audio.reverbSend);
+  bufSrc.start(0.2);
+  bufSrc.stop(0.3);
+
+  audio.onQuality('ultra');
+  const durUltra = audio.convolver.buffer.duration;
+  check(
+    'reverb: ultra tail matches its tier after another rebuild',
+    Math.abs(durUltra - 1.2) < 0.02 && audio.convolver.buffer === audio._verbBuffer,
+    `ultra ${durUltra.toFixed(2)} s`
+  );
+
+  const b = await oac.startRendering();
+  const d = b.getChannelData(0);
+  // Measure energy just after the burst and late in the tail. The IR is normalised but not tiny,
+  // so a working send must leave a measurable tail; a broken/absent path leaves ~nothing.
+  const rms = (a, z) => {
+    let s = 0;
+    let n = 0;
+    for (let i = Math.floor(a * SR); i < Math.floor(z * SR); i++) {
+      s += d[i] * d[i];
+      n++;
+    }
+    return Math.sqrt(s / Math.max(1, n));
+  };
+  const early = rms(0.31, 0.45);
+  const late = rms(0.62, 0.95);
+  check('reverb: rebuilt send chain still produces a tail', early > 1e-5 && late > 1e-6, `early ${early.toFixed(6)}, late ${late.toFixed(7)}`);
+  check('reverb: tail decays rather than ringing forever', late < early, `${early.toFixed(6)} → ${late.toFixed(7)}`);
+  audio.dispose();
+  return { durHigh: +durHigh.toFixed(3), durMed: +durMed.toFixed(3), durUltra: +durUltra.toFixed(3), early: +early.toFixed(7), late: +late.toFixed(9) };
+}
+
+/* ------------------------------------------------- page-level quality cycling */
+
+/**
+ * Drive the *real* AudioSystem in the live page through a run of tier switches and assert the
+ * acceptance criteria there: pool size equals the tier's cap after every change, no duplicate
+ * car/voice binding, released slots no longer counted, reverb duration matches the tier and the
+ * convolver still owns the live buffer. `probe` is supplied by selftest.mjs (it holds the page).
+ */
+async function testPageQuality(probe) {
+  const rows = Array.isArray(probe) ? probe : [];
+  if (!rows.length) return null;
+  let badSize = 0;
+  let badDup = 0;
+  let badRelease = 0;
+  let badVerb = 0;
+  let badChain = 0;
+  const detail = [];
+  for (const r of rows) {
+    const cap = { low: 0, medium: 2, high: 4, ultra: 5 }[r.tier];
+    if (r.cap !== cap) badSize++;
+    const cars = r.bound.map((b) => b.car).filter(Boolean);
+    const voices = r.bound.map((b) => b.voice).filter(Boolean);
+    if (new Set(cars).size !== cars.length || new Set(voices).size !== voices.length) badDup++;
+    if (r.live > cap) badRelease++;
+    if (Math.abs(r.verbDur - r.verbTier) > 0.03) badVerb++;
+    if (!r.conBufferIsVerbBuf) badChain++;
+    detail.push(`${r.tag}:${r.tier} cap=${r.cap} live=${r.live} verb=${r.verbDur?.toFixed(2)}`);
+  }
+  check('page: pool size equals the tier cap after every switch', badSize === 0, detail.join('  '));
+  check('page: no car or voice bound to two slots', badDup === 0, `${badDup} offending switches`);
+  check('page: released slots are not counted as live', badRelease === 0, `${badRelease} offending switches`);
+  check('page: reverb duration matches the tier after every switch', badVerb === 0, `${badVerb} offending switches`);
+  check('page: convolver keeps owning the live reverb buffer', badChain === 0, `${badChain} offending switches`);
+  return rows;
+}
+
 /* ---------------------------------------------------------------- entry point */
 
 /** Prints a readable FFT/level summary and returns the full report. */
@@ -634,8 +948,13 @@ export async function runAudioSelfTest(frames = [], opts = {}) {
   report.sweep = await testSweep();
   report.layers = await testLayers();
   report.music = await testMusic();
+  report.reverb = await testReverbRetune();
+  report.opponentPool = await testOpponentPool();
+  report.releasedVoice = await testReleasedVoiceSilent();
   if (frames.length > 8) report.fullMix = await testFullMix(frames, opts.seconds ?? 6);
   else check('captured game frames available', false, 'no frames captured — full-mix test skipped');
+
+  report.pageQuality = opts.pageProbe ? await testPageQuality(opts.pageProbe) : null;
 
   report.checks = results.map((r) => ({ ...r }));
   report.passed = results.filter((r) => r.pass).length;

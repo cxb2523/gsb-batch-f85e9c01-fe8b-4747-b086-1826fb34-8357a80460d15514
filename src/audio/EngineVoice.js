@@ -112,6 +112,9 @@ export class EngineVoice {
     this._lastGear = 1;
     this._doppler = 0;
     this._active = true;
+    /** Last gain target handed to `out.gain`, so a release can fade from the real level. */
+    this._targetGain = 0;
+    this._detachTimer = null;
 
     const t0 = o.startTime ?? ac.currentTime;
     const harmonics = o.harmonics ?? (this.spatial ? 96 : 240);
@@ -271,7 +274,7 @@ export class EngineVoice {
       bov.connect(bbp).connect(bg).connect(this.out);
       bov.start(t0);
 
-      Object.assign(this.turbo, { whine, wg, whine2, wg2, wf, abp, ag, bg, bbp });
+      Object.assign(this.turbo, { whine, wg, whine2, wg2, wf, abp, ag, bg, bbp, air, bov });
     }
 
     if (o.reverbSend) {
@@ -379,6 +382,7 @@ export class EngineVoice {
     const base = prof.gain * (0.1 + 0.34 * rpmN + 0.4 * load + 0.1 * rpmN * load);
     const lvl = base * (o.gain ?? 1) * (this.isEv ? 0.9 : 1);
     this.loudness = clamp01(base);
+    this._targetGain = lvl;
     ramp(this.out.gain, lvl, t, 0.04);
 
     this._lastThrottle = throttle;
@@ -448,23 +452,93 @@ export class EngineVoice {
   }
 
   silence(t = this.ac.currentTime) {
+    this._targetGain = 0;
     ramp(this.out.gain, 0, t, 0.05);
     this.loudness = 0;
   }
 
+  /**
+   * Permanent retirement of a pooled voice (a shrunken voice pool) — a short fade, then every
+   * source is stopped and the graph torn down. Stopping the sources is what actually kills the
+   * residual sound a `silence()` alone leaves behind.
+   */
+  release(t = this.ac.currentTime) {
+    if (!this._active) return;
+    this._active = false;
+    this.loudness = 0;
+    const g = this.out?.gain;
+    if (g) {
+      const cur = Math.max(this._targetGain, 0.0001);
+      try {
+        g.cancelScheduledValues(t);
+        g.setValueAtTime(cur, t);
+        g.linearRampToValueAtTime(0, t + 0.05);
+      } catch {
+        /* the context may already be closed */
+      }
+    }
+    // Stop each source independently: a source that was already stopped must not prevent the
+    // rest from being stopped (which is how residue would survive).
+    const stopAt = t + 0.06;
+    const stop = (src) => {
+      try {
+        src?.stop(stopAt);
+      } catch {
+        /* already stopped */
+      }
+    };
+    for (const v of this.oscList) stop(v.osc);
+    stop(this.raspSrc);
+    stop(this.chuff);
+    if (this.turbo) {
+      stop(this.turbo.whine);
+      stop(this.turbo.whine2);
+      stop(this.turbo.air);
+      stop(this.turbo.bov);
+    }
+    // Detach the now-dead graph once the fade has elapsed. Skipped in an OfflineAudioContext,
+    // whose clock runs far faster than wall-clock — a real-time timer there would fire mid-render.
+    if (typeof this.ac.startRendering !== 'function' && typeof setTimeout === 'function') {
+      const delayMs = Math.max(0, (stopAt - this.ac.currentTime) * 1000) + 30;
+      try {
+        this._detachTimer = setTimeout(() => this.dispose(), delayMs);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   dispose() {
     this._active = false;
-    try {
-      for (const v of this.oscList) v.osc.stop();
-      this.raspSrc?.stop();
-      this.chuff?.stop();
-      if (this.turbo) {
-        this.turbo.whine.stop();
-        this.turbo.whine2.stop();
+    if (this._detachTimer) {
+      try {
+        clearTimeout(this._detachTimer);
+      } catch {
+        /* ignore */
       }
-      this.output.disconnect();
+      this._detachTimer = null;
+    }
+    const stop = (src) => {
+      try {
+        src?.stop();
+      } catch {
+        /* already stopped */
+      }
+    };
+    for (const v of this.oscList) stop(v.osc);
+    stop(this.raspSrc);
+    stop(this.chuff);
+    if (this.turbo) {
+      stop(this.turbo.whine);
+      stop(this.turbo.whine2);
+      stop(this.turbo.air);
+      stop(this.turbo.bov);
+    }
+    try {
+      this.send?.disconnect();
+      this.output?.disconnect();
     } catch {
-      /* already stopped */
+      /* device gone */
     }
   }
 }

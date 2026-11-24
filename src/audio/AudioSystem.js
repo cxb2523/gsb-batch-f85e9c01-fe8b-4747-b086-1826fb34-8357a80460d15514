@@ -49,7 +49,9 @@ export class AudioSystem {
     this.unlocked = false;
     this.listenerCamera = null;
 
-    this._tier = TIER.high;
+    // Adopt the boot tier immediately: the voice pool, harmonics and reverb are all sized from
+    // it, and a device that starts on `low` must never build a four-voice pool first.
+    this._tier = TIER[ctx?.settings?.tier] ?? TIER.high;
     this._deferred = [];
     this._opponentSlots = [];
     this._rebindCooldown = 0;
@@ -177,8 +179,9 @@ export class AudioSystem {
     this._buildEngine(opts.def);
     this._buildSfx();
     this._buildTyres();
-    this._buildReverb(0);
-    this._buildReverb(1);
+    // An offline context never advances its clock between frames, so both IR channels are
+    // rendered here rather than spread over two deferred tasks.
+    this._rebuildReverb();
     if (opts.music !== false) this._buildMusic();
     this._deferred = [];
     return this;
@@ -258,16 +261,27 @@ export class AudioSystem {
 
   /**
    * The IR is rendered one channel per frame — a 1 s stereo tail is ~200k samples per channel and
-   * rendering both at once is the single largest frame cost in the whole build.
+   * rendering both at once is the single largest frame cost in the whole build. (A mid-game tier
+   * change rebuilds both channels at once: see `_syncReverb`.)
    */
   _buildReverb(channel) {
     const ac = this.ac;
     if (!ac || this.convolver) return;
     const o = this._verbOpts();
-    if (!this._verbBuffer) {
-      this._verbBuffer = ac.createBuffer(2, Math.max(16, Math.floor(ac.sampleRate * o.seconds)), ac.sampleRate);
+    const frames = Math.max(16, Math.floor(ac.sampleRate * o.seconds));
+    if (!this._verbBuffer || this._verbBuffer.length !== frames) {
+      this._verbBuffer = ac.createBuffer(2, frames, ac.sampleRate);
+      this._verbSeconds = o.seconds;
+      this._verbBuilt = new Set();
+    }
+    // The tier may have changed between the two deferred channel passes; in that case the buffer
+    // was just recreated and channel 0 would otherwise be left silent in the new IR.
+    if (channel === 1 && !this._verbBuilt.has(0)) {
+      buildImpulseResponse(ac, { ...o, into: this._verbBuffer, only: 0 });
+      this._verbBuilt.add(0);
     }
     buildImpulseResponse(ac, { ...o, into: this._verbBuffer, only: channel });
+    this._verbBuilt.add(channel);
     if (channel !== 1) return;
     this.convolver = ac.createConvolver();
     this.convolver.normalize = false;
@@ -324,21 +338,126 @@ export class AudioSystem {
     this.music.setSection(phase === 'racing' ? 'race' : phase === 'countdown' ? 'countdown' : 'idle');
   }
 
-  _buildOpponents() {
+  /**
+   * Resize the pool to the tier's voice count. Shrinking releases the extra slots' voices and
+   * clears their occupancy; growing appends genuinely empty slots. Nothing is ever carried over
+   * from a released voice into a new slot.
+   */
+  _buildOpponents(t = this._t()) {
     const n = this._tier.opponents;
-    while (this._opponentSlots.length > n) this._opponentSlots.pop()?.voice?.dispose();
+    while (this._opponentSlots.length > n) this._releaseSlot(this._opponentSlots.pop(), t);
     while (this._opponentSlots.length < n) this._opponentSlots.push({ car: null, voice: null });
+    this._enforceSlotInvariant(t);
+  }
+
+  /**
+   * One voice per car, one car per voice. Normally the binding code guarantees this; this guard
+   * makes the invariant true even if a caller duplicates an instance in `cars.instances`.
+   */
+  _enforceSlotInvariant(t) {
+    const seen = new Set();
+    for (const slot of this._opponentSlots) {
+      if (!slot.car) {
+        if (slot.voice) this._releaseSlot(slot, t); // a voice is never left unowned
+        continue;
+      }
+      if (seen.has(slot.car) || !slot.voice) {
+        this._releaseSlot(slot, t);
+        continue;
+      }
+      seen.add(slot.car);
+    }
+  }
+
+  /**
+   * Drop a slot's car and stop its voice. The voice fades over a few tens of milliseconds and
+   * stops every source it owns, so a released slot can neither keep sounding from its old
+   * position nor pass its graph (and timbre state) on to the next occupant.
+   */
+  _releaseSlot(slot, t = this._t()) {
+    if (!slot) return;
+    const voice = slot.voice;
+    slot.car = null;
+    slot.voice = null;
+    if (!voice) return;
+    if (typeof voice.release === 'function') voice.release(t);
+    else voice.dispose?.();
+  }
+
+  /** Bind a car to a free slot with a freshly built voice sized for the current tier. */
+  _bindSlot(slot, car, t) {
+    if (!slot || !car?.def) return;
+    // A car may occupy at most one slot.
+    if (this._opponentSlots.some((s) => s !== slot && s.car === car)) return;
+    if (slot.voice) this._releaseSlot(slot, t);
+    slot.car = car;
+    const voice = new EngineVoice(this.ac, car.def, {
+      spatial: true,
+      dest: this.spatialBus,
+      reverbSend: this.reverbSend,
+      harmonics: Math.min(112, this._tier.harmonics),
+      startTime: t,
+    });
+    if (voice.panner && !this._tier.hrtf) voice.panner.panningModel = 'equalpower';
+    slot.voice = voice;
   }
 
   onQuality(tier) {
     const t = TIER[tier] ?? TIER[this.ctx?.settings?.tier] ?? TIER.high;
     this._tier = t;
     if (!this.unlocked) return;
-    this._buildOpponents();
-    if (this.convolver && this.convolver.buffer && Math.abs(this.convolver.buffer.duration - t.verb) > 0.2) {
-      this._verbBuffer = null;
-      this.convolver.buffer = buildImpulseResponse(this.ac, this._verbOpts());
+    this._buildOpponents(this._t());
+    // Re-sort the pool immediately: after a shrink the surviving slots may hold cars that are no
+    // longer among the nearest N, and after a grow the new slots must fill now rather than up to
+    // one cooldown later.
+    this._rebindCooldown = 0;
+    this._syncReverb();
+  }
+
+  /**
+   * Keep the reverb tail equal to the tier's reverb time. The previous 0.2 s tolerance meant a
+   * medium↔high switch (0.8 ↔ 0.95 s) left the old tail in place, so the room never matched the
+   * setting. Any mismatch at all rebuilds now.
+   */
+  _syncReverb() {
+    const ac = this.ac;
+    if (!ac || !this.convolver) return false; // not built yet — the deferred build reads _tier
+    const frames = Math.max(16, Math.floor(ac.sampleRate * this._tier.verb));
+    if (this._verbBuffer?.length === frames) return false;
+    return this._rebuildReverb();
+  }
+
+  /**
+   * Build a complete new impulse response and splice it into the live graph. A fresh convolver
+   * node is created and reconnected between the same send and return, so the send path stays
+   * connected while the old node (and therefore the old buffer) is dereferenced outright — this
+   * avoids relying on setting `ConvolverNode.buffer` twice, which older engines reject.
+   */
+  _rebuildReverb() {
+    const ac = this.ac;
+    if (!ac) return false;
+    const o = this._verbOpts();
+    const frames = Math.max(16, Math.floor(ac.sampleRate * o.seconds));
+    const buf = ac.createBuffer(2, frames, ac.sampleRate);
+    buildImpulseResponse(ac, { ...o, into: buf, only: 0 });
+    buildImpulseResponse(ac, { ...o, into: buf, only: 1 });
+
+    const old = this.convolver;
+    const conv = ac.createConvolver();
+    conv.normalize = false;
+    conv.buffer = buf;
+    this.reverbSend.connect(conv).connect(this.verbReturn);
+    if (old) {
+      try {
+        this.reverbSend.disconnect(old);
+      } catch {
+        /* already detached */
+      }
     }
+    this.convolver = conv;
+    this._verbBuffer = buf;
+    this._verbSeconds = o.seconds;
+    return true;
   }
 
   /* -------------------------------------------------------------- listener */
@@ -631,62 +750,86 @@ export class AudioSystem {
   /**
    * Assign the pooled spatial voices to the nearest opponents. Hysteresis + a rebind cooldown stop
    * the pack from thrashing the pool when cars trade places.
+   *
+   * Invariants enforced every pass: a car occupies at most one slot, a slot holds at most one car,
+   * and a slot that loses its car stops sounding before it is made available again.
    */
   _updateOpponents(t, dt, ctx) {
     const slots = this._opponentSlots;
-    if (!slots.length) return;
+    if (!slots.length) {
+      this.stats.opponents = 0;
+      return;
+    }
     const cars = ctx?.cars?.instances;
     const player = ctx?.cars?.player ?? ctx?.player ?? null;
-    if (!cars?.length) return;
 
     this._rebindCooldown -= dt;
-    const lp = this._listenerPos;
 
     if (this._rebindCooldown <= 0) {
       this._rebindCooldown = 0.4;
-      const cand = [];
-      for (const c of cars) {
-        if (c === player || !c.state) continue;
-        const p = c.state.position;
-        const d = Math.hypot(p.x - lp.x, p.y - lp.y, p.z - lp.z);
-        if (d < 260) cand.push({ car: c, d });
+      const lp = this._listenerPos;
+      const dist = new Map();
+      if (cars?.length) {
+        for (const c of cars) {
+          if (c === player || !c.state?.position || !c.def) continue;
+          const p = c.state.position;
+          dist.set(c, Math.hypot(p.x - lp.x, p.y - lp.y, p.z - lp.z));
+        }
       }
-      cand.sort((a, b) => a.d - b.d);
-      const want = cand.slice(0, slots.length).map((x) => x.car);
-      // free slots whose car dropped out
+      // Hysteresis: a car already holding a slot keeps it out to a wider radius than a newcomer
+      // needs to win one. Without that, a car loitering near the range edge would be released
+      // and rebuilt every cooldown — audible churn and a fresh voice object each swap.
+      const KEEP_R = 340;
+      const TAKE_R = 260;
+      const desired = [];
       for (const slot of slots) {
-        if (slot.car && !want.includes(slot.car)) slot.car = null;
+        const car = slot.car;
+        if (!car) continue;
+        const d = dist.get(car);
+        if (d !== undefined && d <= KEEP_R) desired.push(car);
       }
-      for (const car of want) {
+      const near = [...dist.entries()]
+        .filter(([c, d]) => d <= TAKE_R && !desired.includes(c))
+        .sort((a, b) => a[1] - b[1]);
+      for (const [car] of near) {
+        if (desired.length >= slots.length) break;
+        desired.push(car);
+      }
+
+      // Free slots whose car is no longer wanted — and stop them as they go.
+      for (const slot of slots) {
+        if (slot.car && !desired.includes(slot.car)) this._releaseSlot(slot, t);
+      }
+      // Bind the newcomers to free slots with fresh voices. A freshly created slot has no voice,
+      // so there is no way to inherit the previous occupant's car or timbre.
+      for (const car of desired) {
         if (slots.some((sl) => sl.car === car)) continue;
         const free = slots.find((sl) => !sl.car);
         if (!free) break;
-        free.car = car;
-        if (!free.voice || free.voice.def !== car.def) {
-          free.voice?.dispose();
-          free.voice = new EngineVoice(this.ac, car.def, {
-            spatial: true,
-            dest: this.spatialBus,
-            reverbSend: this.reverbSend,
-            harmonics: Math.min(112, this._tier.harmonics),
-            startTime: t,
-          });
-          if (free.voice.panner && !this._tier.hrtf) free.voice.panner.panningModel = 'equalpower';
-        }
+        this._bindSlot(free, car, t);
       }
     }
 
     let live = 0;
     for (const slot of slots) {
-      if (!slot.voice) continue;
-      if (!slot.car?.state) {
-        slot.voice.silence(t);
+      const voice = slot.voice;
+      if (!voice) continue;
+      const car = slot.car;
+      if (!car) {
+        // A voice is never left unowned.
+        this._releaseSlot(slot, t);
+        continue;
+      }
+      const st = car.state;
+      if (!st) {
+        // The car has no state this frame (mid-respawn, or the instance was replaced). Keep the
+        // binding — it will recover — but do not let the voice keep sounding from a stale pose.
+        voice.silence(t);
         continue;
       }
       live++;
-      const st = slot.car.state;
-      const cents = slot.voice.place(st.position, st.velocity, lp, this._listenerVel, t);
-      slot.voice.update(st, t, { dt, gain: 0.85, doppler: cents });
+      const cents = voice.place(st.position, st.velocity, this._listenerPos, this._listenerVel, t);
+      voice.update(st, t, { dt, gain: 0.85, doppler: cents });
     }
     this.stats.opponents = live;
   }
@@ -705,7 +848,7 @@ export class AudioSystem {
     this.ambience?.dispose();
     this.sfx?.dispose();
     this.music?.dispose();
-    for (const s of this._opponentSlots) s.voice?.dispose();
+    for (const s of this._opponentSlots) this._releaseSlot(s, this._t());
     this._opponentSlots.length = 0;
     this.ac?.close?.();
     this.unlocked = false;
