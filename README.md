@@ -160,11 +160,17 @@ where it really is for the date, time and place. One single-scattering
 atmosphere drives the sky dome, the haze over the terrain and the light on
 the clouds. Two raymarched cloud layers and a cirrus sheet; their coverage
 map also casts the cloud shadows on the ground. Rain and snow fall outside
-the aircraft, never inside the cabin. Rain lands on the windscreen and
-windows (`js/glass-rain.js`): it sits in beads while the aircraft is slow,
-runs up the windscreen and back along the side windows once the airflow can
-push it, and dries off after you leave the rain. Night, with stars, town
-lights and lit instruments.
+the aircraft, never inside the cabin. Water on the windscreen and windows is
+a persistent lifecycle (`js/glass-state.js`, drawn by `js/glass-rain.js`):
+rain accumulates into beads that sit while slow and run up the windscreen and
+back along the side windows once the airflow can push them; out of the rain
+the airflow dries the glass in airspeed-dependent time. When the systems
+module reports airframe ice (`systems.ice`), the water freezes into a static
+rime layer and the streams lock; warm outside air thaws it. Pause holds the
+whole state exactly, and Restart / a new airport clears it. Run the headless
+lifecycle sample with `node test/glass-rain.mjs`, or `npm run sample:glass`
+for the real headless-Chrome pass with screenshots in `shots/glass-sample/`.
+Night, with stars, town lights and lit instruments.
 
 **Cockpit** (`js/cockpit.js`). The inside of the same aircraft model.
 Airspeed, attitude, altimeter (three needles, Kollsman window), turn

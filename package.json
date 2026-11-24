@@ -7,7 +7,9 @@
   "license": "MIT",
   "scripts": {
     "start": "python3 -m http.server 8906",
-    "test": "node test/validate.mjs all && node test/systems.mjs && node test/nav.mjs",
+    "start:node": "node tools/serve.mjs 8906",
+    "test": "node test/validate.mjs all && node test/systems.mjs && node test/nav.mjs && node test/glass-rain.mjs",
+    "sample:glass": "node tools/glass-sample.mjs",
     "validation": "node tools/validation-page.mjs"
   }
 }

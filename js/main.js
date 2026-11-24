@@ -74,6 +74,7 @@ const cam = { e: 0, n: 0, u: 0 };
 const H = 1 / 240;
 let frames = 0, slowFrames = 0;
 let acc = 0, last = performance.now(), hudT = 0, slowT = 0, frameAvg = 16, pixelRatio = Math.min(window.devicePixelRatio || 1, 1.5);
+let animT = 0;        // visual clock: wall dt while running, held still while paused
 
 // ------------------------------------------------------------------ UI
 let toastT = 0;
@@ -295,6 +296,7 @@ function place() {
   }
   if (!def.engine) { fm.ctl.throttle = mode === 'final' ? 0.35 : 0; fm.ctl.spoiler = fm.ctl.throttle; }   // a glider's throttle keys are its airbrake lever
   systems.reset();
+  aircraft?.rainGlass?.reset();                 // restart / new airport: clean, dry glass
   fm.kollsman = S.weather.qnh * 100;
   S.settled = false; S.placedAt = performance.now(); S.flyby = null; S.chaseHdg = dep.heading;
   S.lastTouch = fm.touchdowns;
@@ -396,7 +398,7 @@ function updateCamera(dt) {
     // the head rides the airframe, with a little give under g and a buzz from the engine
     const gy = THREE.MathUtils.clamp(-(o.gLoad - 1) * 0.014, -0.03, 0.03);
     headLag.y += (gy - headLag.y) * Math.min(1, dt * 6);
-    const buzz = o.rpm > 300 ? 0.0006 * (o.rpm / 2400) : 0;
+    const buzz = dt > 0 && o.rpm > 300 ? 0.0006 * (o.rpm / 2400) : 0;   // no random shake on a frozen/paused frame
     tmp.copy(aircraft.eye).add(headLag).add(new THREE.Vector3((Math.random() - 0.5) * buzz, (Math.random() - 0.5) * buzz, 0));
     tmp.x += Math.sin(input.look.yaw) * -0.07; tmp.z += (1 - Math.cos(input.look.yaw)) * 0.05;
     nearCam.position.copy(tmp).applyQuaternion(acQuat);
@@ -502,6 +504,10 @@ function frame(now) {
   if (!S.terrain || !S.weather) { renderer.setRenderTarget(null); renderer.clear(); return; }
   const o = fm.out, c = fm.ctl;
   const flying = S.mode === 'fly' && !S.paused;
+  // Pause freezes every visual clock, not just the flight model, so stepping
+  // the renderer by hand through several "paused" frames yields the same frame.
+  const motionDt = S.paused ? 0 : dt;
+  if (!S.paused) animT += dt;
 
   // the gear settles onto the real ground once it has streamed in
   if (!S.settled && (S.terrain.levelAt(fm.pos[1], fm.pos[0]) >= 14 || (air.hold === null && now - S.placedAt > 1500))) {
@@ -552,9 +558,9 @@ function frame(now) {
   }
 
   aircraftAttitude();
-  updateCamera(dt);
+  updateCamera(motionDt);
   S.terrain.update(cam.e, cam.n, cam.u);
-  S.scenery.update(cam, S.paused ? 0 : dt);
+  S.scenery.update(cam, motionDt);
 
   // sun, sky, haze
   const date = new Date(S.date.getTime() + S.elapsed * 1000);
@@ -572,32 +578,36 @@ function frame(now) {
   const lum = (c) => 0.3 * c.r + 0.55 * c.g + 0.15 * c.b;
   const illum = lum(atm.sunLight) * Math.max(atm.lightDir.y, 0) * shade + lum(atm.ambient);
   const targetExp = THREE.MathUtils.clamp(0.95 * Math.pow(1.05 / Math.max(illum, 1e-4), 0.72), 0.7, 13);
-  S.exposure = S.exposure ? S.exposure + (targetExp - S.exposure) * Math.min(1, dt * 1.5) : targetExp;
+  S.exposure = S.exposure ? S.exposure + (targetExp - S.exposure) * Math.min(1, motionDt * 1.5) : targetExp;
   const exposure = S.exposure;
   cabin.color.copy(atm.ambient).lerp(atm.sunLight, 0.35); cabin.intensity = 1.6 + 2.2 * illum;
 
   const wc = air.meanWind((low.base + low.top) / 2);
-  clouds.update(S.paused ? 0 : dt, wc.e, wc.n, worldCam, cam.e, cam.n);
+  clouds.update(motionDt, wc.e, wc.n, worldCam, cam.e, cam.n);
 
   // rain or snow past the windows
   const w = air.out;
   tmp.set(w.e - fm.vel[1], -(S.weather.snow ? 1.4 : 7.5) + fm.vel[2], -(w.n - fm.vel[0]));
   const wet = cam.u < low.top ? Math.min(1, S.weather.precip / 5) : 0;
-  precip.update(S.paused ? 0 : dt, tmp, wet, S.weather.snow, atm.ambient, S.view === 'cockpit' ? 1.6 : 0);
-  // and the water it leaves on the glass
+  precip.update(motionDt, tmp, wet, S.weather.snow, atm.ambient, S.view === 'cockpit' ? 1.6 : 0);
+  // and the water/ice it leaves on the glass. Ice severity is the systems
+  // module's airframe-ice output (systems.ice), never a second judgement here.
   if (aircraft.rainGlass) {
     glassSky.copy(atm.ambient).multiplyScalar(1.3);
     glassGlint.copy(atm.sunLight).multiplyScalar(0.8 * shade).add(bounce.copy(atm.ambient).multiplyScalar(2));
-    aircraft.rainGlass.update(S.paused ? 0 : dt, S.weather.snow ? 0 : wet, o.ias, glassSky, glassGlint);
+    aircraft.rainGlass.update(motionDt, {
+      rain: S.weather.snow ? 0 : wet, ias: o.ias, ice: systems.ice, oat: o.oat,
+      sky: glassSky, glint: glassGlint,
+    });
   }
 
-  // aircraft, panel, lights
-  aircraft.update(o, c, flying ? dt : 0, now / 1000, atm.night, illum, fm.gearPos);
+  // aircraft, panel, lights. The blinking lights run on animT, which holds still while paused.
+  aircraft.update(o, c, flying ? dt : 0, animT, atm.night, illum, fm.gearPos);
   cockpit.group.visible = S.view === 'cockpit' || S.view === 'orbit' || !!S.def && S.def.id === 'c172s';
   aircraft.glass.material.opacity = S.view === 'cockpit' ? 0.07 : 0.3;
   const dep = S.dep;
   const de = dep.runway.e0 * 0.5 + dep.runway.e1 * 0.5 - fm.pos[1], dn = dep.runway.n0 * 0.5 + dep.runway.n1 * 0.5 - fm.pos[0];
-  cockpit.update(dt, fm, {
+  cockpit.update(motionDt, fm, {
     heading: o.heading, e: fm.pos[1], n: fm.pos[0], runways: S.runways, range: Math.hypot(de, dn) * 1.15,
     ident: S.airport.id, brg: (Math.atan2(de, dn) / D2R + 360) % 360, dist: Math.hypot(de, dn) / 1852,
     gs: o.gs / KT, trk: o.gs > 2 ? o.track / D2R : o.heading / D2R, xpdr: '1200  ALT', oat: o.oat,
@@ -635,9 +645,9 @@ function frame(now) {
     });
   }
 
-  S.fade += ((S.settled || now - S.placedAt > 9000 ? 1 : 0.0) - S.fade) * Math.min(1, dt * 2.5);
+  S.fade += ((S.settled || now - S.placedAt > 9000 ? 1 : 0.0) - S.fade) * Math.min(1, motionDt * 2.5);
   pipeline.render(world, worldCam, near, nearCam, exposure, S.fade, fm.crashed ? 0.7 : 0);
-  if (S.mode === 'fly') updateHud(dt);
+  if (S.mode === 'fly') updateHud(motionDt);
 
   // loading bar and a gentle quality governor
   const pend = S.terrain.pending;

@@ -1,20 +1,20 @@
-// Water on the glass. Rain does not fall inside the cabin: it lands on the
-// windscreen and windows, sits there in beads while the aircraft is slow, and
+// Water and ice on the glass. Rain does not fall inside the cabin: it lands on
+// the windscreen and windows, sits in beads while the aircraft is slow, and
 // once the air over the glass is fast enough to push it, runs up the
 // windscreen and back along the side windows in streams. Out of the rain the
-// glass dries over half a minute or so.
+// glass dries in the airflow. When the airframe ices (systems.ice), the water
+// already on the glass freezes into a static rime layer and stops running;
+// warm air thaws it again.
 //
-// The drops are drawn on the canopy's own triangles. Each pane is read flat in
-// the plane it mostly faces (windscreen: across and up; side windows: along and
-// up; a bubble canopy's roof: across and along), and the water moves in that
-// plane: gravity pulls it down, the airflow pushes it the way the air goes
-// over that pane. Three layers of streams move at different speeds so they do
-// not slide as one sheet.
+// All of that lifecycle lives in ./glass-state.js, which is plain deterministic
+// state testable under node. This file only draws that state on the canopy's
+// own triangles. Each pane is read flat in the plane it mostly faces
+// (windscreen: across and up; side windows: along and up; a bubble canopy's
+// roof: across and along), and the water moves in that plane: gravity pulls it
+// down, the airflow pushes it the way the air goes over that pane. Three
+// layers of streams move at different speeds so they do not slide as one sheet.
 import * as THREE from '../vendor/three.module.js';
-
-const CELLS = [0.017, 0.022, 0.017, 0.013];       // m: beads, then three stream layers
-const PACE = [0, 0.55, 1.0, 1.6];                  // stream speeds relative to the pane's flow
-const PERIOD = 512;                                // cells before the pattern repeats
+import { GlassState, CELLS, PACE, PERIOD } from './glass-state.js';
 
 const VERT = /* glsl */`
 varying vec3 vPos;
@@ -27,6 +27,7 @@ void main() {
 
 const FRAG = /* glsl */`
 uniform float uWet;
+uniform float uFrost;
 uniform vec4 uDens;            // beads, stream layers 1..3
 uniform vec2 uOff[9];          // per pane kind (windscreen, side, roof) and layer: how far the water has moved
 uniform vec2 uDir[3];          // per pane kind: which way the water runs
@@ -66,8 +67,28 @@ vec4 drops(vec2 p, float cell, float dens, vec2 dir, float tail, float aa, float
   }
   return o;
 }
+// ---- frost: static patchy rime with a fine crystal grain
+float frHash(vec2 p) {
+  vec3 q = fract(vec3(p.xyx) * 0.1031);
+  q += dot(q, q.yzx + 33.33);
+  return fract((q.x + q.y) * q.z);
+}
+float frNoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  float a = frHash(i);
+  float b = frHash(i + vec2(1.0, 0.0));
+  float c = frHash(i + vec2(0.0, 1.0));
+  float d = frHash(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+float frFbm(vec2 p) {
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 4; i++) { v += a * frNoise(p); p = p * 2.07 + 11.3; a *= 0.5; }
+  return v;
+}
 void main() {
-  if (uWet < 0.002) discard;
+  if (uWet < 0.002 && uFrost < 0.002) discard;
   vec3 an = abs(normalize(vNrm));
   int k; vec2 p;
   if (an.z > max(an.x, an.y)) { k = 0; p = vPos.xy; }          // windscreen and rear window
@@ -87,13 +108,39 @@ void main() {
   float a = 0.30 * d.x; col = mix(col, lens, a / max(A + a * (1.0 - A), 1e-4)); A += a * (1.0 - A);
   a = 0.14 * d.y; col = mix(col, vec3(0.0), a / max(A + a * (1.0 - A), 1e-4)); A += a * (1.0 - A);
   a = 0.90 * d.z; col = mix(col, uGlint, a / max(A + a * (1.0 - A), 1e-4)); A += a * (1.0 - A);
+  // frost forms where the water was: the same pane space, but its offsets have
+  // stopped, so the rime is pinned to the glass. Fine crystalline grain and
+  // feathery ridges at moderate alpha: it roughens and whitens the view without
+  // ever becoming an opaque sheet.
+  if (uFrost > 0.003) {
+    float coarse = frFbm(p / 0.05);
+    float mid = frFbm(p / 0.012 + 5.0);
+    float grain = frNoise(p / 0.003);
+    float ridges = 1.0 - abs(2.0 * frFbm(p / 0.018 - 3.0) - 1.0);
+    float patchAmt = smoothstep(0.32, 0.70, coarse);
+    // A thin widespread rime film, feathery ridge build-up and sparse crystals.
+    float aFilm = uFrost * (0.14 + 0.22 * patchAmt) * (0.8 + 0.5 * mid);
+    float aFeather = uFrost * ridges * ridges * 0.2;
+    float spark = smoothstep(0.86, 0.995, grain);
+    float aSpark = spark * uFrost * 0.5;
+    float fa = clamp(aFilm + aFeather + aSpark, 0.0, 0.62);
+    // Rime reflects the ambient sky like the drops do, so it stays correctly
+    // exposed instead of being an unlit constant white; crystal tips catch the
+    // same key light as the drop highlights. ACES rolls the bright cores off.
+    vec3 frostCol = uSky * (2.6 + 2.6 * grain) + uGlint * aSpark * 1.6;
+    col = mix(col, frostCol, fa / max(A + fa * (1.0 - A), 1e-4));
+    A += fa * (1.0 - A);
+  }
   gl_FragColor = vec4(col, A);
 }`;
 
 export class GlassRain {
   constructor(geometry) {
+    // The lifecycle state is the single driver for accumulation, flow, freeze and drying.
+    this.state = new GlassState();
     this.uniforms = {
       uWet: { value: 0 },
+      uFrost: { value: 0 },
       uDens: { value: new THREE.Vector4() },
       uOff: { value: Array.from({ length: 9 }, () => new THREE.Vector2()) },
       uDir: { value: [new THREE.Vector2(0, 1), new THREE.Vector2(1, 0), new THREE.Vector2(0, 1)] },
@@ -108,35 +155,52 @@ export class GlassRain {
     this.mesh = new THREE.Mesh(geometry, mat);
     this.mesh.renderOrder = 60;          // after the rain outside, which shows through it
     this.mesh.visible = false;
-    this.wet = 0;
+    this.sync();
   }
-  // rain: 0..1 how hard it is raining on the aircraft; ias in m/s; sky, glint: colours
-  update(dt, rain, ias, sky, glint) {
-    // wetting takes seconds, drying takes the better part of a minute (faster in a fast airflow)
-    const rate = rain > this.wet ? 0.35 : 0.025 * (1 + ias / 30);
-    this.wet += (rain - this.wet) * Math.min(1, dt * rate);
-    const U = this.uniforms, wet = this.wet;
-    U.uWet.value = wet;
-    this.mesh.visible = wet > 0.002;
-    if (!this.mesh.visible) return;
-    const push = THREE.MathUtils.smoothstep(ias, 8, 22);            // air fast enough to move a drop
-    U.uDens.value.set(
-      wet * (0.50 - 0.42 * push),                                   // beads stick when slow, mostly blow off when fast
-      wet * (0.10 - 0.03 * push), wet * (0.08), wet * (0.05 + 0.04 * push));   // a few runs at rest, quick thin rivulets at speed
-    // how the water moves on each kind of pane, in its own plane (metres per second)
-    const flow = 0.035 * ias * push, fall = 0.05 * (1 - 0.8 * push);
-    const kinds = [[0, flow - fall], [flow, 0.12 * flow - fall], [0, flow]];
-    kinds.forEach(([vx, vy], k) => {
-      const v = Math.hypot(vx, vy);
-      if (v > 1e-4) U.uDir.value[k].set(vx / v, vy / v);
-      for (let l = 1; l <= 3; l++) {
-        const o = U.uOff.value[k * 3 + l - 1], m = PACE[l], span = CELLS[l] * PERIOD;
-        o.x = (o.x + vx * m * dt) % span; o.y = (o.y + vy * m * dt) % span;
-        U.uTail.value[k].setComponent(l - 1, Math.min(1.0, (v * m * 0.06) / CELLS[l] + 0.15 * push));
-      }
-    });
-    U.uSky.value.copy(sky);
-    U.uGlint.value.copy(glint);
+
+  // Backwards-compatible read-only view of the liquid wetness.
+  get wet() { return this.state.water; }
+
+  // Clear every persistent trace: bound to Restart / new airport / new aircraft.
+  reset() {
+    this.state.reset();
+    this.sync();
   }
+
+  // Copy the deterministic state into three uniforms. Safe to call under node
+  // with no colours and no GL context (uniforms are plain objects).
+  sync(sky, glint) {
+    const s = this.state, U = this.uniforms;
+    U.uWet.value = s.water;
+    U.uFrost.value = s.frost;
+    U.uDens.value.set(s.dens[0], s.dens[1], s.dens[2], s.dens[3]);
+    for (let i = 0; i < 9; i++) U.uOff.value[i].set(s.offX[i], s.offY[i]);
+    for (let k = 0; k < 3; k++) {
+      U.uDir.value[k].set(s.dirX[k], s.dirY[k]);
+      U.uTail.value[k].set(s.tail[k * 3], s.tail[k * 3 + 1], s.tail[k * 3 + 2]);
+    }
+    if (sky && typeof sky.copy === 'function') U.uSky.value.copy(sky);
+    if (glint && typeof glint.copy === 'function') U.uGlint.value.copy(glint);
+    this.mesh.visible = s.visible;
+  }
+
+  // Accepted forms:
+  //   update(dt, { rain, ias, ice, oat, sky, glint })
+  //   update(dt, rain, ias, ice, oat, sky, glint)
+  //   update(dt, rain, ias, sky, glint)                       (legacy signature)
+  // dt === 0 is the pause tick: state is untouched.
+  update(dt, rain, ias, ice, oat, sky, glint) {
+    let input, sk = null, gl = null;
+    if (rain !== null && typeof rain === 'object' && rain !== undefined) {
+      input = rain; sk = input.sky ?? null; gl = input.glint ?? null;
+    } else if (ice && typeof ice === 'object') {
+      input = { rain, ias }; sk = ice; gl = oat;               // legacy (sky, glint)
+    } else {
+      input = { rain, ias, ice, oat }; sk = sky ?? null; gl = glint ?? null;
+    }
+    this.state.update(dt, input);
+    this.sync(sk, gl);
+  }
+
   dispose() { this.mesh.material.dispose(); }
 }
