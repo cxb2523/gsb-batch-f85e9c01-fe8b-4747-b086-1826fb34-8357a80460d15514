@@ -1,5 +1,5 @@
 import { angleDifference, sampleTrack, TRACK_LENGTH, TRACK_WIDTH, wrapDistance } from './track';
-import { EMPTY_INPUT, type Difficulty, type InputState, type ItemType, type Racer, type RaceState } from './types';
+import { EMPTY_INPUT, type Difficulty, type InputState, type ItemType, type Projectile, type Racer, type RaceState } from './types';
 import { DEFAULT_DIFFICULTY, DIFFICULTIES, isDifficulty } from './difficulty';
 import { playerSteeringScale, smoothPlayerSteer } from './driving';
 import { createBoxVolume, intersectVolumes, racerVolume, StaticCollisionIndex,
@@ -12,6 +12,11 @@ const FINISH_DISTANCE = TRACK_LENGTH * 3;
 const PLAYER_BASE_SPEED = 52;
 const BOOST_SPEED_GAIN = 20;
 const MAX_SPEED = 84;
+/** Brief window granted by a spent shield so a follow-up weapon in the same step cannot land. */
+const SHIELD_BLOCK_PROTECTION = 0.9;
+/** Hit protection for AI racers; player duration comes from DIFFICULTIES.playerHitProtection. */
+const AI_HIT_PROTECTION = 1.65;
+type WeaponHitOutcome = 'protected' | 'shielded' | 'damage';
 const clamp = (value: number, low: number, high: number) => Math.max(low, Math.min(high, value));
 const approach = (current: number, target: number, rate: number, dt: number) =>
   current + (target - current) * (1 - Math.exp(-rate * dt));
@@ -442,26 +447,46 @@ export class RaceSimulation {
           if (!intersectVolumes(projectileVolume, racerVolume(racer))) continue;
         } else if (Math.abs(trackGap(projectile.distance, racer.distance)) > 3.5 ||
           Math.abs(projectile.lateral - racer.lateral) > (projectile.powered ? 3.6 : 2.7)) continue;
+        // Geometry confirmed the contact. Neutralise the weapon, then apply exactly
+        // one mutually exclusive outcome (protected / shielded / damage) and stop.
         projectile.lifetime = 0;
-        if (racer.invulnerable > 0) break;
-        if (racer.shield > 0) {
-          racer.shield = 0;
-          racer.invulnerable = 0.9;
-          this.state.events.push({ type: 'shield', racer: racer.id, item: 'shield', text: 'BLOCKED!' });
-        } else {
-          racer.speed *= projectile.powered ? 0.5 : 0.6;
-          racer.hitTime = projectile.powered ? 0.95 : 0.65;
-          racer.invulnerable = racer.isPlayer ? DIFFICULTIES[this.selectedDifficulty].playerHitProtection : 1.65;
-          racer.heading += (this.random() > 0.5 ? 1 : -1) * 0.14;
-          racer.driftTime = 0;
-          if (projectile.owner === 0) this.state.hits++;
-          this.state.events.push({ type: 'hit', racer: racer.id, item: projectile.type,
-            text: projectile.owner === 0 ? 'DIRECT HIT!' : 'HIT!' });
-        }
+        this.resolveWeaponHit(projectile, racer);
         break;
       }
     }
     this.state.projectiles = this.state.projectiles.filter(projectile => projectile.lifetime > 0).slice(-80);
+  }
+
+  /**
+   * Resolve one confirmed weapon/racer contact. The three outcomes never stack and
+   * player and AI racers go through this identical chain:
+   *  1. an active invulnerability window ignores the contact — it must not spend a
+   *     shield, fire a hit event, slow the car, or count a hit;
+   *  2. otherwise an active shield absorbs the single hit, is consumed, and opens
+   *     a short protection window so a second weapon in the same step is ignored;
+   *  3. otherwise the weapon deals damage, slows the car, and opens hit protection.
+   * The caller is responsible for destroying the projectile and only calls this
+   * after a contact is confirmed, so each contact resolves exactly once.
+   */
+  private resolveWeaponHit(projectile: Projectile, racer: Racer): WeaponHitOutcome {
+    if (racer.invulnerable > 0) return 'protected';
+    if (racer.shield > 0) {
+      racer.shield = 0;
+      racer.invulnerable = SHIELD_BLOCK_PROTECTION;
+      this.state.events.push({ type: 'shield', racer: racer.id, item: 'shield', text: 'BLOCKED!' });
+      return 'shielded';
+    }
+    racer.speed *= projectile.powered ? 0.5 : 0.6;
+    racer.hitTime = projectile.powered ? 0.95 : 0.65;
+    racer.invulnerable = racer.isPlayer
+      ? DIFFICULTIES[this.selectedDifficulty].playerHitProtection
+      : AI_HIT_PROTECTION;
+    racer.heading += (this.random() > 0.5 ? 1 : -1) * 0.14;
+    racer.driftTime = 0;
+    if (projectile.owner === 0) this.state.hits++;
+    this.state.events.push({ type: 'hit', racer: racer.id, item: projectile.type,
+      text: projectile.owner === 0 ? 'DIRECT HIT!' : 'HIT!' });
+    return 'damage';
   }
 
   /** Reproject small world-space corrections locally, never onto another part/lap of the circuit. */

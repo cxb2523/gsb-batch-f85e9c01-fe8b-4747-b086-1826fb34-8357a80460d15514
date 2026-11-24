@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { RaceSimulation } from '../src/simulation';
 import { sampleTrack, TRACK_LENGTH } from '../src/track';
-import { EMPTY_INPUT, type InputState } from '../src/types';
+import { createBoxVolume, type StaticCollider } from '../src/collision';
+import { DIFFICULTIES } from '../src/difficulty';
+import { EMPTY_INPUT, type InputState, type Projectile } from '../src/types';
 
 const input = (changes: Partial<InputState> = {}): InputState => ({ ...EMPTY_INPUT, ...changes });
 const running = (seed = 42) => { const sim = new RaceSimulation(seed); sim.start(); sim.update(3, input()); return sim; };
@@ -299,4 +301,192 @@ test('invalid time does not poison state and separate simulations reproduce the 
   first.update(Number.NaN, input({ throttle: true }));
   first.update(Number.POSITIVE_INFINITY, input({ throttle: true }));
   assert.equal(first.state.racers[0].distance, distance);
+});
+
+// --- Mutual exclusion of shield absorption, invulnerability windows and damage ---
+
+const mineAt = (owner: number, at: { distance: number; lateral: number }, id: number,
+  powered = false): Projectile => ({
+  id, type: 'mine', owner, distance: at.distance, lateral: at.lateral,
+  lifetime: 10, powered, target: null,
+});
+
+const weaponWall = (id: string, distance: number, lateral = 0): StaticCollider => {
+  const point = sampleTrack(distance);
+  return { id, kind: 'barrier', ...createBoxVolume(
+    point.x + point.nx * lateral, point.y + 1.5, point.z + point.nz * lateral,
+    20, 1.5, 0.08, point.heading) };
+};
+
+const finishTraffic = (sim: RaceSimulation) => {
+  sim.state.racers.slice(1).forEach(racer => { racer.finished = true; });
+};
+
+test('a shield absorbs one hit and its grace window ignores the second same-step weapon', () => {
+  const sim = running(); clearTraffic(sim); finishTraffic(sim);
+  const car = sim.state.racers[0];
+  Object.assign(car, { distance: 200, lateral: 0, heading: 0, speed: 40,
+    shield: 5, invulnerable: 0, hitTime: 0 });
+  const speedBefore = car.speed;
+  // Two weapons at the exact same spot, both resolved inside the single 1/90 step.
+  sim.state.projectiles.push(mineAt(1, car, 101), mineAt(2, car, 102));
+  sim.update(1 / 90, input());
+
+  assert.equal(car.shield, 0, 'the shield is consumed by the first contact only');
+  assert.equal(car.invulnerable, 0.9, 'the spent shield opens the brief block window');
+  assert.equal(car.hitTime, 0, 'a blocked contact never starts hit recovery');
+  assert.equal(sim.state.hits, 0);
+  assert.ok(car.speed > speedBefore - 1, 'the block applies no hit slowdown');
+  assert.equal(sim.state.projectiles.length, 0, 'both same-step weapons contacted and were resolved');
+  const blocks = sim.state.events.filter(event => event.type === 'shield' && event.text === 'BLOCKED!');
+  assert.equal(blocks.length, 1, 'exactly one shield-absorb event');
+  assert.ok(!sim.state.events.some(event => event.type === 'hit'), 'absorption and damage never stack');
+});
+
+test('a mine inside the protection window does not spend the shield, slow the car or fire a hit', () => {
+  const setup = () => {
+    const sim = running(); clearTraffic(sim); finishTraffic(sim);
+    const car = sim.state.racers[0];
+    Object.assign(car, { distance: 205, lateral: 0, heading: 0, speed: 40,
+      shield: 4, invulnerable: 1.2, hitTime: 0 });
+    return sim;
+  };
+  const sim = setup();
+  const control = setup();
+  const car = sim.state.racers[0];
+  sim.state.projectiles.push(mineAt(1, car, 201));
+
+  sim.update(1 / 90, input());
+  control.update(1 / 90, input());
+
+  assert.ok(Math.abs(car.shield - (4 - 1 / 90)) < 1e-9, 'shield only undergoes normal timer decay');
+  assert.ok(car.shield > 3.9, 'the protected contact must not consume the active shield');
+  assert.ok(Math.abs(car.invulnerable - (1.2 - 1 / 90)) < 1e-9);
+  assert.equal(car.hitTime, 0);
+  assert.equal(sim.state.hits, 0);
+  assert.equal(sim.state.projectiles.length, 0, 'the mine still makes contact and is removed');
+  assert.ok(!sim.state.events.some(event => event.type === 'hit'), 'protection raises no hit event');
+  assert.ok(!sim.state.events.some(event => event.type === 'shield' && event.text === 'BLOCKED!'),
+    'protection must not look like a shield absorption');
+  assert.ok(Math.abs(car.speed - control.state.racers[0].speed) < 1e-9,
+    'the protected contact adds no speed loss beyond the identical ambient step');
+});
+
+test('after the shield fully expires a weapon deals damage and grants difficulty protection', () => {
+  for (const difficulty of ['easy', 'hard', 'hell'] as const) {
+    const sim = new RaceSimulation(7, difficulty);
+    sim.start(); sim.update(3, input());
+    sim.state.pickups.forEach(pickup => { pickup.cooldown = 1000; });
+    finishTraffic(sim);
+    const car = sim.state.racers[0];
+    Object.assign(car, { distance: 180, lateral: 0, heading: 0, speed: 40,
+      shield: 1 / 90, invulnerable: 0, hitTime: 0 });
+    sim.update(1 / 90, input());
+    assert.equal(car.shield, 0, 'the shield timer naturally expires before the hit');
+
+    sim.state.projectiles.push(mineAt(1, car, 301));
+    sim.update(1 / 90, input());
+
+    assert.ok(car.hitTime > 0, `${difficulty}: damaging hit starts recovery`);
+    assert.equal(car.invulnerable, DIFFICULTIES[difficulty].playerHitProtection,
+      `${difficulty}: player protection duration stays sourced from DIFFICULTIES`);
+    assert.ok(sim.state.events.some(event => event.type === 'hit' && event.racer === 0));
+    assert.equal(sim.state.hits, 0, 'an AI attacker never advances the player hits statistic');
+  }
+});
+
+test('hits increments only for a damaging player-owned weapon, never for shield or protection blocks', () => {
+  const sim = running(); clearTraffic(sim);
+  const target = sim.state.racers[1];
+  Object.assign(target, { finished: false, distance: 230, lateral: 0, heading: 0, speed: 0,
+    shield: 5, invulnerable: 0, hitTime: 0 });
+
+  // Player mine vs an active shield: absorbed, no hit count.
+  sim.state.projectiles.push(mineAt(0, target, 401));
+  sim.update(1 / 90, input());
+  assert.equal(sim.state.hits, 0);
+  assert.equal(target.shield, 0);
+  assert.equal(target.invulnerable, 0.9);
+
+  // A recharged shield while the grace window is active is preserved by protection.
+  target.shield = 5;
+  sim.state.projectiles.push(mineAt(0, target, 402));
+  sim.update(1 / 90, input());
+  assert.equal(sim.state.hits, 0);
+  assert.ok(target.shield > 4.9, 'the grace window ignores the mine before the shield is touched');
+
+  // Once both shield and protection are gone the next player mine counts as a real hit.
+  target.shield = 0;
+  target.invulnerable = 0;
+  sim.state.projectiles.push(mineAt(0, target, 403));
+  sim.update(1 / 90, input());
+  assert.equal(sim.state.hits, 1);
+  assert.ok(target.hitTime > 0);
+  assert.ok(sim.state.events.some(event => event.type === 'hit' && event.racer === 1
+    && event.text === 'DIRECT HIT!'));
+});
+
+test('a rocket intercepted by a static obstacle produces only the structure collision event', () => {
+  const sim = running(); clearTraffic(sim); finishTraffic(sim);
+  const player = sim.state.racers[0];
+  Object.assign(player, { distance: 46, lateral: 0, heading: 0, speed: 0 });
+  sim.setStaticColliders([weaponWall('weapon-wall', 40)]);
+  sim.state.projectiles.push({ id: 501, type: 'rocket', owner: 1, distance: 38,
+    lateral: 0, lifetime: 10, powered: false, target: null });
+
+  sim.update(1 / 90, input());
+
+  assert.equal(sim.state.projectiles.length, 0);
+  const structures = sim.state.events.filter(event =>
+    event.type === 'collision' && event.collisionKind === 'structure');
+  assert.equal(structures.length, 1);
+  assert.equal(structures[0].text, 'PROJECTILE_BLOCKED');
+  assert.ok(!sim.state.events.some(event => event.type === 'hit' || event.type === 'shield'),
+    'the blocked rocket never enters the vehicle-hit branch');
+  assert.equal(player.hitTime, 0);
+  assert.equal(player.invulnerable, 0);
+  assert.equal(player.speed, 0, 'traffic behind the obstacle is untouched');
+  assert.equal(sim.state.events.length, 1, 'the obstacle contact is the only event in the step');
+});
+
+test('pause followed by restart, and return to menu, leave no hit, shield or protection residue', () => {
+  const sim = running(); clearTraffic(sim);
+  const player = sim.state.racers[0];
+  const opponent = sim.state.racers[1];
+  Object.assign(player, { distance: 150, lateral: 0, shield: 0, invulnerable: 0, hitTime: 0 });
+  Object.assign(opponent, { distance: 172, lateral: 0, shield: 0, invulnerable: 0, hitTime: 0 });
+  // One AI-owned mine damages the player; one player-owned mine damages the opponent.
+  sim.state.projectiles.push(mineAt(1, player, 601), mineAt(0, opponent, 602));
+  sim.update(1 / 90, input());
+  assert.ok(player.hitTime > 0 && player.invulnerable > 0);
+  assert.ok(opponent.hitTime > 0);
+  assert.equal(sim.state.hits, 1);
+  player.shield = 2.5; // an active shield value present at pause time
+
+  sim.pause();
+  assert.equal(sim.state.phase, 'paused');
+  assert.ok(player.hitTime > 0, 'pause freezes rather than clears the live race state');
+  sim.start();
+  assert.equal(sim.state.phase, 'countdown');
+  assert.equal(sim.state.hits, 0);
+  assert.deepEqual(sim.state.projectiles, []);
+  for (const racer of sim.state.racers) {
+    assert.equal(racer.hitTime, 0, `racer ${racer.id} hitTime resets on restart`);
+    assert.equal(racer.invulnerable, 0, `racer ${racer.id} invulnerable resets on restart`);
+    assert.equal(racer.shield, 0, `racer ${racer.id} shield resets on restart`);
+  }
+
+  // Dirty the fresh run again, then abandon it through the menu.
+  sim.state.hits = 3;
+  sim.state.racers[0].hitTime = 0.7;
+  sim.state.racers[0].invulnerable = 1.1;
+  sim.state.racers[0].shield = 4;
+  sim.returnToMenu();
+  assert.equal(sim.state.phase, 'menu');
+  assert.equal(sim.state.hits, 0);
+  for (const racer of sim.state.racers) {
+    assert.equal(racer.hitTime, 0);
+    assert.equal(racer.invulnerable, 0);
+    assert.equal(racer.shield, 0);
+  }
 });
