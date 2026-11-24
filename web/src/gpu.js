@@ -28,6 +28,44 @@ const TEX_MISSING = 0xFFFFFFFF;
 const PUSH_BYTES = 128, LIGHT_BYTES = 22 * 16, VERTEX_BYTES = 32;
 const SCENE_LEVELS = 4;
 
+// The picture's shape for a frame: 512 x 448 times the render scale, and as much wider than its 4:3 middle as the race's aspect asks for
+// (native_vk.cpp's W43, H and W). The mirror and the six views round the car stay 4:3; `wide` is the frame's own (the menus stay 4:3 even
+// when the setting is wider). The same values lay out the passes and the blit, so the picture and its box never disagree about the aspect.
+export function pictureShape(fr) {
+  const scale = Math.max(1, Math.min(8, fr.scale || 2));
+  const W43 = 512 * scale, H = 448 * scale;
+  const narrow = fr.narrow > 0 && Number.isFinite(fr.narrow) ? fr.narrow : 1;
+  const W = Math.max(2, Math.round(W43 / narrow) & ~1);
+  const envSize = fr.reflections === 2 ? 128 : 64;
+  const wide = fr.wide !== 0;
+  const regionW = wide ? W : Math.min(W43, W), ox = (W - regionW) / 2, sx = regionW / 512, sy = H / 448;
+  const aspect = (4 / 3) / (wide ? narrow : 1);          // the TV box's shape: 4:3, or the race's
+  return { scale, narrow, W43, H, W, envSize, wide, regionW, ox, sx, sy, aspect };
+}
+
+// The same shape from the four numbers alone (W, H, W43, envSize), for a caller that has no frame: the aspect is the one W and W43 imply,
+// or `narrow` when it is given (a frame's own, a little more exact than the rounding of W). `wide` may be given too (the frame's own);
+// without it, a picture wider than its 4:3 middle is taken for a race's
+export function shapeOf(W, H, W43, envSize, wide = W !== W43, narrow = W43 > 0 ? W43 / Math.max(1, W) : 1) {
+  if (!(narrow > 0 && Number.isFinite(narrow))) narrow = 1;
+  const regionW = wide ? W : Math.min(W43, W), ox = (W - regionW) / 2, sx = regionW / 512, sy = H / 448;
+  return { scale: W43 / 512, narrow, W43, H, W, envSize, wide, regionW, ox, sx, sy, aspect: (4 / 3) / (wide ? narrow : 1) };
+}
+
+// The picture's box in a canvas of cw x ch (device pixels), and the part of the picture it shows: the largest TV box of the picture's shape
+// in the middle, the rest black. Everything is a function of the shape alone, so a frame's box and its source rect cannot come out of two
+// different aspects: a 4:3 setting shows a 4:3 box in the middle of the wider picture, a 16:9 one the whole picture, and the same call after
+// a rebuild gives the same numbers the new targets were made for.
+export function blitBox(shape, cw, ch) {
+  const { W, H, wide, aspect } = shape;
+  let bw = Math.max(1, cw), bh = Math.max(1, ch);
+  if (bw > bh * aspect) bw = Math.floor(bh * aspect); else bh = Math.floor(bw / aspect);
+  bw = Math.max(1, bw), bh = Math.max(1, bh);
+  const bx = Math.floor((Math.max(1, cw) - bw) / 2), by = Math.floor((Math.max(1, ch) - bh) / 2);
+  const from = wide ? 0 : (W - shape.regionW) / 2, across = shape.regionW;
+  return { bw, bh, bx, by, from, across, u0: from / W, u1: (from + across) / W, v1: (H * 444 / 448) / H };
+}
+
 function blendState(b) {
   if (b === NB_OPAQUE) return undefined;
   const byDest = b === NB_DEST || b === NB_LERP_DEST;
@@ -263,42 +301,58 @@ export class Renderer {
     return t;
   }
 
-  // the pictures that depend on the settings: made again when the picture's size or the reflections' change
-  resources(W, H, W43, envSize) {
-    const key = `${W}x${H}/${W43}/${envSize}`;
-    if (this.resKey === key) return;
-    this.resKey = key;
+  // the pictures that depend on the settings: made again when the picture's size, the 4:3 middle, the race's aspect or the reflections' change.
+  // The aspect belongs in the key on its own: two aspects can round to the same W (16:9 next to a slightly wider shape, or a frame read
+  // before the setting was), and then W and W43 alone would look unchanged while every pass, the mirror's scale and the blit's box are not.
+  // The two are compared as the shape the passes use (`shape`), never as one of its numbers alone. A shape may also come as its four
+  // numbers (W, H, W43, envSize, as the first callers passed it): the aspect it implies is then the one W and W43 give.
+  resources(shape, H, W43, envSize) {
+    if (typeof shape === 'number') shape = shapeOf(shape, H, W43, envSize);
+    const { W, H: h, W43: w43, envSize: env } = shape;
+    const narrow = Number.isFinite(shape.narrow) && shape.narrow > 0 ? shape.narrow : 1;
+    const key = `${W}x${h}/${w43}/${env}/${narrow.toFixed(6)}`;
+    if (this.resKey === key) return false;
+    // the old picture goes before the new one is made (no moment holds both): its color and depth, then the copies and the sphere map,
+    // and `res` with them, so nothing of the last shape can be bound (`resKey` follows only once the new picture is whole: a build that
+    // threw is tried again next frame, never remembered as done)
     for (const t of this.res ? [this.res.pic, this.res.rvm, ...this.res.env] : []) { t.color.destroy(); t.depth.destroy(); }
     if (this.res) for (const t of [this.res.prev, this.res.scene, this.res.sphere, this.res.spherePrev]) t.destroy();
+    this.res = null;
+    this.resKey = null;
     const d = this.device;
-    const pic = this.target(W, H);
-    const rvm = this.target(Math.max(W43 >> 1, 1), Math.max(Math.floor(H / 7), 1));
-    const env = [0, 1, 2, 3, 4, 5].map(() => this.target(envSize, envSize));
+    const pic = this.target(W, h);
+    const rvm = this.target(Math.max(w43 >> 1, 1), Math.max(Math.floor(h / 7), 1));
+    const envTex = [0, 1, 2, 3, 4, 5].map(() => this.target(env, env));
     const usage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST;
-    const prev = d.createTexture({ size: [W, H], format: 'rgba8unorm', usage });
-    const scene = d.createTexture({ size: [W, H], format: 'rgba8unorm', usage, mipLevelCount: SCENE_LEVELS });
-    const sphere = d.createTexture({ size: [envSize * 4, envSize * 4], format: 'rgba8unorm', usage });
-    const spherePrev = d.createTexture({ size: [envSize * 4, envSize * 4], format: 'rgba8unorm', usage });
-    this.res = {
-      pic, rvm, env, prev, scene, sphere, spherePrev, envSize,
+    const prev = d.createTexture({ size: [W, h], format: 'rgba8unorm', usage });
+    const scene = d.createTexture({ size: [W, h], format: 'rgba8unorm', usage, mipLevelCount: SCENE_LEVELS });
+    const sphere = d.createTexture({ size: [env * 4, env * 4], format: 'rgba8unorm', usage });
+    const spherePrev = d.createTexture({ size: [env * 4, env * 4], format: 'rgba8unorm', usage });
+    const res = {
+      pic, rvm, env: envTex, prev, scene, sphere, spherePrev, envSize: env, W, H: h, W43: w43, narrow,
       prevGroup: this.texGroup(prev.createView()),
       sphereView: sphere.createView(),
       sphereGroup: this.texGroup(sphere.createView()),
       sceneLevels: [...Array(SCENE_LEVELS).keys()].map(l => scene.createView({ baseMipLevel: l, mipLevelCount: 1 })),
-      foldGroups: env.map(t => d.createBindGroup({ layout: this.foldLayout, entries: [
+      foldGroups: envTex.map(t => d.createBindGroup({ layout: this.foldLayout, entries: [
         { binding: 0, resource: t.colorView }, { binding: 1, resource: spherePrev.createView() }, { binding: 2, resource: { buffer: this.foldUniform } }] })),
     };
-    this.res.downGroups = this.res.sceneLevels.slice(0, -1).map(v => d.createBindGroup({ layout: this.downLayout, entries: [
+    res.downGroups = res.sceneLevels.slice(0, -1).map(v => d.createBindGroup({ layout: this.downLayout, entries: [
       { binding: 0, resource: v }, { binding: 1, resource: this.samplers.linear }] }));
-    this.res.postGroup = d.createBindGroup({ layout: this.postLayout, entries: [
+    res.postGroup = d.createBindGroup({ layout: this.postLayout, entries: [
       { binding: 0, resource: pic.depth.createView({ aspect: 'depth-only' }) }, { binding: 1, resource: this.palette.createView() },
       { binding: 2, resource: scene.createView() }, { binding: 3, resource: this.samplers.mip },
       { binding: 4, resource: { buffer: this.postUniform, size: 64 } }] });
+    this.res = res;
+    // every cached group held a view of the textures just destroyed: none may be bound again
     this.blitGroups = {};
     this.blitBgGroup = null;
+    this.depthGroup = null, this.depthGroupFor = null;
     this.envReady.fill(false);
     this.sphereReady = this.rvmReady = this.prevReady = false;
-    this.log(`[gpu] picture ${W}x${H}, mirror ${rvm.w}x${rvm.h}, reflections ${envSize}`);
+    this.resKey = key;
+    this.log(`[gpu] picture ${W}x${h}, mirror ${rvm.w}x${rvm.h}, reflections ${env}${narrow !== 1 ? `, the race ${(4 / 3 / narrow).toFixed(3)}:1` : ''}`);
+    return true;
   }
 
   upload(at) {
@@ -478,14 +532,14 @@ export class Renderer {
       const t = this.textures.get(u32[at + i]);
       if (t) { t.tex.destroy(); this.textures.delete(u32[at + i]); }
     }
-    // the picture: 512 x 448 times the scale; a race wider by its aspect (native_vk.cpp's W, W43, H)
-    const scale = Math.max(1, Math.min(8, fr.scale || 2));
-    const W43 = 512 * scale, H = 448 * scale, W = Math.round(W43 / fr.narrow) & ~1;
-    const envSize = fr.reflections === 2 ? 128 : 64;
-    this.resources(W, H, W43, envSize);
+    // the picture: 512 x 448 times the scale; a race wider by its aspect (native_vk.cpp's W, W43, H). The shape is taken once here and
+    // given to both the targets and the blit: the aspect a frame is laid out with is the one its textures were made for, whatever the
+    // setting or the window did between two frames. A shape that differs from the last frame's rebuilds every target (resources) before
+    // anything of this frame is encoded, and nothing of the last frame's survives to be bound.
+    const shape = pictureShape(fr);
+    const { W, H, ox, sx, sy } = shape;
+    this.resources(shape);
     const { pic, rvm, env } = this.res;
-    const wide = fr.wide !== 0;
-    const regionW = wide ? W : W43, ox = (W - regionW) / 2, sx = regionW / 512, sy = H / 448;
 
     // the frame's vertices, indices and lights
     const vcount = fr.vertexCount, icount = fr.indexCount, lcount = fr.lightCount;
@@ -609,7 +663,7 @@ export class Renderer {
     if (wantsPrev) enc.copyTextureToTexture({ texture: pic.color }, { texture: this.res.prev }, [W, H]);
     const depthCopy = this.depthRects(enc, fr, view);
 
-    this.blit(enc, fr, W, H, W43, wide);
+    this.blit(enc, fr, shape);
     d.queue.submit([enc.finish()]);
     if (depthCopy) this.depthRead(depthCopy);
 
@@ -763,19 +817,19 @@ export class Renderer {
     }).catch(() => { this.depthBusy = false; });
   }
 
-  // into the canvas: the largest TV box (4:3, or the race's aspect) in the middle, the rest black
-  blit(enc, fr, W, H, W43, wide) {
+  // into the canvas: the largest TV box (4:3, or the race's aspect) in the middle, the rest black. The box and the source rect come from
+  // the frame's shape (pictureShape), the one its targets were made for: a frame whose aspect differs from the last rebuilt them, and this
+  // frame's blit reads the new picture, not the old aspect held in the settings
+  blit(enc, fr, shape, H, W43, wide) {
+    if (typeof shape === 'number') shape = shapeOf(shape, H, W43, fr.reflections === 2 ? 128 : 64, wide, fr.narrow);
     const d = this.device;
+    const { aspect } = shape;
     const dpr = window.devicePixelRatio || 1;
     const cw = Math.max(1, Math.round(this.canvas.clientWidth * dpr)), ch = Math.max(1, Math.round(this.canvas.clientHeight * dpr));
     if (this.canvas.width !== cw || this.canvas.height !== ch) { this.canvas.width = cw; this.canvas.height = ch; }
-    const aspect = (4 / 3) / (wide ? fr.narrow : 1);
-    let bw = cw, bh = ch;
-    if (bw > bh * aspect) bw = Math.floor(bh * aspect); else bh = Math.floor(bw / aspect);
-    const bx = Math.floor((cw - bw) / 2), by = Math.floor((ch - bh) / 2);
-    const from = wide ? 0 : (W - W43) / 2, across = wide ? W : W43;
+    const { bw, bh, bx, by, u0, u1, v1 } = blitBox(shape, cw, ch);
     const graded = fr.brightness !== 0 || fr.contrast !== 100 || fr.gamma !== 100;
-    d.queue.writeBuffer(this.blitUniform, 0, new Float32Array([from / W, 0, across / W, (H * 444 / 448) / H,
+    d.queue.writeBuffer(this.blitUniform, 0, new Float32Array([u0, 0, u1 - u0, v1,
       (fr.brightness | 0) / 100, (fr.contrast | 0) / 100 || 1, (fr.gamma | 0) / 100 || 1, graded ? 1 : 0]));
     const smooth = fr.smooth !== 0 ? 'linear' : 'nearest';
     let bg = this.blitGroups[smooth];
@@ -784,7 +838,7 @@ export class Renderer {
     const bp = enc.beginRenderPass({ colorAttachments: [{ view: this.context.getCurrentTexture().createView(), clearValue: [0, 0, 0, 1], loadOp: 'clear', storeOp: 'store' }] });
     // bars beside (or above) the picture: a soft, dimmed copy of it, scaled to cover the canvas and drawn only where the bars are
     if (prefs.blurSides && (bx > 0 || by > 0)) {
-      const sx = from / W, sw = across / W, sh = (H * 444 / 448) / H, ca = cw / ch;
+      const sx = u0, sw = u1 - u0, sh = v1, ca = cw / ch;
       let rect;      // the picture's rect, cropped to the canvas's shape
       if (ca > aspect) { const fh = sh * aspect / ca; rect = [sx, (sh - fh) / 2, sw, fh]; }
       else { const fw = sw * ca / aspect; rect = [sx + (sw - fw) / 2, 0, fw, sh]; }

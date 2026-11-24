@@ -79,11 +79,15 @@ build/eefloat_soft_test: tests/eefloat_soft_test.cpp $(OWN)/eefloat_soft.h
 	@mkdir -p build
 	clang++ -std=c++17 -O2 -ffp-contract=off -frounding-math -I$(OWN) $< -o $@
 
+# ---- the page's own tests (no game, no browser): hp2.ini, and the renderer's pictures for each aspect -----------------------------
+test-page:
+	node --test tests/*.test.mjs
+
 check-gen:
 	@test -n "$(GEN_SRC)" || { echo "$(GEN) is empty: run ./setup.sh <your disc image> first"; exit 1; }
 
 clean:
 	rm -rf build
 
-.PHONY: web native test check-gen clean
+.PHONY: web native test test-page check-gen clean
 -include $(N_GEN_OBJ:.o=.d) $(N_RT_OBJ:.o=.d) $(W_GEN_OBJ:.o=.d) $(W_RT_OBJ:.o=.d)
