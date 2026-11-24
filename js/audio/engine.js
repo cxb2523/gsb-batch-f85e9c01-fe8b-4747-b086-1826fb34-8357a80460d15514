@@ -16,6 +16,10 @@ import { tempoBpm } from '../tuning.js';
 import { MAX_LAYERS, audibleLayers } from '../state.js';
 
 const SMOOTH = 0.03;
+// A retired insert chain stays connected, fading out, for this long before its
+// nodes are destroyed: long enough for the crossfade and worklet tails, short
+// enough that rapid rebuilds only keep a handful of chains alive at once.
+export const CHAIN_RETIRE_MS = 250;
 const json = (v) => JSON.stringify(v);
 
 export const WORKLET_URL = new URL('../../worklet/processor.js', import.meta.url);
@@ -55,16 +59,125 @@ export class Strip {
 		// Offline renders of dry stems pass no Space or Echo.
 		if (space) this.panner.connect(this.spaceSend).connect(space.input);
 		if (echo) this.panner.connect(this.echoSend).connect(echo.input);
-		this.effects = [];
-		this.fxKey = '';
+		// The insert junction is permanent: input and duck are never disconnected.
+		// The active effect chain (possibly empty) bridges input to this tail, and
+		// rebuilds crossfade a fresh chain in before the old one is torn down, so
+		// the graph never has a dangling input or a destroyed node connected.
+		this.tail = ctx.createGain();
+		this.tail.connect(this.duck);
 		this.duck.connect(this.fader);
-		this.input.connect(this.duck);
+		this.chain = this.buildChain([], 90);
+		this.chain.gen = 0;
+		this.chain.out.gain.value = 1;
+		this.input.connect(this.chain.in);
+		this.chain.out.connect(this.tail);
+		this.retiring = [];
+		this.fxKey = '';
+		this.bpm = 90;
+		this.gen = 0;
 	}
 
 	// Takes this layer's audio and the sidechain from a song node.
 	attach(song, index) {
 		song.connect(this.sidechain, MAX_LAYERS, 0);
 		song.connect(this.input, index, 0);
+	}
+
+	// Builds a complete, internally wired but not yet connected insert chain for
+	// the active effects. Every effect receives its current parameters and BPM
+	// before the chain can pass a single sample, so tempo-derived rates (pump,
+	// tremolo) are correct from the first block rather than the next set().
+	buildChain(fx, bpm) {
+		const input = this.ctx.createGain();
+		const out = this.ctx.createGain();
+		out.gain.value = 0;
+		const effects = fx.map((f) => {
+			const e = createEffect(this.ctx, f.type, f.params);
+			e.set(f.params, bpm);
+			return { effect: e, params: json(f.params) };
+		});
+		let node = input;
+		for (const e of effects) {
+			node.connect(e.effect.input);
+			node = e.effect.output;
+		}
+		node.connect(out);
+		return { in: input, out, effects };
+	}
+
+	// Disconnects a chain from the permanent junction and destroys every node
+	// and worklet port it owns. Only called once the chain is no longer active
+	// and its fade-out has finished, so no destroyed node is still connected.
+	disposeChain(chain) {
+		try {
+			this.input.disconnect(chain.in);
+		} catch {}
+		try {
+			chain.out.disconnect(this.tail);
+		} catch {}
+		for (const e of chain.effects) {
+			try {
+				e.effect.dispose();
+			} catch {}
+		}
+		for (const node of [chain.in, chain.out]) {
+			try {
+				node.disconnect();
+			} catch {}
+		}
+	}
+
+	// Replaces the active chain without a gap: the new chain is fully built and
+	// parameterized first, then it is crossfaded in while the old chain keeps
+	// sounding. If building the new chain throws, the old chain stays wired and
+	// audible — the input is never left dangling.
+	swapChain(fx, bpm) {
+		let next;
+		try {
+			next = this.buildChain(fx, bpm);
+		} catch (err) {
+			if (next) this.disposeChain(next);
+			throw err;
+		}
+		next.gen = ++this.gen;
+		const old = this.chain;
+		if (this.ctx.currentTime < 0.001) {
+			// Before the first sample (an offline render start) a cut is inaudible
+			// and no real-time timer may exist to free the old chain later. Wire
+			// the new chain first so the input is never without a downstream.
+			next.out.gain.value = 1;
+			this.input.connect(next.in);
+			next.out.connect(this.tail);
+			this.chain = next;
+			this.disposeChain(old);
+			return;
+		}
+		// Both chains stay fully wired during the fade; the old one is only
+		// unwired once it has reached silence (see retire()). Neither input nor
+		// tail is disconnected at any point, so the signal never drops.
+		this.input.connect(next.in);
+		next.out.connect(this.tail);
+		ramp(next.out.gain, 1, this.ctx, SMOOTH);
+		ramp(old.out.gain, 0, this.ctx, SMOOTH);
+		this.chain = next;
+		this.retire(old);
+	}
+
+	// Holds a superseded chain until its fade-out has finished, then unwires and
+	// destroys it. The timeout belongs to that specific chain: every rebuild
+	// schedules its own retirement, so rapid rebuilds cannot reschedule or
+	// cancel the destruction of an earlier chain, and an active chain is never
+	// retired (its timer, if any, finds it current and bails).
+	retire(chain) {
+		if (chain.timer) clearTimeout(chain.timer);
+		this.retiring.push(chain);
+		chain.timer = setTimeout(() => {
+			chain.timer = 0;
+			const idx = this.retiring.indexOf(chain);
+			if (idx >= 0) this.retiring.splice(idx, 1);
+			if (chain === this.chain) return;
+			this.disposeChain(chain);
+		}, CHAIN_RETIRE_MS);
 	}
 
 	// `trim` is the automatic balance's gain for this layer.
@@ -77,41 +190,41 @@ export class Strip {
 		ramp(this.sidechain.gain, -(layer.sidechain || 0), ctx);
 	}
 
-	// Rebuilds the insert chain when effects are added, removed, reordered, or toggled.
+	// Rebuilds the insert chain when effects are added, removed, reordered, or
+	// toggled; parameter-only changes are pushed to the existing effects. Safe
+	// to call in quick succession: each rebuild completes atomically against
+	// the chain currently active, and earlier chains finish their own fade.
 	setEffects(fx, bpm) {
-		const key = json(fx.map((f) => [f.type, f.on]));
+		this.bpm = bpm;
+		const active = fx.filter((f) => f.on);
+		const key = json(active.map((f) => [f.type, f.on]));
 		if (key !== this.fxKey) {
 			this.fxKey = key;
-			this.input.disconnect();
-			for (const e of this.effects) {
-				e.output.disconnect();
-				e.dispose();
-			}
-			this.effects = fx.filter((f) => f.on).map((f) => ({ ...createEffect(this.ctx, f.type, f.params), params: '' }));
-			let node = this.input;
-			for (const e of this.effects) {
-				node.connect(e.input);
-				node = e.output;
-			}
-			node.connect(this.duck);
+			this.swapChain(active, bpm);
 		}
-		const active = fx.filter((f) => f.on);
+		// A newly built chain was parameterized during construction and its
+		// entries already match, so only genuinely changed params are pushed;
+		// tempo() then refreshes every BPM-derived rate (pump, tremolo, filter
+		// sweep), covering a setEffects call whose BPM changed but fx did not.
 		active.forEach((f, i) => {
-			const e = this.effects[i];
+			const entry = this.chain.effects[i];
+			if (!entry) return;
 			const p = json(f.params);
-			if (e && e.params !== p) {
-				e.params = p;
-				e.set(f.params, bpm);
+			if (entry.params !== p) {
+				entry.params = p;
+				entry.effect.set(f.params, bpm);
 			}
 		});
+		this.chain.effects.forEach((entry) => entry.effect.tempo(bpm));
 	}
 
 	tempo(bpm) {
-		for (const e of this.effects) e.tempo(bpm);
+		this.bpm = bpm;
+		for (const entry of this.chain.effects) entry.effect.tempo(bpm);
 	}
 
 	clear() {
-		this.setEffects([], 90);
+		this.setEffects([], this.bpm);
 		this.fader.gain.setTargetAtTime(0, this.ctx.currentTime, SMOOTH);
 	}
 }

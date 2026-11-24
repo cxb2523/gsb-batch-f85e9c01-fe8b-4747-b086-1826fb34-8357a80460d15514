@@ -20,6 +20,17 @@ export function ramp(param, value, ctx, smooth = SMOOTH) {
 // Chorus speeds: 48 Hz × 1/256, 3/512, 1/128, 3/256, 9/512, 3/128.
 const CHORUS_RATES = [0.1875, 0.28125, 0.375, 0.5625, 0.84375, 1.125];
 
+// Tears down a native effect's sub-graph. Disconnecting the two junction nodes
+// drops every path through the effect, so its internal nodes become garbage;
+// stopping the oscillators ends their modulation connections.
+function disposeNative({ input, output, lfo = null }) {
+	try {
+		input.disconnect();
+		output.disconnect();
+		lfo?.stop();
+	} catch {}
+}
+
 function filterEffect(ctx) {
 	const input = ctx.createGain();
 	const output = ctx.createGain();
@@ -58,7 +69,7 @@ function filterEffect(ctx) {
 			if (last) this.set(last, bpm);
 		},
 		dispose() {
-			lfo.stop();
+			disposeNative({ input, output, lfo });
 		},
 	};
 }
@@ -105,7 +116,9 @@ function driveEffect(ctx) {
 			ramp(dry.gain, 1 - p.mix, ctx);
 		},
 		tempo() {},
-		dispose() {},
+		dispose() {
+			disposeNative({ input, output });
+		},
 	};
 }
 
@@ -143,7 +156,7 @@ function chorusEffect(ctx) {
 		},
 		tempo() {},
 		dispose() {
-			lfo.stop();
+			disposeNative({ input, output, lfo });
 		},
 	};
 }
@@ -177,7 +190,7 @@ function tremoloEffect(ctx) {
 			if (last) this.set(last, bpm);
 		},
 		dispose() {
-			lfo.stop();
+			disposeNative({ input, output, lfo });
 		},
 	};
 }
@@ -200,6 +213,12 @@ function workletEffect(ctx, type, params) {
 		},
 		tempo() {},
 		dispose() {
+			// Drop the graph connection first, then close the message port: the
+			// worklet processor can then be collected, and a queued parameter
+			// message never reaches a node the graph has stopped referencing.
+			try {
+				node.disconnect();
+			} catch {}
 			node.port.close();
 		},
 	};

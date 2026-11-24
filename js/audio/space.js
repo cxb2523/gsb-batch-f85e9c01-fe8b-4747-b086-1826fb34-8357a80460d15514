@@ -6,6 +6,17 @@ import { ECHO_TIMES } from '../tuning.js';
 import { ramp } from './fx.js';
 
 const SMOOTH = 0.05;
+// How long a faded-out convolver stays connected before it is replaced by an
+// idle one. Exported for tests.
+export const SLOT_RETIRE_MS = 600;
+// Debounce while a size/tone knob is being dragged.
+const SETTLE_MS = 120;
+
+// True for an OfflineAudioContext: its currentTime advances only while
+// rendering, so wall-clock setTimeout work would never line up with it.
+function isOffline(ctx) {
+	return typeof ctx.startRendering === 'function';
+}
 
 // Builds a stereo impulse response: early reflections, then decorrelated noise
 // that decays and darkens over time.
@@ -81,6 +92,13 @@ export class Space {
 		this.active = 0;
 		this.key = '';
 		this.timer = 0;
+		// Each slot carries its own retirement timer and a generation counter, so
+		// a timer can only ever retire the exact convolver that was fading out
+		// when it was scheduled — never a slot a later rebuild reactivated.
+		for (const slot of this.slots) {
+			slot.retire = 0;
+			slot.gen = 0;
+		}
 	}
 
 	set({ size, tone }) {
@@ -88,35 +106,83 @@ export class Space {
 		if (key === this.key) return;
 		this.key = key;
 		clearTimeout(this.timer);
-		// Rebuilding the response takes a few milliseconds; wait for the knob to settle.
-		this.timer = setTimeout(() => this.rebuild(size, tone), this.slots[this.active].convolver.buffer ? 120 : 0);
+		if (isOffline(this.ctx)) {
+			// Offline time does not advance on wall-clock timers: rebuild now,
+			// synchronously, so stems render through the requested response.
+			this.rebuild(size, tone);
+			return;
+		}
+		// Rebuilding the response takes a few milliseconds; always wait for the
+		// knob to settle, including the very first change.
+		this.timer = setTimeout(() => this.rebuild(size, tone), SETTLE_MS);
+	}
+
+	// Cancels a slot's pending retirement, if any. Called before the slot is
+	// reused: its previous convolver must not be replaced underneath a live
+	// crossfade.
+	cancelRetire(slot) {
+		if (slot.retire) {
+			clearTimeout(slot.retire);
+			slot.retire = 0;
+		}
+	}
+
+	// Replaces the slot's convolver with a fresh, disconnected idle one. Runs
+	// only from a timer whose generation token still matches, so an active
+	// convolver is never retired.
+	retireSlot(slot, token) {
+		slot.retire = 0;
+		if (slot.gen !== token) return;
+		if (this.slots[this.active] === slot && slot.convolver.buffer) return;
+		slot.convolver.disconnect();
+		slot.convolver = this.ctx.createConvolver();
+		this.predelay.connect(slot.convolver).connect(slot.gain);
 	}
 
 	rebuild(size, tone) {
-		const next = 1 - this.active;
+		const nextIndex = 1 - this.active;
+		const next = this.slots[nextIndex];
 		const old = this.slots[this.active];
+		// The slot we are about to take over may still have a retirement pending
+		// from an earlier fade-out; cancel it so its new convolver survives.
+		this.cancelRetire(next);
+		next.gen++;
+		next.convolver.buffer = impulseResponse(this.ctx, size, tone);
 		const now = this.ctx.currentTime;
-		this.slots[next].convolver.buffer = impulseResponse(this.ctx, size, tone);
-		this.slots[next].gain.gain.setTargetAtTime(1, now, SMOOTH * 2);
-		old.gain.gain.setTargetAtTime(0, now, SMOOTH * 2);
-		this.active = next;
-		// Once faded out, the old convolver is replaced by an idle one, so only one
-		// convolution runs at a time.
-		clearTimeout(this.retire);
-		this.retire = setTimeout(() => {
-			if (this.slots[this.active] === old) return;
-			old.convolver.disconnect();
-			old.convolver = this.ctx.createConvolver();
-			this.predelay.connect(old.convolver).connect(old.gain);
-		}, 600);
+		ramp(next.gain.gain, 1, this.ctx, SMOOTH * 2);
+		ramp(old.gain.gain, 0, this.ctx, SMOOTH * 2);
+		this.active = nextIndex;
+		if (this.ctx.currentTime < 0.001 || isOffline(this.ctx)) {
+			// No real-time clock to wait on: the old slot is already silent, so
+			// idle it immediately and keep exactly one convolver running.
+			this.cancelRetire(old);
+			old.gen++;
+			this.retireSlot(old, old.gen);
+			return;
+		}
+		// Once faded out, the old convolver is replaced by an idle one, so only
+		// one convolution runs at a time. The captured token binds this timer to
+		// the convolver being retired: if the slot is reused before 600 ms, its
+		// bumped generation makes the callback a no-op.
+		this.cancelRetire(old);
+		const token = old.gen;
+		old.retire = setTimeout(() => this.retireSlot(old, token), SLOT_RETIRE_MS);
 	}
 
-	// Sets the response at once, for offline rendering.
+	// Sets the response at once, for offline rendering and the initial build.
 	prepare({ size, tone }) {
+		clearTimeout(this.timer);
+		for (const slot of this.slots) this.cancelRetire(slot);
 		this.key = `${size.toFixed(2)}|${tone.toFixed(2)}`;
 		this.slots[0].convolver.buffer = impulseResponse(this.ctx, size, tone);
 		this.slots[0].gain.gain.value = 1;
+		this.slots[0].gen++;
 		this.active = 0;
+		// Slot 1 must stay silent and idle, with no buffered response running.
+		const idle = this.slots[1];
+		idle.gen++;
+		idle.gain.gain.value = 0;
+		if (idle.convolver.buffer) this.retireSlot(idle, idle.gen);
 	}
 }
 
