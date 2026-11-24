@@ -1,0 +1,43 @@
+{
+  "name": "bind-manager",
+  "version": "0.2.4",
+  "description": "Universal key binding manager for browser games and applications",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src",
+    "!src/input/controller_definitions/captures"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.js",
+    "build:watch": "node scripts/build.js --watch",
+    "demo": "npx --yes serve . -p 3001 --no-clipboard",
+    "process_controller_defs": "node scripts/process-controller-defs.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "hygiene": "vitest run tests/hygiene",
+    "setup:git": "node scripts/setup-git.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1",
+    "esbuild": "^0.28.0",
+    "jsdom": "^24.1.1",
+    "vitest": "^4.1.2"
+  },
+  "keywords": [
+    "keybinding",
+    "game",
+    "input",
+    "browser",
+    "threejs"
+  ],
+  "license": "MIT"
+}
