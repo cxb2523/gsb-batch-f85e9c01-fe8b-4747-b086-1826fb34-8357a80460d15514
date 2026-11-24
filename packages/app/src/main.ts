@@ -752,6 +752,13 @@ async function beginOnlineMatch(requeued = false, joinCode?: string, spectate = 
   const generation = ++matchGeneration;
 
   if (match) {
+    // Leaving the local match also ends any spectator session on it:
+    // clear the controller's follow/transition state so a leftover
+    // half-finished glide can't leak into the next match's opening
+    // framing (the controller itself is replaced below, this keeps the
+    // invariant explicit and covers the online path that doesn't
+    // construct a new one).
+    spectator?.deactivate();
     match.stop();
     match.renderer.destroy();
     match = null;
@@ -1140,6 +1147,9 @@ async function beginMatch(): Promise<void> {
   lastFrameTimeMs = null;
 
   if (match) {
+    // End the previous match's spectator session before tearing it down
+    // (see the beginOnlineMatch teardown for why).
+    spectator?.deactivate();
     match.stop();
     match.renderer.destroy();
     canvasRoot.innerHTML = '';
