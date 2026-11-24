@@ -63,8 +63,8 @@ export function applyPowerup(type, ctx) {
       plane.rapidT = P.rapidTime;
       return 'RAPID FIRE!';
     case 'shield':
-      plane.shieldHp = P.shieldHp;
-      plane.shieldT = P.shieldTime;
+      // same-type re-pickup refreshes timer + pool to one full shield (no stacking past the cap)
+      plane.giveShield();
       return `SHIELD! (blocks ${P.shieldHp} damage)`;
     case 'afterburner':
       plane.burnT = P.burnTime;

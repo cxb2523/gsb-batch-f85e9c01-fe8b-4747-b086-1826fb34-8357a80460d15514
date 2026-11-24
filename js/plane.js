@@ -78,6 +78,20 @@ export class Plane {
     this.alive = true;
     this.invuln = P.respawnInvuln;
     this.roll = 0;                 // track the roll angle, used for bank-to-turn and the camera
+    this.clearBuffs();             // every timed power-up effect (shield included) starts empty
+    this.missiles = P.missileStart ?? CFG.missile.startAmmo;
+    this.reloadT = 0;              // time towards the next reloaded missile (pylons)
+    this.gunCd = 0;
+    this.missCd = 0;
+    this.treeHits = 0;
+    this.ramCd = 0;
+    this.deathCause = '';          // the previous sortie's cause must never follow the plane into this one
+    this.syncMesh();
+  }
+
+  // wipe every temporary power-up effect. Used on (re)take-off and respawn so a previous
+  // sortie's shield / fire-rate / afterburner state can never carry over into the next one.
+  clearBuffs() {
     this.doubleT = 0;              // twin cannon time remaining
     this.rapidT = 0;               // rapid fire time remaining
     this.pairT = 0;                // missile pairs (the missile version of Twin Cannon) time remaining
@@ -85,14 +99,6 @@ export class Plane {
     this.burnT = 0;                // afterburner time remaining
     this.shieldT = 0;              // shield time remaining
     this.shieldHp = 0;             // damage the shield can still absorb
-    this.missiles = P.missileStart ?? CFG.missile.startAmmo;
-    this.reloadT = 0;              // time towards the next reloaded missile (pylons)
-    this.gunCd = 0;
-    this.missCd = 0;
-    this.treeHits = 0;
-    this.ramCd = 0;
-    this.deathCause = '';
-    this.syncMesh();
   }
 
   // body axes (three.js treats -Z as forward by default)
@@ -108,6 +114,37 @@ export class Plane {
     this.mesh.visible = this.alive && !(this.invuln > 0 && Math.floor(this.invuln * 4) % 2 === 0);
   }
 
+  // ---- Shield lifecycle -------------------------------------------------------
+  // The shield has one invariant the whole game relies on: a live timer and a
+  // positive absorb pool exist together. There is no "timer running but empty"
+  // and no "pool left but timer expired" state. Every change goes through these
+  // three helpers so the invariant can never be broken by an individual caller.
+  get hasShield() { return this.shieldT > 0 && this.shieldHp > 0; }
+
+  // pick up (or re-pick up) a shield power-up: per the power-up rules the timer
+  // and the absorb pool are REFRESHED to one full shield, never stacked, so the
+  // pool can never exceed a single shield's cap (CFG.power.shieldHp)
+  giveShield() {
+    this.shieldHp = CFG.power.shieldHp;
+    this.shieldT = CFG.power.shieldTime;
+  }
+
+  // timer ran out: drop the whole shield atomically (timer and pool together)
+  expireShield() {
+    this.shieldT = 0;
+    this.shieldHp = 0;
+  }
+
+  // the hit that empties the pool ends the shield too, so the timer can never
+  // outlive the pool; returns the damage left over for the hull
+  absorbWithShield(dmg) {
+    const soak = Math.min(this.shieldHp, dmg);
+    this.shieldHp -= soak;
+    dmg -= soak;
+    if (this.shieldHp <= 0) this.expireShield();
+    return dmg;
+  }
+
   update(dt, input) {
     if (!this.alive) return;
     const P = this.P;
@@ -117,7 +154,7 @@ export class Plane {
     if (this.pairT > 0) this.pairT -= dt;
     if (this.mRapidT > 0) this.mRapidT -= dt;
     if (this.burnT > 0) this.burnT -= dt;
-    if (this.shieldT > 0) { this.shieldT -= dt; if (this.shieldT <= 0) this.shieldHp = 0; }
+    if (this.shieldT > 0) { this.shieldT -= dt; if (this.shieldT <= 0) this.expireShield(); }
 
     // afterburner power-up: top speed, cruise speed and turn rates all scaled up while it lasts
     const boost = this.burnT > 0 ? CFG.power.burnMul : 1;
@@ -260,21 +297,22 @@ export class Plane {
 
   hurt(dmg, cause = 'ENEMY FIRE') {
     if (!this.alive || this.invuln > 0) return false;
-    // shield power-up soaks damage first (crashing into the ground bypasses it, see crash())
-    if (this.shieldT > 0 && this.shieldHp > 0) {
-      const soak = Math.min(this.shieldHp, dmg);
-      this.shieldHp -= soak;
-      dmg -= soak;
-      if (dmg <= 0) return true;
-    }
+    // shield power-up soaks damage first (crashing into the ground bypasses it, see crash()).
+    // The shield pool is drained before the hull, and whatever breaks the pool carries fully
+    // through onto the hull in the same hit; the hit that empties the pool also ends its timer.
+    if (this.hasShield) dmg = this.absorbWithShield(dmg);
+    if (dmg <= 0) return true;
     this.hp -= dmg;
     if (this.hp <= 0) { this.hp = 0; this.alive = false; this.deathCause = cause; }
     return true;
   }
 
-  // Ground = crash. Invulnerability doesn't save you (it protects from bullets, not from the ground)
+  // Ground = crash. Invulnerability doesn't save you (it protects from bullets, not from the ground).
+  // The shield does not save you either: terrain/buildings are a fatal path that bypasses it entirely,
+  // so no shield charge is spent and the recorded cause stays the terrain, never the shield.
   crash() {
     if (!this.alive) return;
+    this.expireShield();                 // nothing from the old shield carries past the crash
     this.hp = 0;
     this.alive = false;
     this.deathCause = 'TERRAIN';
