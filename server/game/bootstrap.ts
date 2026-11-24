@@ -1,0 +1,205 @@
+// POST /api/bootstrap: resolve (or create / adopt) the player, optionally import a legacy
+// inventory, and return everything the client needs for a session in one response.
+import crypto from "node:crypto";
+import type { Context } from "@netlify/functions";
+import { z } from "zod";
+import { ACQ_MAX, BOOT_ENTRIES, type BootstrapResponse, type PowSolution } from "../../src/shared/api.ts";
+import { BODY_LIMIT_BOOTSTRAP, checkCsrf, clientIp, errors, ipHash, json, readJson } from "../http.ts";
+import { checkPowSolution, issuePow, recordPowIssued, recordPowRedeemed, verifyPow, type PowCheck } from "../pow.ts";
+import { BUDGETS, LIMITS, enforce } from "../ratelimit.ts";
+import { encodeSession, sessionCookie, sessionPlayer, type PlayerRow } from "../session.ts";
+import { classifyUserAgent } from "../ua.ts";
+import { challengeStats, dailyChallenges, resolveDay } from "./challenges.ts";
+import { toElementDTO, toLibraryEntry } from "./dto.ts";
+import {
+  claimLegacyPlayer,
+  countFirsts,
+  createPlayer,
+  ensureStarters,
+  importLegacy,
+  isLegacyUserId,
+  knownCount,
+  legacyPlayerExists,
+  library,
+  notImported,
+  recentElements,
+  touchPlayer,
+  type PlayerOrigin,
+} from "./players.ts";
+
+export const BootstrapSchema = z.object({
+  clientDate: z.string().max(32),
+  pow: z.object({ salt: z.string().max(128), nonce: z.string().max(64) }).optional(),
+  legacy: z
+    .object({
+      userId: z.string().max(200).nullable(),
+      // Truncated to MAX_LEGACY_IDS during import; the 1 MB body cap bounds the array.
+      elementIds: z.array(z.string().max(32)),
+      // This browser's claim token (src/app/lib/legacy.ts): binds the legacy player on first adoption.
+      claim: z.string().regex(/^[0-9a-f]{32}$/).optional(),
+    })
+    .optional(),
+  // Analytics only: a malformed or oversized value is dropped, never a 400.
+  acq: z
+    .object({
+      ref: z.string().max(ACQ_MAX.ref),
+      path: z.string().max(ACQ_MAX.path),
+      src: z.string().max(ACQ_MAX.utm).nullish(),
+      med: z.string().max(ACQ_MAX.utm).nullish(),
+      cmp: z.string().max(ACQ_MAX.utm).nullish(),
+    })
+    .optional()
+    .catch(undefined),
+  // Analytics only (BootstrapHint): each malformed field is dropped on its own, never a 400.
+  hint: z
+    .object({
+      touch: z.boolean().optional().catch(undefined),
+      standalone: z.boolean().optional().catch(undefined),
+      wide: z.boolean().optional().catch(undefined),
+      prior: z.boolean().optional().catch(undefined),
+      // Accepted for the contract; not stored (it reads false unless the site asked to persist).
+      persisted: z.boolean().optional().catch(undefined),
+      entry: z.enum(BOOT_ENTRIES).optional().catch(undefined),
+    })
+    .optional()
+    .catch(undefined),
+  // A resumed tab's silent new-day refresh (BootstrapRequest.refresh): no load is counted.
+  refresh: z.boolean().optional().catch(undefined),
+});
+
+/** Earth, Water, Air, Fire and Time. */
+const STARTER_COUNT = 5;
+
+const POW_MESSAGES: Record<Exclude<PowCheck, "ok">, string> = {
+  malformed: "Proof-of-work solution was malformed.",
+  bad_signature: "Proof-of-work challenge was not issued by this server.",
+  expired: "Proof-of-work challenge expired. Solve the new one.",
+  insufficient: "Proof-of-work solution is incorrect.",
+  replayed: "Proof-of-work challenge was already used.",
+};
+
+/**
+ * Finish `p` after the response is sent (context.waitUntil), so a best-effort write never delays
+ * it. Without waitUntil (tests) it still runs, unawaited. Only for promises that never reject.
+ */
+function afterResponse(context: Context, p: Promise<unknown>): void {
+  if (typeof context.waitUntil === "function") context.waitUntil(p);
+}
+
+/**
+ * New players must present a fresh, unspent PoW solution and fit the creation limits. The
+ * global player budget is charged last, so a replayed salt or an over-limit IP never spends it.
+ * Every challenge sent and every solution spent is counted (server/pow.ts, the PoW funnel). The
+ * issue count finishes after the 401 is sent and the redemption stats run alongside the budget
+ * charge, so neither adds a round trip to the boot.
+ */
+async function createWithPow(pow: PowSolution | undefined, ip: string, origin: PlayerOrigin, context: Context): Promise<PlayerRow> {
+  const challenge = (message?: string) => {
+    afterResponse(context, recordPowIssued(origin.uaClass)); // bumpStat never throws
+    return errors.powRequired(issuePow(), message);
+  };
+  if (!pow) throw challenge();
+  const stateless = checkPowSolution(pow);
+  if (stateless !== "ok") throw challenge(POW_MESSAGES[stateless]);
+  await enforce([
+    { limit: LIMITS.createIp, subject: ip },
+    { limit: LIMITS.createIpDay, subject: ip },
+  ]);
+  const spent = await verifyPow(pow);
+  if (spent !== "ok") throw challenge(POW_MESSAGES[spent]);
+  await Promise.all([enforce([{ limit: BUDGETS.players, subject: "all" }]), recordPowRedeemed(pow, origin.uaClass)]);
+  return createPlayer(ip, origin);
+}
+
+export async function bootstrap(req: Request, context: Context): Promise<Response> {
+  checkCsrf(req);
+  const body = await readJson(req, BootstrapSchema, BODY_LIMIT_BOOTSTRAP);
+  const ip = ipHash(clientIp(req, context));
+  const today = resolveDay(body.clientDate);
+
+  let [player] = await Promise.all([sessionPlayer(req), enforce([{ limit: LIMITS.bootstrapIp, subject: ip }])]);
+  let adopted = false;
+  let claimed = false;
+  /** Whether a backfilled legacy player has `legacyUserId`, once the claim below has found out. */
+  let legacyExists: boolean | undefined;
+  const legacyUserId = body.legacy?.userId;
+  if (!player && isLegacyUserId(legacyUserId)) {
+    await enforce([{ limit: LIMITS.adoptIp, subject: ip }]);
+    const claimHash = body.legacy?.claim ? crypto.createHash("sha256").update(body.legacy.claim).digest("hex") : null;
+    const claim = await claimLegacyPlayer(legacyUserId, claimHash);
+    if (claim.player) {
+      await ensureStarters(claim.player.id);
+      player = claim.player;
+      adopted = true;
+    }
+    // Bound to another browser: this one becomes a new player (PoW-gated; the check above is
+    // stateless, so the 401 pow_required retry lands here again) and only gets a copy of the
+    // inventory below. Firsts and challenge history stay with the bound player.
+    claimed = claim.claimed;
+    legacyExists = claim.player !== undefined || claim.claimed;
+  }
+  // A refresh never creates a player (the client never solves PoW for one), so it gets no
+  // challenge either: one would count as issued in the PoW funnel and never be redeemed.
+  if (!player && body.refresh) throw errors.unauthorized();
+  player ??= await createWithPow(
+    body.pow,
+    ip,
+    {
+      acq: body.acq,
+      uaClass: classifyUserAgent(req.headers.get("user-agent")),
+      ...(body.hint ? { hint: { touch: body.hint.touch, wide: body.hint.wide, prior: body.hint.prior } } : {}),
+    },
+    context,
+  );
+
+  let legacyImport: BootstrapResponse["legacyImport"];
+  if (body.legacy) {
+    // Only a real legacy user id imports: into its own (adopted) player, or as a copy when that
+    // player is bound to another browser. Without one (or with an unknown one) nothing is written,
+    // so a fresh player cannot fill its library with caller-chosen elements. The zero result still
+    // tells the client the import is settled, so it stops sending the inventory.
+    const eligible =
+      isLegacyUserId(legacyUserId) &&
+      (player.legacy_user_id === legacyUserId || (legacyExists ?? (await legacyPlayerExists(legacyUserId))));
+    const r = eligible ? await importLegacy(player.id, body.legacy.elementIds) : notImported(body.legacy.elementIds);
+    legacyImport = { ...r, adopted, claimed };
+  }
+
+  const playerId = player.id;
+  // Legacy players are backfilled without starter rows. Adoption adds them, but a legacy player
+  // can also arrive via a transfer code (or lose them some other way), so make sure every load
+  // has all starters; this is a no-op once they're there.
+  const libraryWithStarters = async () => {
+    const rows = await library(playerId);
+    if (rows.filter((r) => r.is_starter).length >= STARTER_COUNT) return rows;
+    await ensureStarters(playerId);
+    return library(playerId);
+  };
+  const [lib, firsts, known, { challenge, tomorrow }, chStats, recent] = await Promise.all([
+    libraryWithStarters(),
+    countFirsts(playerId),
+    knownCount(),
+    dailyChallenges(playerId, today),
+    challengeStats(playerId, today),
+    recentElements(),
+    touchPlayer(playerId, today, { standalone: body.hint?.standalone, entry: body.hint?.entry, ...(body.refresh ? { refresh: true } : {}) }),
+  ]);
+
+  const response: BootstrapResponse = {
+    player: { id: player.public_id, createdAt: player.created_at.toISOString(), legacy: player.legacy_user_id != null },
+    library: lib.map((row) => toLibraryEntry(row, playerId)),
+    stats: {
+      known,
+      mine: lib.length,
+      firsts,
+      challengesCompleted: chStats.completed,
+      streak: chStats.streak,
+    },
+    challenge,
+    history: chStats.history,
+    recent: recent.map(toElementDTO),
+    ...(legacyImport ? { legacyImport } : {}),
+    ...(tomorrow ? { tomorrow } : {}),
+  };
+  return json(response, { headers: { "set-cookie": sessionCookie(req, encodeSession(playerId, player.session_version)) } });
+}
