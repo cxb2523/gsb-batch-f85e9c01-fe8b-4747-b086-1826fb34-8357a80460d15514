@@ -249,3 +249,44 @@ as it ships: instrument 0x70. Ported as `Race.engineSound` plus `SoundDriver.eng
 
 fn 7af8, which silences the engines by zeroing all four cars' speeds when the driver is the OPL one (so the
 sound setting reaches the physics), came in with the head to head. Only the PC speaker driver is left.
+
+## Where the port deliberately departs from the file
+
+The driver is transliterated register write for register write in every case the original handles. What it
+does not handle is running out of room, and in a race that happens constantly: sixteen channel records, nine
+OPL channels, an eight-slot effects queue and a boombox of crashes, skids and four engines. `driver.ts`
+keeps the same sound numbers, the same `SoundPort` and the same chip writes, and changes only the
+out-of-room behaviour:
+
+- **A full effects queue is a priority queue.** The original answers al = 1 and the request is gone; the port
+  evicts the least valuable *waiting* request for anything strictly more valuable, and refuses requests that
+  are worth no more than everything already queued (`play` returns false). The order is repeating chatter
+  (5 skid, 0x12 bumpy/sticky) < engines (0x40+) < one-shot effects < the calls the game makes once (1/3
+  respawn/collision, 2 lap, 0x0A, 0x0F, 0x10). Ties go to the request already waiting, so a burst of equal
+  sounds cannot keep evicting itself. Engine requests are still one per car, as fn 06c8 has them.
+- **A request may take a sounding voice.** When no OPL channel frees, `start` takes the least valuable
+  effect voice the new sound outranks: a one-shot may take an engine (the only voice fn 7b46 re-requests
+  within a frame) or a lesser one-shot, an engine may take a repeating skid voice only, and chatter takes
+  nothing. Song tracks are never taken. This is the same "can be replayed later" rule as the queue, one
+  level down: losing a queued request costs nothing, losing a started one-shot loses the sound.
+- **An engine request survives a full driver.** The original drops whatever it cannot start; the port keeps
+  an engine note at the head of the queue and retries it every tick until a channel frees, so a car whose
+  voice a crash took gets it back on the tick after the crash ends, without fn 7b46 noticing. A one-shot
+  that cannot start is still dropped, as in the original.
+- **`engine(car, pitch, false)` withdraws a request that has not started.** Otherwise the record's 0x91 edit
+  would be too late and the queue would key a note on for one loop first. A note already playing still ends
+  through its own 0x91, as the driver does it.
+- **`stopVoices` stops every voice, not only the song's tracks.** In the original ah=7 happens to be called
+  when only the song is playing, but here it is called on pause and on a dropped connection, while effects
+  and engines are sounding: leaving them keyed on is the drone after a pause, and a stale engine voice makes
+  fn 7b46 think the car is already playing so it never comes back. Both stops key every slot off and then
+  push the silence list through fn 019d.
+- **Stops can land between ticks.** The original deferred ah=6/ah=7 to the next int 8 because that was the
+  only writer; `SoundOutput` interleaves the driver's tick with the OPL samples, and a tick is ~14 ms, so a
+  stop that waited for it would be heard as a note hanging over the pause. `flushStops` is called on every
+  sample (and by `SoundOutput.stopAll`/`stopVoices` themselves) so a stop takes effect on the first sample
+  after the request. In the driver alone the next `tick` still applies it, unchanged.
+
+Tests: `test/engine/sound_lifecycle.test.ts` builds a small driver image with the real layout so all of this
+runs without the game's files; `test/engine/sound.test.ts` repeats the queue, stop and engine-recovery cases
+against DRIVER1.BIN when it is present, and skips when it is not.

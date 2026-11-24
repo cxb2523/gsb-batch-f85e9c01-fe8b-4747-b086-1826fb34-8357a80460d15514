@@ -411,6 +411,25 @@ async function main(): Promise<void> {
     if (race!.pauseStage === 1) { frame = renderer!.pauseFrame(); present(frame, VIEWPORT.outWidth, VIEWPORT.height); }
   }
 
+  /**
+   * The fn 5 / 8 / 0a / 6 / 7 calls the race recorded, applied in order.
+   *
+   * The pause (fn 35f0) records ah=6, which used to fall through to `play(0)` and do nothing: the music,
+   * every effect and every engine stayed on the chip through the pause, and what came back afterwards was
+   * a drone rather than a race. ah=6 and ah=7 now reach the driver's own stop functions, which shut the
+   * voices up on the next tick (and therefore on the next audio sample, see SoundOutput).
+   */
+  function drainSounds(r: Race, snd: SoundOutput): void {
+    for (const { fn, arg } of r.sounds) {
+      if (fn === 6) { snd.stopAll(); continue; }
+      if (fn === 7) { snd.stopVoices(); continue; }
+      if (fn === 8) { snd.play(arg, true); continue; }
+      if (fn === 0x0A && snd.isPlaying(arg)) continue;
+      snd.play(arg);
+    }
+    r.sounds.length = 0;
+  }
+
   /** One animation frame of the race loop. 'over' when fn 3039 has left. */
   function stepRaceFrame(now: number): 'running' | 'over' | 'error' {
     acc += Math.min(0.1, (now - last) / 1000); last = now;
@@ -422,6 +441,7 @@ async function main(): Promise<void> {
         ds.w8(0x26D0, blink & 0x1F); ds.w8(0x26CF, (blink >> 5) & 1);
         ds.add16(0x261F, 1);
         if (!race!.pauseStep()) { ds.w8(0x107E, 0); break; }
+        if (sound) drainSounds(race!, sound);            // fn 35f0's ah=6 must not wait for the resume
         pausedFrame();
       }
       return 'running';
@@ -434,6 +454,7 @@ async function main(): Promise<void> {
           const blink = Math.floor(ticks);
           ds.w8(0x26D0, blink & 0x1F); ds.w8(0x26CF, (blink >> 5) & 1);
           race!.stepPhysics(ds.r8(0x107D), ds.r8(0x107C));
+          if (sound) drainSounds(race!, sound);        // fn 35f0 records ah=6 in the same step that pauses
           if (race!.paused) { pausedFrame(); return 'running'; }   // fn 35f0: the page drives the pause
           if (race!.over) {
             race = undefined; renderer = undefined;
@@ -445,14 +466,7 @@ async function main(): Promise<void> {
           }
           if (race!.rendersThisStep) frame = renderer!.render(() => race!.renderSideEffects());
           race!.stepPost(); steps++;
-          if (sound) {                                 // the ah=5, ah=8 and ah=0a calls the race made
-            for (const { fn, arg } of race!.sounds) {
-              if (fn === 8) { sound.play(arg, true); continue; }
-              if (fn === 0x0A && sound.isPlaying(arg)) continue;
-              sound.play(arg);
-            }
-          }
-          race!.sounds.length = 0;
+          if (sound) drainSounds(race!, sound);      // the ah=5, ah=6, ah=7, ah=8 and ah=0a calls
         }
       }
     } catch (e) {

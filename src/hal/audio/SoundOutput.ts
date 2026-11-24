@@ -61,8 +61,17 @@ export class SoundOutput implements SoundPort {
     }
   }
 
-  /** One OPL sample, running the driver's tick on the way past. */
+  /**
+   * One OPL sample, running the driver's tick on the way past.
+   *
+   * A deferred ah=6 / ah=7 stop is applied *before* the tick and before the sample, not only when the tick
+   * comes round: the tick falls every ~709 samples (14 ms), and a stop that waited for it would keep the
+   * old voices feeding the chip for that long — long enough to be heard as a note hanging over a pause.
+   * Applying it here means the first sample after the call is silent, whether the call landed just before
+   * a tick or just after one. `flushStops` is idempotent, so the tick's own call costs nothing.
+   */
   private sample(): number {
+    this.driver.flushStops();
     if (this.tickCarry <= 0) { this.driver.tick(); this.tickCarry += OPL_RATE / TICK_RATE; }
     this.tickCarry--;
     return this.opl.sample();
@@ -73,7 +82,11 @@ export class SoundOutput implements SoundPort {
   songPlaying(n: number): boolean { return this.driver.songPlaying(n); }
   play(n: number, music = false): void { this.driver.play(n, music); }
   isPlaying(n: number): boolean { return this.driver.isPlaying(n); }
-  stopAll(): void { this.driver.stopAll(); }
-  stopVoices(): void { this.driver.stopVoices(); }
+  /** A stop is applied at once, not on the next tick: `sample` would do it on the next sample anyway, but
+   *  a page that stops while the queue is not being pumped (the tab is hidden) should not keep a voice.
+   *  Buffers already scheduled (~200 ms of look-ahead) still play; the stop lands in the samples rendered
+   *  after the call, which is the soonest anything can. */
+  stopAll(): void { this.driver.stopAll(); this.driver.flushStops(); }
+  stopVoices(): void { this.driver.stopVoices(); this.driver.flushStops(); }
   engine(car: number, pitch: number, running: boolean): void { this.driver.engine(car, pitch, running); }
 }

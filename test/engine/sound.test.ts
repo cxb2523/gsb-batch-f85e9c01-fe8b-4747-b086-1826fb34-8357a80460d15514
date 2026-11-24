@@ -151,4 +151,55 @@ describe.skipIf(!have)('sound driver', () => {
     expect(d.isPlaying(0x40)).toBe(true);                 // command 0x98 sends it back to the loop point
     expect(log.writes.some(([r]) => r >= 0xA0 && r < 0xA9)).toBe(true);
   });
+
+  /**
+   * The lifecycle the race actually sees, against the real bank: a full queue keeps the crash, stopVoices
+   * really stops an effect that is on a channel, and an engine whose voice was taken comes back on its own
+   * once a channel frees (fn 7b46 asks for it again every rendered frame).
+   */
+  it('a full effects queue makes room for the crash instead of dropping it', () => {
+    const { d } = boot();
+    for (let i = 0; i < 8; i++) expect(d.play(5)).toBe(true);   // eight skids fill the queue
+    expect(d.play(1)).toBe(true);                              // a crash outranks them
+    expect(d.play(5)).toBe(false);                             // another skid is worth no more than the queue
+    d.tick();
+    expect(d.isPlaying(1)).toBe(true);                         // and the crash is what got the channel
+  });
+
+  it('stopVoices stops an effect that is on a channel, not just the song', () => {
+    const { d, log } = boot();
+    d.play(1);
+    d.tick();
+    expect(d.isPlaying(1)).toBe(true);
+    log.writes.length = 0;
+    d.stopVoices();
+    d.tick();
+    expect(d.isPlaying(1)).toBe(false);
+    // every channel is keyed off, so nothing is left gated on
+    const keys = log.writes.filter(([r]) => r >= 0xB0 && r < 0xB9);
+    expect(keys.some(([, v]) => (v & 0x20) === 0)).toBe(true);
+    expect(keys.every(([, v]) => (v & 0x20) === 0)).toBe(true);
+  });
+
+  it('a car gets its engine back after a crash took the voice', () => {
+    const { d } = boot();
+    d.engine(0, 0x30, true);
+    d.tick();
+    for (const n of [1, 2, 3, 4, 6, 7, 8, 9]) d.play(n);       // every other OPL channel is busy
+    d.tick();
+    expect(d.isPlaying(0x40)).toBe(true);
+
+    d.play(0x0A);                                             // the crash: the engine is the voice it takes
+    d.tick();
+    expect(d.isPlaying(0x40)).toBe(false);
+    expect(d.isPlaying(0x0A)).toBe(true);
+
+    let back = false;
+    for (let tick = 0; tick < 400 && !back; tick++) {
+      d.engine(0, 0x30 + (tick & 0x0F), true);                // fn 7b46, once a frame
+      d.tick();
+      back = d.isPlaying(0x40);
+    }
+    expect(back).toBe(true);
+  });
 });

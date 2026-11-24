@@ -5,6 +5,18 @@
  * The file carries the whole sound set, so everything here reads out of the driver image: the bank of 18
  * sequences, the 128 instrument records, the frequency tables and the four engine records the game rewrites
  * while a race runs. What comes out is the stream of OPL2 register writes the real driver would make.
+ *
+ * Deliberate departures from the file, all confined to what happens when resources run out (the same
+ * register writes come out of it in every case the original handles):
+ *
+ *  - a full effects queue evicts its least valuable request for a more valuable one instead of dropping
+ *    the new sound (`queueRank`);
+ *  - a request that finds no free OPL channel may take a lower-ranked sounding effect's voice
+ *    (`canPreempt`), and an engine that loses its voice is retried until a channel frees;
+ *  - the two stop functions stop *every* voice, not only the song's tracks, and can be applied on the
+ *    next audio sample rather than the next tick (`flushStops`).
+ *
+ * Sound numbers, `SoundPort` and the chip register sequence are unchanged.
  */
 
 /** Whatever the register writes go to: the chip, or a log in a test. */
@@ -43,6 +55,75 @@ const EFFECT_RATE = 0x1680;            // 5760: the fixed rate channels in state
 
 export const CHANNELS = 16;            // slots, of which only the nine OPL channels can sound
 export const QUEUE_LEN = 8;
+
+/**
+ * What a request is worth in the eight-slot effects queue.
+ *
+ * The race can ask for a crash, a skid and four engine notes in the same frame, and the original driver
+ * simply answers "full" (al = 1 from ah=5) and forgets the request. The sounds the game asks for again and
+ * again (a skid, a bumped surface) can be lost without anybody noticing, but the ones it asks for once —
+ * a collision, a lap, a finish — cannot be replayed later. A full queue therefore makes room for anything
+ * strictly more valuable than the least valuable request already waiting, and refuses (play returns false)
+ * a request worth no more than everything queued, rather than evicting something better. Ties go to the
+ * request already waiting, so a burst of equal sounds cannot keep evicting itself.
+ *
+ * This is the queue order. Which *sounding* voice may be taken is a different question and has its own
+ * ranking below, because a queued request costs nothing to lose while a started one-shot is gone for good.
+ */
+const RANK_REPEATING = 0;              // 5 (skid), 0x12 (bumpy/sticky surface): asked for many times a second
+const RANK_ENGINE = 1;                 // 0x40 + car: continuous, but also asked for again on every rendered frame
+const RANK_ACTION = 2;                 // every other one-shot effect
+const RANK_CRITICAL = 3;               // 1/3 (respawn, collision), 2 (lap), 0x0A, 0x0F, 0x10 (round end, time up, finish)
+
+/**
+ * How badly a sound wants a queue slot; higher gets in first when the queue is full. Engines sit above
+ * the chatter because otherwise a few skids in one frame would keep a car silent, but below the one-shot
+ * effects: an engine that loses its slot is queued again by fn 7b46 a frame later, while an effect that
+ * loses its slot is never heard at all.
+ */
+function queueRank(sound: number): number {
+  if (sound >= 0x40) return RANK_ENGINE;
+  switch (sound) {
+    case 1: case 2: case 3: case 0x0A: case 0x0F: case 0x10: return RANK_CRITICAL;
+    case 5: case 0x12: return RANK_REPEATING;
+    default: return RANK_ACTION;
+  }
+}
+
+/**
+ * How much a *sounding* voice is worth keeping. This is not the queue order turned round: losing an
+ * engine costs one frame of drone (fn 7b46 asks for it again), while losing a one-shot costs the sound
+ * entirely. Engines are therefore the lowest rank, below the repeating chatter a one-shot may take.
+ */
+function voiceRank(sound: number): number {
+  if (sound >= 0x40) return 0;         // engine: cheapest to take
+  if (sound === 5 || sound === 0x12) return 1;      // repeating chatter
+  if (sound === 1 || sound === 2 || sound === 3
+    || sound === 0x0A || sound === 0x0F || sound === 0x10) return 3;
+  return 2;                            // every other one-shot
+}
+
+/**
+ * May a new sound take a voice that is already sounding? The rules, in one place:
+ *
+ *  - a one-shot effect may take an engine's channel, and a one-shot of higher rank may take a lesser
+ *    one-shot's (a crash may interrupt a bump; two crashes never interrupt each other). The engine is the
+ *    only voice the game asks for again within a frame (fn 7b46 runs on every rendered frame), so a stolen
+ *    engine is a few milliseconds of drone, while the crash is gone for ever otherwise;
+ *  - an engine may only take a repeating chatter voice (a skid). That way a run of skids cannot leave a car
+ *    silent for ever, without engines cutting through a crash or a lap chime;
+ *  - repeating chatter takes nothing, and ties never preempt: three skids in a frame cannot cascade.
+ *
+ * Everything else waits in the queue for a channel to free, rather than interrupting an equal or a
+ * more valuable one-shot.
+ */
+function canPreempt(incoming: number, victim: number): boolean {
+  if (incoming >= 0x40) return victim === 5 || victim === 0x12;
+  const me = voiceRank(incoming);
+  if (me < 2) return false;                                      // chatter takes nothing
+  if (victim >= 0x40) return true;                               // a one-shot may take an engine
+  return voiceRank(victim) < me;
+}
 
 /** One of the sixteen 0x16-byte channel records at 0x1271. */
 interface Slot {
@@ -169,13 +250,38 @@ export class SoundDriver {
     return true;
   }
 
-  /** fn 06c8 (ah=5) and fn 06c3 (ah=8): put a sound number in one of the two eight-slot queues. */
+  /**
+   * fn 06c8 (ah=5) and fn 06c3 (ah=8): put a sound number in one of the two eight-slot queues.
+   *
+   * A full queue used to mean the request was thrown away, which loses a crash or a lap chime for good;
+   * instead the least valuable waiting request makes room, and a request worth no more than everything
+   * already waiting is refused (false) so the caller can decide what to do. Engines are one per car: the
+   * second request for the same engine note is satisfied by the one already queued (true, no new entry).
+   */
   play(sound: number, music = false): boolean {
     const queue = music ? this.music : this.effects;
     if (sound >= 0x40 && queue.includes(sound)) return true;   // one engine note per car at a time
     const free = queue.indexOf(0);
-    if (free < 0) return false;
-    queue[free] = sound;
+    if (free >= 0) { queue[free] = sound; return true; }
+    return this.enqueueByPriority(queue, sound);
+  }
+
+  /**
+   * A full queue: overwrite the least valuable request when this one ranks above it. Ties go to the one
+   * already waiting, so a run of equal-value requests (three skids in one frame) cannot keep evicting
+   * itself; sound for sound the queue stays in request order, which is what runQueue plays.
+   */
+  private enqueueByPriority(queue: Uint8Array, sound: number): boolean {
+    const mine = queueRank(sound);
+    let victim = -1, worst = Infinity;
+    for (let i = 0; i < queue.length; i++) {
+      const s = queue[i]!;
+      if (s === 0) continue;
+      const rank = queueRank(s);
+      if (rank < worst) { worst = rank; victim = i; }
+    }
+    if (victim < 0 || mine <= worst) return false;
+    queue[victim] = sound;
     return true;
   }
 
@@ -192,26 +298,46 @@ export class SoundDriver {
     return this.slots.some(s => s.state !== 0 && s.sound === sound);
   }
 
-  /** fn 0804 (ah=6) and fn 0841 (ah=7): both take effect on the next tick, as in the driver. */
+  /**
+   * fn 0804 (ah=6) and fn 0841 (ah=7): both take effect on the next tick, as in the driver.
+   *
+   * `stopAll` clears both queues and shuts every voice up. `stopVoices` keeps the queues, as ah=7 says, but
+   * it must stop **every** voice, not only the song's own tracks: a crash, a skid or an engine that was
+   * sounding when the game paused would otherwise stay keyed on, which is the drone heard after a pause or
+   * a dropped connection, and the stale engine voice makes fn 7b46 think that car is already playing, so
+   * the engine never comes back.
+   */
   stopAll(): void { this.stopEverything = true; }
   stopVoices(): void { this.stopChannels = true; }
 
-  /** fn 021a: one tick of the sequencer, called at 70.086 Hz by the game's int 8 handler. */
-  tick(): void {
+  /**
+   * Apply a pending ah=6 / ah=7 request now, without waiting for a sequencer tick.
+   *
+   * The driver deferred them to the next tick because int 8 was the only thing that could write the chip.
+   * Here the audio callback interleaves ticks and samples, and a tick is ~14 ms of chips samples; a stop
+   * that waited for the next one is up to a tick late. `SoundOutput` calls this at the top of every
+   * sample, so a stop requested between two ticks lands on the very next sample rather than on the tick
+   * after that. Called twice in a row it does nothing the second time.
+   */
+  flushStops(): void {
     if (this.stopEverything) {
       this.effects.fill(0);
-      this.silence();
-      for (const s of this.slots) { s.state = 0; s.sound = 0; }
-      this.stopEverything = false; this.data[CURRENT_SONG] = 0;
+      this.music.fill(0);                                    // fn 0804: both request queues go
+      this.shutUp();                                         // key-off, then the silence list through fn 019d
+      this.stopEverything = false; this.stopChannels = false;   // ah=6 subsumes a pending ah=7
+      this.data[CURRENT_SONG] = 0;
+      return;
     }
-    if (this.stopChannels) {                                 // fn 084a: only the song's own tracks
-      const tracks = this.word(TRACK_COUNT);
-      for (let i = 0; i < Math.min(tracks, CHANNELS); i++) {
-        const s = this.slots[i]!;
-        this.keyOff(s); s.state = 0; s.sound = 0;
-      }
+    if (this.stopChannels) {                                 // fn 084a: every voice, but the queues stay
+      this.dropEngineRequests();                             // an engine is only worth keeping if it is asked for again
+      this.shutUp();
       this.stopChannels = false; this.data[CURRENT_SONG] = 0;
     }
+  }
+
+  /** fn 021a: one tick of the sequencer, called at 70.086 Hz by the game's int 8 handler. */
+  tick(): void {
+    this.flushStops();
     this.startSong();
     this.runQueue(this.music);
     this.runQueue(this.effects);
@@ -220,6 +346,25 @@ export class SoundDriver {
     const musicTicks = this.musicAccum >>> 16, effectTicks = this.effectAccum >>> 16;
     this.musicAccum &= 0xFFFF; this.effectAccum &= 0xFFFF;
     for (const s of this.slots) this.advance(s, s.state === 2 ? effectTicks : musicTicks);
+  }
+
+  /**
+   * Key every sounding voice off and push the silence list to the chip. The key-offs have to come first:
+   * the list forces every operator's release rate to 0xff, but an operator whose gate is still on sits in
+   * its sustain stage where the release rate is not consulted, so a forced release alone would leave a
+   * sustained note ringing until the next instrument load. Used by both stop functions.
+   */
+  private shutUp(): void {
+    for (const s of this.slots) {
+      this.keyOff(s);
+      s.state = 0; s.sound = 0;
+    }
+    this.silence();
+  }
+
+  /** Drop queued engine notes: fn 7b46 queues them again on the next rendered frame if still wanted. */
+  private dropEngineRequests(): void {
+    for (let i = 0; i < this.effects.length; i++) if (this.effects[i]! >= 0x40) this.effects[i] = 0;
   }
 
   /** fn 0606: start the song ah=4 asked for, one slot per track. */
@@ -258,30 +403,71 @@ export class SoundDriver {
   /**
    * fn 7b46's half of the engine note: the pitch goes into the 0x95 command of that car's record and the
    * command after it decides whether the little sequence loops on or ends.
+   *
+   * `running` true re-queues the note whenever it is not on a channel, which is what makes a car audible
+   * again after its voice was taken by a louder effect: fn 7b46 runs on every rendered frame, so the
+   * request comes back within milliseconds, and the priority queue in `play` keeps it from being crowded
+   * out by a run of skids. `running` false takes a request that has not reached a channel yet back out of
+   * the queue (otherwise it would key a note on for one loop before its 0x91 ended it) and lets the
+   * playing voice reach that 0x91, which is how the driver ends an engine.
    */
   engine(car: number, pitch: number, running: boolean): void {
     const at = ENGINE_RECORDS + car * ENGINE_LEN;
     this.data[at + 0x0A] = pitch & 0xFF;
     this.data[at + 0x0C] = running ? 0x98 : 0x91;
-    if (running && !this.isPlaying(0x40 + car)) this.play(0x40 + car);
+    const sound = 0x40 + car;
+    if (!running) {
+      const queued = this.effects.indexOf(sound);
+      if (queued >= 0) this.effects[queued] = 0;
+      return;
+    }
+    if (!this.isPlaying(sound)) this.play(sound);
   }
 
-  /** fn 0704 / 089e: start everything the queue asked for, then empty it. */
+  /**
+   * fn 0704 / 089e: start everything the queue asked for, then empty it.
+   *
+   * In request order, as the original has it: the queue is already ordered by what got in, and playing the
+   * effects in the order the game asked for them is what the capture of the real driver sees. A one-shot
+   * that finds no voice is dropped, as in the original: it is an event, and playing it late would be worse
+   * than not playing it. An engine note is different — it is a continuous sound whose whole point is to
+   * keep going — so it stays in the queue and is retried on the following ticks until a channel frees.
+   * That is how a car gets its engine back after a crash took the voice, without fn 7b46 having to notice
+   * anything; the tick after a one-shot ends the engine starts, and if it is still wanted fn 7b46 queues
+   * it again anyway.
+   */
   private runQueue(queue: Uint8Array): void {
     for (let i = 0; i < queue.length; i++) {
       const sound = queue[i]!;
       if (sound === 0) continue;
+      if (this.start(sound)) { queue[i] = 0; continue; }
+      if (sound >= 0x40) continue;                         // an engine waits for a voice
       queue[i] = 0;
-      if (!this.start(sound)) return;                      // 071a: nothing free, the rest waits
+      return;                                              // 071a: a one-shot that cannot start is lost, the rest wait
     }
   }
 
-  /** fn 0722: find a free slot and point it at the sequence. */
+  /**
+   * fn 0722: find a free slot and point it at the sequence.
+   *
+   * The original gives up as soon as the sixteen slots or the nine OPL channels are all in use, and the
+   * request is lost. With the race's engines and effects arriving together that drops exactly the sounds
+   * that matter, so a request that outranks a sounding effect takes that effect's voice (see
+   * `canPreempt`). Song tracks are never taken: the music is the one thing an effect must not cut through,
+   * and `victimFor` only ever returns effect voices.
+   */
   private start(sound: number): boolean {
-    const slot = this.slots.find(s => s.state === 0);
-    if (!slot) return false;
-    const chan = this.freeChannel();
-    if (chan === undefined) return false;
+    let slot = this.slots.find(s => s.state === 0);
+    let chan = this.freeChannel();
+    if (!slot || chan === undefined) {
+      // No free slot or no free OPL channel: take whichever is short from the least valuable effect
+      // `sound` outranks. Its channel and its slot both come free with the same call.
+      const victim = this.victimFor(sound);
+      if (!victim) return false;
+      if (chan === undefined) chan = victim.chan;
+      if (!slot) slot = victim;
+      this.stopSlot(victim);
+    }
     slot.chan = chan;
     slot.sound = sound;
     slot.ops = this.word(CHANNEL_OPS + chan * 2);
@@ -299,6 +485,28 @@ export class SoundDriver {
       if (!this.slots.some(s => s.state !== 0 && s.chan === chan)) return chan;
     }
     return undefined;
+  }
+
+  /**
+   * The least valuable sounding effect `sound` is allowed to take, or undefined when it may take none.
+   * Only effect voices (state 2) are candidates; a song track is never interrupted. Engine notes lose
+   * first, repeating chatter next, one-shots after that, and the calls the game makes once (a crash, a
+   * lap) last of all.
+   */
+  private victimFor(sound: number): Slot | undefined {
+    let victim: Slot | undefined, worst = Infinity;
+    for (const s of this.slots) {
+      if (s.state !== 2 || !canPreempt(sound, s.sound)) continue;
+      const rank = voiceRank(s.sound);
+      if (rank < worst) { worst = rank; victim = s; }
+    }
+    return victim;
+  }
+
+  /** Take a voice off the chip now: key it off and free its slot. Its channel is free for its successor. */
+  private stopSlot(s: Slot): void {
+    this.keyOff(s);
+    s.state = 0; s.sound = 0;
   }
 
   /** fn 0759: sounds below 0x40 come from the bank, the rest are the engine records at driver:0008. */

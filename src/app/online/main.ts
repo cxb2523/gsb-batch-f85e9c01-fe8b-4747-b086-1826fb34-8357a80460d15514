@@ -406,8 +406,11 @@ function runLeg(wire: NetTransport, files: RaceFiles, deal: Deal, mine: number, 
       const packet = outbox.packet(gen);
       if (packet) wire.send(packet);
       if (sound) {
-        // The ah=5, ah=8 and ah=0a calls the race made, exactly as the single player page drains them.
+        // The ah=5, ah=6, ah=7, ah=8 and ah=0a calls the race made, exactly as the single player page
+        // drains them: ah=6/7 are stop requests the pause records, not sounds to play.
         for (const { fn, arg } of r.sounds) {
+          if (fn === 6) { sound.stopAll(); continue; }
+          if (fn === 7) { sound.stopVoices(); continue; }
           if (fn === 8) { sound.play(arg, true); continue; }
           if (fn === 0x0A && sound.isPlaying(arg)) continue;
           sound.play(arg);
