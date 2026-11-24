@@ -2,8 +2,12 @@
 'use strict';
 
 const Sound = (() => {
-  let ac = null, master, sfxBus, bgmBus, musicGain, duck;
+  let ac = null, master, sfxBus, bgmBus, loopBus = null, musicGain, duck;
   let unlocked = false, want = null, theme = null, timer = 0, step = 0, nextT = 0;
+  // 배경음 상태 사슬: want(무엇을 틀어야 하는가) → resolve(어떤 음원인가) → stage(지금 나는 소리)
+  // stage 는 'none' | 'synth'(합성 루프) | 'file'(파일 플레이어) 중 하나만 된다.
+  let stage = 'none', reqSeq = 0, pending = false, bgmEnabled = null;
+  const loopNodes = new Set();   // 합성 루프가 예약한 소리들 (끌 때 함께 멈춘다)
   const lastPlay = {};
   const set = () => (typeof Game !== 'undefined' && Game.save && Game.save.settings) || {};
   const mtof = m => 440 * Math.pow(2, (m - 69) / 12);
@@ -15,7 +19,10 @@ const Sound = (() => {
       sfxBus = ac.createGain(); sfxBus.connect(master);
       duck = ac.createGain(); duck.connect(master);   // 짧은 곡(팡파르)이 나오는 동안 배경음을 줄인다
       bgmBus = ac.createGain(); bgmBus.connect(duck);
+      loopBus = ac.createGain(); loopBus.gain.value = 1; loopBus.connect(bgmBus);   // 합성 루프 전용 (끌 때 한 번에 0으로)
       musicGain = ac.createGain(); musicGain.connect(duck);
+      // 지금 설정을 '이미 반영된 상태'로 먼저 맞춘다 — refresh()가 만들자마자 request()를 다시 걸지 않게
+      bgmEnabled = set().bgm !== false;
       refresh();
     }
     if (ac.state === 'suspended' && !document.hidden) ac.resume();
@@ -25,28 +32,43 @@ const Sound = (() => {
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
       if (ac && ac.state === 'running') ac.suspend().catch(() => {});
-      if (player && player.el && !player.el.paused) player.el.pause();
+      if (stage === 'file' && player && player.el && !player.el.paused) player.el.pause();
     } else {
       if (ac && ac.state === 'suspended') ac.resume().catch(() => {});
-      if (player && player.el && player.el.paused && unlocked && set().bgm !== false) player.el.play().catch(() => {});
+      if (stage === 'file' && player && player.el && player.el.paused && unlocked && bgmOn()) player.el.play().catch(() => {});
+      else if (unlocked && want && stage === 'none' && !pending) request(want);   // 합성 루프가 비어 있으면 되살린다
     }
   });
-  // 설정의 켜기/끄기와 음량을 반영
+  // 설정의 켜기/끄기와 음량을 반영 (음원을 새로 만들지 않고, 지금 나는 소리의 음량만 맞춘다)
   function refresh() {
     const s = set();
-    const mv = s.bgm === false ? 0 : (s.bgmVol ?? 40) / 100 * 0.8 * trackVol(fileKey);
+    const on = s.bgm !== false;
+    const mv = on ? (s.bgmVol ?? 40) / 100 * 0.8 * trackVol(fileKey) : 0;
     if (musicGain) musicGain.gain.value = mv;
-    if (player && player.el) { player.el.volume = Math.min(1, mv); if (s.bgm === false) player.el.pause(); else if (unlocked && player.el.paused && !document.hidden) player.el.play().catch(() => {}); }
-    if (s.bgm === false && player && player.src) stopFile(true);
-    else if (s.bgm !== false && !player && fileUrl && unlocked) playFile(fileUrl, fileKey);
+    if (stage === 'file' && player && player.el) { player.el.volume = Math.min(1, mv); if (!on) player.el.pause(); else if (unlocked && player.el.paused && !document.hidden) player.el.play().catch(() => {}); }
     if (ac) {
       sfxBus.gain.value = s.sfx === false ? 0 : (s.sfxVol ?? 60) / 100 * 0.5;
-      bgmBus.gain.value = s.bgm === false ? 0 : (s.bgmVol ?? 40) / 100 * 0.22;
+      bgmBus.gain.value = on ? (s.bgmVol ?? 40) / 100 * 0.22 : 0;
     }
-    if (s.bgm === false) stopLoop(); else if (unlocked && want && !timer) startLoop();
+    // 켜짐 → 꺼짐: 두 음원 모두 즉시 정지·해제. 꺼짐 → 켜짐: 지금 장소의 곡을 다시 푼다.
+    // (음량만 바뀐 경우에는 여기서 아무것도 하지 않는다)
+    if (on !== bgmEnabled) {
+      bgmEnabled = on;
+      if (!on) { previewing = false; silence(); }   // 미리 듣기도 함께 끝낸다
+      else if (unlocked && want) request(want);     // 다시 켜면 현재 장소의 곡으로 복귀
+    }
   }
+  // 지금 배경음이 나야 하는 상태인지 (설정을 껐으면 refresh()가 bgmEnabled 를 false 로 바꾼다)
+  const bgmOn = () => (bgmEnabled === null ? set().bgm !== false : bgmEnabled);
 
   // ── 합성 도구 ──
+  // 합성 루프가 예약한 소리를 담는다. 그 소리가 끝나면(onended) 딸린 노드들을 함께 버퍼에서 지운다.
+  // loopNodes 는 배경음을 끌 때 "지금 살아 있는 합성 소리"를 한 번에 멈추는 목록이다.
+  function trackLoop(src, nodes) {
+    if (!src) return;
+    for (const n of nodes) loopNodes.add(n);
+    src.onended = () => { for (const n of nodes) loopNodes.delete(n); };
+  }
   function tone(freq, dur, o = {}) {
     const t = ac.currentTime + (o.at || 0);
     const osc = ac.createOscillator(), g = ac.createGain();
@@ -59,6 +81,7 @@ const Sound = (() => {
     g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
     osc.connect(g); g.connect(o.dest || sfxBus);
     osc.start(t); osc.stop(t + dur + 0.02);
+    if (o.loop) trackLoop(osc, [osc, g]);
   }
   let noiseBuf = null;
   function noise(dur, o = {}) {
@@ -77,6 +100,7 @@ const Sound = (() => {
     g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
     src.connect(f); f.connect(g); g.connect(o.dest || sfxBus);
     src.start(t); src.stop(t + dur + 0.02);
+    if (o.loop) trackLoop(src, [src, f, g]);
   }
   const arp = (notes, gap, o = {}) => notes.forEach((m, i) => tone(mtof(m), o.len || gap * 1.4, { ...o, at: (o.at || 0) + i * gap }));
 
@@ -150,17 +174,18 @@ const Sound = (() => {
     const bar = Math.floor(i / 16) % 4, beat = i % 16, ch = th.prog[bar];
     const len = 60 / th.bpm / 4;
     const at = t - ac.currentTime;
+    const out = { dest: loopBus, loop: true };
     // 베이스
-    if (beat % 4 === 0) tone(mtof(th.deg(ch, -1)), len * (beat % 8 === 0 ? 3.5 : 1.8), { type: th.bass, vol: 0.5, at, dest: bgmBus });
+    if (beat % 4 === 0) tone(mtof(th.deg(ch, -1)), len * (beat % 8 === 0 ? 3.5 : 1.8), { ...out, type: th.bass, vol: 0.5, at });
     // 화음 아르페지오 (작게)
-    if (beat % 2 === 0) tone(mtof(th.deg(ch + [0, 2, 4, 2][(beat / 2) % 4])), len * 1.6, { type: 'triangle', vol: 0.13, at, dest: bgmBus });
+    if (beat % 2 === 0) tone(mtof(th.deg(ch + [0, 2, 4, 2][(beat / 2) % 4])), len * 1.6, { ...out, type: 'triangle', vol: 0.13, at });
     // 멜로디
     const m = th.mel[i % 64];
-    if (m) tone(mtof(m), len * 1.8, { type: th.wave, vol: 0.14, at, dest: bgmBus });
+    if (m) tone(mtof(m), len * 1.8, { ...out, type: th.wave, vol: 0.14, at });
     // 리듬
     if (th.drums) {
-      if (beat % 8 === 4) noise(0.07, { freq: 1500, vol: 0.18, at, dest: bgmBus });
-      if (beat % 2 === 0) noise(0.02, { filter: 'highpass', freq: 7000, vol: 0.05, at, dest: bgmBus });
+      if (beat % 8 === 4) noise(0.07, { ...out, freq: 1500, vol: 0.18, at });
+      if (beat % 2 === 0) noise(0.02, { ...out, filter: 'highpass', freq: 7000, vol: 0.05, at });
     }
   }
   function tick() {
@@ -170,22 +195,35 @@ const Sound = (() => {
       nextT += 60 / theme.bpm / 4; step = (step + 1) % 64;
     }
   }
-  function startLoop() {
-    // 음악 파일을 틀고 있거나 불러오는 중이면 합성 배경음은 켜지 않는다 (둘이 겹쳐 들리지 않게)
-    if (!want || fileUrl || !ctx() || set().bgm === false) return;
-    if (!theme || theme.key !== want.key) { theme = makeTheme(want.key, want.o); step = 0; }
+  // 합성 루프가 예약해 둔 소리를 모두 멈추고 버퍼에서 떼어 낸다
+  function killLoopNodes() {
+    if (!loopNodes.size) return;
+    for (const n of [...loopNodes]) {
+      try { if (n.stop) n.stop(); } catch (e) { /* 이미 멈춤 */ }
+      try { n.disconnect(); } catch (e) { /* 이미 끊김 */ }
+    }
+    loopNodes.clear();
+  }
+  function startLoop(th) {
+    if (!ctx()) return;
+    if (!th) return;
+    theme = th; step = 0;
     nextT = ac.currentTime + 0.1;
+    if (loopBus) loopBus.gain.value = 1;
     clearInterval(timer); timer = setInterval(tick, 40);
   }
-  function stopLoop() { clearInterval(timer); timer = 0; }
+  function stopLoop() {
+    clearInterval(timer); timer = 0;
+    theme = null; step = 0; nextT = 0;
+    killLoopNodes();
+  }
 
   // ── 음악 파일: music/ 폴더의 파일이나 정보 탭에서 불러온 파일이 있으면 합성 배경음 대신 그 파일을 반복 재생 ──
   // 파일 이름: town, boss, dungeon(던전 공통), 던전 ID (예: music/forest.ogg). 확장자 ogg / mp3 / m4a / wav
   const EXTS = ['mp3', 'ogg', 'm4a', 'wav'];
   const found = {};          // 파일 키 → URL 또는 null (한 번 찾으면 기억)
   let uploadedKeys = new Set();
-  let fileUrl = null, fileKey = null, player = null, seq = 0, previewing = false;
-  let playTok = 0;   // 재생 요청 번호: 불러오는 사이에 새 요청이나 정지가 있으면 옛 요청은 소리를 내지 않는다
+  let fileUrl = null, fileKey = null, player = null, previewing = false;
   // 불러온 파일은 용량이 커서 IndexedDB에 저장한다
   const IDB = {
     db: null,
@@ -209,7 +247,16 @@ const Sound = (() => {
     del(k) { return this.op('readwrite', st => st.delete(k)); },
     keys() { return this.op('readonly', st => st.getAllKeys()); },
   };
-  IDB.keys().then(k => { uploadedKeys = new Set(k || []); });
+  // 업로드 목록은 비동기로 읽는다. 그 전에 "파일 없음"으로 기억해 둔 키가 있으면, 목록이 도착한 뒤 지운다
+  // (업로드한 곡이 합성 배경음으로 나던 문제 방지). 지금 그 키로 소리가 나고 있으면 다시 푼다.
+  IDB.keys().then(k => {
+    uploadedKeys = new Set(k || []);
+    for (const key of Object.keys(found)) {
+      if (!uploadedKeys.has(key) || found[key]) continue;
+      delete found[key];   // 목록을 읽기 전에 "없음"으로 기억했던 업로드 곡
+      const w = want; if (w && !previewing && candidates(w).includes(key)) request(w);
+    }
+  });
   // 소리가 날 수 있는 파일인지 확인
   function tryAudio(src) {
     return new Promise(res => {
@@ -285,80 +332,147 @@ const Sound = (() => {
     if (url) urlKey[url] = key;
     return url;
   }
+  // 업로드한 곡이 바뀌면(불러오기·삭제) 그 키의 기억을 지우고, 붙잡고 있던 blob URL도 놓아 준다
+  function forgetFile(key) {
+    delete found[key];
+    for (const u of Object.keys(urlKey)) {
+      if (urlKey[u] !== key) continue;
+      delete urlKey[u]; bufCache.delete(u);
+      if (u.startsWith('blob:')) URL.revokeObjectURL(u);
+    }
+  }
   const urlKey = {};
   const fileKeyOf = url => urlKey[url] || null;
-  // keep: 곡 정보는 남겨 두고 소리만 멈춘다 (배경음을 끈 경우)
-  function stopFile(keep) {
-    playTok++;
+  // 파일 소리를 멈추고 해제한다 (곡 정보도 함께 비운다). 요청 번호(reqSeq)는 건드리지 않는다.
+  function stopFile() {
     if (player) {
-      if (player.src) { try { player.src.stop(); } catch (e) { /* 이미 멈춤 */ } }
-      if (player.el) { player.el.pause(); clearInterval(player.timer); }
+      if (player.src) { try { player.src.stop(); } catch (e) { /* 이미 멈춤 */ } try { player.src.disconnect(); } catch (e) { /* 이미 끊김 */ } }
+      if (player.el) { player.el.pause(); clearInterval(player.timer); try { player.el.removeAttribute('src'); player.el.load(); } catch (e) { /* 무시 */ } }
       player = null;
     }
-    if (!keep) { fileUrl = null; fileKey = null; }
+    if (stage === 'file') stage = 'none';
+    fileUrl = null; fileKey = null;
   }
-  // 파일 재생: 가능하면 Web Audio로 정확히 루프, 안 되면(file:// 로 연 경우) audio 요소로 루프 지점에서 되감기
-  async function playFile(url, key, offset = 0) {
-    stopFile();
-    fileUrl = url; fileKey = key;
-    if (!unlocked || set().bgm === false || !ctx()) return;   // 나중에 unlock/refresh에서 다시 시작
-    const my = seq, tok = ++playTok;
+  // 파일 하나를 끝까지 준비해서 소리를 낸다. tok(=요청 번호)이 바뀌었으면(새 요청·정지) 조용히 버린다.
+  // Web Audio로 정확히 루프, 안 되면(file:// 로 연 경우) audio 요소로 현재 곡의 루프 지점에서 되감기
+  async function playFile(url, key, tok, offset = 0) {
+    if (!unlocked || !bgmOn() || !ctx()) return false;   // 나중에 unlock/refresh에서 다시 시작
+    const stale = () => tok !== reqSeq;
     if (canFetch(url)) {
       try {
         const { buf, tags } = await loadBuffer(url);
-        if (my !== seq || tok !== playTok || fileUrl !== url) return;
+        if (stale()) return false;
+        stopLoop();   // 혹시 남아 있으면 합성 루프를 끈다 (파일과 동시에 나지 않게)
+        stage = 'none';
         const L = loopFor(key, tags, buf.duration);
         const src = ac.createBufferSource();
         src.buffer = buf; src.loop = true;
         if (L) { src.loopStart = L.start; src.loopEnd = L.end; }
         src.connect(musicGain);
-        player = { src, loop: L, dur: buf.duration, tags };
+        player = { src, loop: L, dur: buf.duration, tags, key, url };
+        const me = player;
+        stage = 'file'; fileUrl = url; fileKey = key;
         refresh();
-        src.start(0, Math.min(offset, buf.duration - 0.05));
-        return;
+        // refresh() 가 그 사이에 음원을 껐을 수 있다 (배경음 끄기 등) → 그러면 이 소리는 내지 않는다
+        if (player !== me || stale() || !bgmOn()) { stopFile(); return false; }
+        src.start(0, Math.min(Math.max(0, offset), buf.duration - 0.05));
+        return true;
       } catch (e) { /* 디코딩 실패 → audio 요소로 */ }
     }
+    if (stale()) return false;
+    stopLoop(); stage = 'none';
     const el = new Audio(url);
-    player = { el, loop: null };
+    const p = { el, loop: null, key, url };
+    player = p;
+    stage = 'file'; fileUrl = url; fileKey = key;
     el.addEventListener('loadedmetadata', () => {
-      const L = loopFor(key, null, el.duration);
-      player && player.el === el && (player.loop = L, player.dur = el.duration);
+      if (player !== p) return;
+      const L = loopFor(key, null, el.duration);   // 항상 지금 곡의 루프 설정으로 (앞 곡의 구간을 물려받지 않는다)
+      p.loop = L; p.dur = el.duration;
       el.loop = !L;
       if (offset) el.currentTime = offset;
     }, { once: true });
-    el.addEventListener('ended', () => { if (player && player.el === el && player.loop) { el.currentTime = player.loop.start; el.play().catch(() => {}); } });
-    player.timer = setInterval(() => {
-      const L = player && player.el === el && player.loop;
+    el.addEventListener('ended', () => {
+      if (player !== p) return;
+      const L = p.loop;   // 되감기도 지금 곡의 loop 설정 기준
+      if (L) { el.currentTime = L.start; el.play().catch(() => {}); }
+    });
+    p.timer = setInterval(() => {
+      if (player !== p) { clearInterval(p.timer); return; }
+      const L = p.loop;
       if (L && el.currentTime >= L.end - 0.015) el.currentTime -= L.end - L.start;
     }, 10);
     refresh();
+    // refresh() 가 그 사이에 음원을 껐을 수 있다 → 그러면 재생하지 않는다
+    if (player !== p || stale() || !bgmOn()) { stopFile(); return false; }
     el.play().catch(() => {});
+    return true;
   }
 
+  // ── 배경음 상태 사슬 ──
+  // want: 지금 장소가 원하는 곡(후보 목록 포함). request(): 후보를 차례로 찾아 어떤 음원으로 낼지 정한다.
+  // request()는 곧바로 지금 소리를 멈추고(silence) 새 요청 번호를 낸다. 그 뒤 모든 await 에서 자기 번호가
+  // 아직 현재인지 확인하고, 아니면 조용히 버린다 — 빠른 전환에서 옛 곡이 새 곡 위에 올라가지 않는다.
+  // stage 는 언제나 'none' | 'synth' | 'file' 중 하나이고, 두 음원이 동시에 살아 있는 상태는 없다.
+  const candidates = w => (w && w.o && Array.isArray(w.o.files) && w.o.files.length ? w.o.files : [w.key]);
+  async function resolve(w, tok) {
+    pending = true;
+    const cur = () => tok === reqSeq;
+    const keys = [...new Set(candidates(w))];
+    let url = null, key = null;
+    for (const k of keys) { url = await findFile(k); if (!cur()) return; if (url) { key = k; break; } }
+    if (!cur()) return;
+    if (url) {
+      await playFile(url, key, tok);   // 성공하면 playFile 이 stage 를 'file' 로 바꾼다
+    } else {
+      stopFile();
+      if (unlocked && bgmOn() && ctx()) { stage = 'synth'; startLoop(makeTheme(w.key, w.o)); }
+    }
+    if (cur()) pending = false;
+  }
+  function request(w) {
+    if (previewing) previewing = false;   // 새 장소로 가면 미리 듣기는 끝난다
+    silence();               // 새 요청 번호를 내고 지금 나는 소리는 즉시 멈춘다
+    resolve(w, reqSeq);
+  }
+  // 지금 나는 소리를 모두 멈추고 해제한다. 요청 번호도 함께 올려, 아직 불러오는 중인 옛 요청을 모두 무효로 만든다.
+  function silence() {
+    ++reqSeq;
+    pending = false;
+    stopLoop(); stopFile();
+    stage = 'none';
+    if (loopBus) loopBus.gain.value = 0;
+  }
+  // 같은 곡을 이어서 트는지 판단할 때 쓰는 지문 (후보 목록까지 비교)
+  const sameWant = (a, b) => !!a && a.key === b.key && candidates(a).join('|') === candidates(b).join('|');
+
   // 장소별 배경음. 같은 곡이면 이어서 튼다. 음악 파일이 있으면 파일, 없으면 합성
-  async function bgm(key, o = {}) {
-    if (want && want.key === key) return;
-    want = { key, o };
-    const my = ++seq;
-    stopLoop();
-    let url = null;
-    for (const f of o.files || []) { url = await findFile(f); if (url) break; }
-    if (my !== seq) return;          // 그 사이에 다른 곡으로 바뀜
-    if (url) { stopLoop(); playFile(url, fileKeyOf(url)); return; }
-    stopFile();
-    if (unlocked) startLoop();
+  function bgm(key, o = {}) {
+    const next = { key, o };
+    if (sameWant(want, next)) {
+      want = next;
+      // 같은 곡인데 소리가 비었으면(아직 준비 중이거나 꺼져 있었다) 한 번 더 푼다
+      if (unlocked && bgmOn() && stage === 'none' && !pending) request(want);
+      return;
+    }
+    want = next;
+    if (!unlocked || !bgmOn()) { previewing = false; silence(); return; }
+    request(want);
   }
   async function importMusic(key, file) {
     if (!file || !/^audio\//.test(file.type) && !/\.(ogg|mp3|m4a|wav)$/i.test(file.name)) return false;
     const ok = await IDB.put(key, file);
     if (ok === null) return false;
-    uploadedKeys.add(key); delete found[key];
-    const w = want; want = null; if (w) bgm(w.key, w.o);   // 지금 곡에 바로 반영
+    uploadedKeys.add(key); forgetFile(key);
+    // 지금 장소가 이 곡을 후보로 쓰고 있으면 즉시 다시 푼다 (미리 듣기 중이면 끝난 뒤 반영)
+    if (want && !previewing && candidates(want).includes(key)) request(want);
     return true;
   }
   async function removeMusic(key) {
-    await IDB.del(key); uploadedKeys.delete(key); delete found[key];
-    const w = want; want = null; if (w) bgm(w.key, w.o);
+    await IDB.del(key); uploadedKeys.delete(key); forgetFile(key);
+    if (!want || previewing) return;
+    // 지금 그 파일로 나고 있었거나 후보에 들어 있던 곡이면 다시 푼다 → 다음 후보 파일, 없으면 합성
+    if (fileKey === key || candidates(want).includes(key)) request(want);
   }
   // 정보 탭의 루프 설정용: 파일 정보(길이, 파일 안의 루프, 지금 쓰는 루프)
   async function loopInfo(key) {
@@ -370,16 +484,29 @@ const Sound = (() => {
     const cfg = (window.MUSIC_LOOPS || {})[key];
     return { url, dur, tags, cfg: cfg ? { start: cfg[0], end: cfg[1] } : null, user: userLoops()[key] || null, use: loopFor(key, tags, dur), exact: canFetch(url) };
   }
-  // 루프 연결 부분 미리 듣기 (끝나기 3초 전부터)
+  // 루프 연결 부분 미리 듣기 (끝나기 3초 전부터). 끝나면 endPreview()가 원래 곡으로 돌려놓는다.
   async function previewLoop(key) {
+    const wantKey = want && want.key;
     const url = await findFile(key); if (!url) return false;
     const info = await loopInfo(key); if (!info || !info.use) return false;
-    previewing = true; ++seq; stopLoop();
-    await playFile(url, key, Math.max(info.use.start, info.use.end - 3));
-    return true;
+    if ((want && want.key) !== wantKey) return false;   // 준비하는 사이에 장소가 바뀌었으면 미리 듣기는 시작하지 않는다
+    previewing = true;
+    silence();   // 새 요청 번호: 미리 듣는 동안 도착하는 옛 배경음 요청은 모두 버려진다
+    const ok = await playFile(url, key, reqSeq, Math.max(info.use.start, info.use.end - 3));
+    if (!ok && previewing) endPreview();   // 미리 들을 수 없으면 원래 곡으로
+    return ok;
   }
-  function endPreview() { if (!previewing) return; previewing = false; stopFile(); const w = want; want = null; if (w) bgm(w.key, w.o); }
-  function setLoop(key, v) { setUserLoop(key, v); if (fileKey === key && !previewing) { const w = want; want = null; if (w) bgm(w.key, w.o); } }
+  function endPreview() {
+    if (!previewing) return;
+    previewing = false;
+    if (want && unlocked && bgmOn()) request(want);   // 미리 듣기 전의 곡으로 되돌린다
+    else silence();
+  }
+  function setLoop(key, v) {
+    setUserLoop(key, v);
+    // 지금 이 곡이 나고 있으면 새 루프 구간으로 바로 다시 건다
+    if (!previewing && fileKey === key && unlocked && bgmOn() && want) request(want);
+  }
 
   const MOODS = { burned: 'phryg', whirl: 'dorian', seafloor: 'minor', ruins: 'phryg', shrine: 'minor', altar: 'lydian', coronet: 'dorian', spiral: 'minor', areazero: 'lydian', crystal: 'lydian', swamp: 'dorian', volcano: 'phryg', desert: 'phryg', frost: 'minor', storm: 'minor', dark: 'minor', mine: 'dorian',
     canyon: 'phryg', summit: 'lydian', trial: 'dorian', twilight: 'minor', mystery: 'dorian', eternal: 'phryg', daily: 'dorian' };
@@ -392,15 +519,18 @@ const Sound = (() => {
   const dungeon = dg => bgm('dg:' + dg.id + (dg.daily ? dg.seed : ''), { mode: MOODS[dg.id] || 'major', files: dg.daily ? dailyFiles(dg.seed >>> 0) : [dg.id, ...((window.MUSIC_ALIAS || {})[dg.id] ? [window.MUSIC_ALIAS[dg.id]] : []), 'dungeon'] });
   // 특별한 순간의 곡 (수배범·도둑질·몬스터하우스·이야기): 파일이 있을 때만 틀고, 없으면 fallback (합성 배경음으로 바꾸지 않는다)
   async function special(key, fallback) {
+    const wasKey = want && want.key;
     const url = await findFile(key);
+    if ((want && want.key) !== wasKey) return;   // 찾는 사이에 장소가 바뀌었으면 옛 판단은 버린다
     if (url) bgm('sp:' + key, { files: [key] }); else if (fallback) fallback();
   }
   // 이야기 장면 동안만 잠깐 다른 곡: 끝나면 원래 곡으로 (그 사이에 다른 곡으로 바뀌었으면 그대로 둔다)
   async function scene(key) {
-    const prev = want, url = key && await findFile(key);
-    if (!url || (want && want.key === 'sp:' + key)) return () => {};
+    const prev = want, prevKey = prev && prev.key;
+    const url = key && await findFile(key);
+    if (!url || (want && want.key) !== prevKey || (want && want.key === 'sp:' + key)) return () => {};
     bgm('sp:' + key, { files: [key] });
-    return () => { if (want && want.key === 'sp:' + key && prev) { want = null; bgm(prev.key, prev.o); } };
+    return () => { if (want && want.key === 'sp:' + key && prev) bgm(prev.key, prev.o); };
   }
   // 팡파르: 짧은 곡을 한 번 (승급·보상 등). 그동안 배경음을 줄였다가 끝나면 다시. 파일이 없거나 배경음을 껐으면 합성 효과음(sfx)
   const fanCache = new Map();
@@ -429,10 +559,9 @@ const Sound = (() => {
     if (!ctx()) return;
     unlocked = true;
     refresh();
-    if (fileUrl) playFile(fileUrl, fileKey);
-    else if (want) startLoop();
+    if (want && bgmOn() && stage === 'none' && !pending) request(want);   // 첫 곡은 잠금이 풀린 뒤 시작
   }
   ['pointerdown', 'keydown'].forEach(ev => window.addEventListener(ev, unlock, { capture: true }));
 
-  return { play, bgm, title, town, dungeon, boss, special, scene, fanfare, refresh, importMusic, removeMusic, loopInfo, previewLoop, endPreview, setLoop, get uploaded() { return uploadedKeys; }, get playingFile() { return fileUrl; }, get player() { return player; } };
+  return { play, bgm, title, town, dungeon, boss, special, scene, fanfare, refresh, importMusic, removeMusic, loopInfo, previewLoop, endPreview, setLoop, get uploaded() { return uploadedKeys; }, get playingFile() { return fileUrl; }, get player() { return player; }, get state() { return { stage, previewing, want: want && want.key, fileKey, pending, enabled: bgmOn(), voices: loopNodes.size }; } };
 })();
