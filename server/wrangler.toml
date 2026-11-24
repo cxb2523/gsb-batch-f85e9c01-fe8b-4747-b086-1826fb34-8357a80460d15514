@@ -1,0 +1,24 @@
+name = "abyssal-infinite"
+main = "src/worker.js"
+compatibility_date = "2025-11-01"
+
+# Where the game lives: without the lines below, at https://abyssal-infinite.<your-subdomain>.workers.dev.
+# For a host of your own (its zone must be in the same Cloudflare account):
+# workers_dev = false
+# preview_urls = false
+# routes = [ { pattern = "sea.example.com", custom_domain = true } ]
+
+# the game itself: `npm run build` in ../source puts index.html here
+[assets]
+directory = "./public/"
+binding = "ASSETS"
+run_worker_first = [ "/ws", "/status" ]
+
+# the sea: one Durable Object (SQLite-backed: the only kind the free plan has; it stores nothing)
+[[durable_objects.bindings]]
+name = "SEA"
+class_name = "SeaObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = [ "SeaObject" ]

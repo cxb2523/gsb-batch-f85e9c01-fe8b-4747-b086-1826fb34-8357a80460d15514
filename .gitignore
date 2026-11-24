@@ -1,0 +1,11 @@
+node_modules/
+dev.html
+
+# the server's copy of the game: `npm run build` in source writes it
+server/public/
+
+# local tooling and secrets
+.wrangler/
+.dev.vars
+.env*
+*.log
