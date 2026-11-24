@@ -1541,7 +1541,7 @@ function observeArray(array, onAdd, onDel, equals)
                 {
                     if ('push' === method || 'unshift' === method)
                     {
-                        args = Array.prototype.map.apply(args, onAdd);
+                        args = Array.prototype.map.call(args, onAdd);
                     }
                     if ('splice' === method && 2 < args.length)
                     {
@@ -1643,7 +1643,7 @@ function observeArray(array, onAdd, onDel, equals)
             else
             {
                 index = array.$cb.indexOf(cb);
-                if (-1 !== index) array.$cb.push(cb);
+                if (-1 === index) array.$cb.push(cb);
             }
         }
     };

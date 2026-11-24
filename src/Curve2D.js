@@ -687,6 +687,7 @@ var CompositeCurve = makeClass(Curve2D, {
             _length = null,
             _bbox = null,
             _hull = null,
+            _disposed = false,
             onCurveChange,
             onArrayChange,
             curve_add,
@@ -705,6 +706,7 @@ var CompositeCurve = makeClass(Curve2D, {
             return c;
         };
         onCurveChange = function onCurveChange(curve) {
+            if (_disposed) return;
             if (is_array(_curves) && (-1 !== _curves.indexOf(curve)))
             {
                 //if (!self.isChanged())
@@ -716,6 +718,7 @@ var CompositeCurve = makeClass(Curve2D, {
         };
         onCurveChange.id = self.id;
         onArrayChange = function onArrayChange(changed) {
+            if (_disposed || !is_array(_curves)) return;
             //if (!self.isChanged())
             {
                 self.isChanged(true);
@@ -728,10 +731,10 @@ var CompositeCurve = makeClass(Curve2D, {
             get: function() {
                 if (null == _points)
                 {
-                    _points = _curves.reduce(function(points, curve) {
+                    _points = is_array(_curves) ? _curves.reduce(function(points, curve) {
                         points.push.apply(points, curve.points);
                         return points;
-                    }, []);
+                    }, []) : [];
                 }
                 return _points;
             },
@@ -776,7 +779,9 @@ var CompositeCurve = makeClass(Curve2D, {
                     else if (null == curves)
                     {
                         _curves = null;
-                        __curves = null;
+                        // clear all derived caches and notify listeners
+                        self.isChanged(true);
+                        self.triggerChange();
                     }
                 }
             },
@@ -787,8 +792,15 @@ var CompositeCurve = makeClass(Curve2D, {
             get: function() {
                 if (null == __curves)
                 {
-                    var matrix = self.matrix;
-                    __curves = self.curves.map(function(curve) {return curve.transform(matrix, true);});
+                    if (is_array(_curves))
+                    {
+                        var matrix = self.matrix;
+                        __curves = _curves.map(function(curve) {return curve.transform(matrix, true);});
+                    }
+                    else
+                    {
+                        __curves = [];
+                    }
                 }
                 return __curves;
             },
@@ -864,36 +876,41 @@ var CompositeCurve = makeClass(Curve2D, {
             }
             else if (false === isChanged)
             {
-                _curves.forEach(function(c) {c.isChanged(false);});
+                if (is_array(_curves)) _curves.forEach(function(c) {c.isChanged(false);});
             }
             return Object2D.prototype.isChanged.apply(self, arguments);
+        };
+        // instance-level dispose so the closure `_disposed` flag is reachable
+        self.dispose = function() {
+            if (_disposed) return;
+            _disposed = true;
+            if (is_array(_curves))
+            {
+                // unbind change listeners from all child curves and stop observing array
+                unobserveArray(_curves, curve_del);
+                _curves = null;
+                __curves = null;
+                _points = null;
+                _length = null;
+                _bbox = null;
+                _hull = null;
+            }
+            Object2D.prototype.dispose.call(self);
         };
         self.curves = curves;
     },
     name: 'CompositeCurve',
-    dispose: function() {
-        var self = this;
-        if (self.curves)
-        {
-            unobserveArray(self.curves, function(c) {
-                if (c instanceof Curve2D) c.onChange(self.id, false);
-                return c;
-            });
-            self.curves = null;
-            self.points = null;
-        }
-        Object2D.prototype.dispose.call(self);
-    },
     clone: function() {
-        return new CompositeCurve(this.curves.map(function(curve) {return curve.clone();}));
+        return new CompositeCurve((this.curves || []).map(function(curve) {return curve.clone();}));
     },
     transform: function(matrix, withSelfMatrix) {
-        var curves = true === withSelfMatrix ? this._curves : this.curves;
+        var curves = true === withSelfMatrix ? this._curves : (this.curves || []);
         return new CompositeCurve(curves.map(object_transform(matrix, withSelfMatrix)));
     },
     isConnected: function() {
-        var c = this.curves, c1, c2, p1, p2, n = c.length-1, i;
-        if (0 > n) return false;
+        var c = this.curves, c1, c2, p1, p2, n, i;
+        if (!is_array(c) || !c.length) return false;
+        n = c.length-1;
         if (!c[0].isConnected()) return false;
         for (i=0; i<n; ++i)
         {
@@ -907,7 +924,7 @@ var CompositeCurve = makeClass(Curve2D, {
     isClosed: function(isConnected) {
         var self = this;
         isConnected = true === isConnected || false === isConnected ? isConnected : self.isConnected();
-        if (!isConnected) return false;
+        if (!isConnected || !is_array(self.curves)) return false;
         var c = self.curves, n = c.length;
         if (!n) return false;
         if ((1 === n) && c[0].isClosed()) return true;
@@ -1080,10 +1097,10 @@ var CompositeCurve = makeClass(Curve2D, {
         }
     },
     toTex: function() {
-        return '\\text{CompositeCurve: }\\begin{cases}&'+this.curves.map(Tex).join('\\\\&')+'\\end{cases}';
+        return '\\text{CompositeCurve: }\\begin{cases}&'+(this.curves || []).map(Tex).join('\\\\&')+'\\end{cases}';
     },
     toString: function() {
-        return 'CompositeCurve('+"\n"+this.curves.map(Str).join("\n")+"\n"+')';
+        return 'CompositeCurve('+"\n"+(this.curves || []).map(Str).join("\n")+"\n"+')';
     }
 });
 Geometrize.CompositeCurve = CompositeCurve;
