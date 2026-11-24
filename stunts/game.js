@@ -70,6 +70,11 @@
       this.view = 'chase';
       this.mode = 'drive';
       this.replay = null;
+      // per-track state, reset by load()/restart() so nothing carries over from a previous track or race
+      this.model = null; this.collision = null; this.layout = null;
+      this.chase = null; this.chaseDir = null; this.tvCam = null; this.orbitA = 0; this.wheelMap = null;
+      this.rec = []; this.visited = new Set(); this.leftStart = false; this.warned = false;
+      this.penalty = 0; this.crashTimer = 0; this.safe = null;
       addEventListener('keydown', e => this.onKey(e, true));
       addEventListener('keyup', e => this.onKey(e, false));
       addEventListener('blur', () => this.keys.clear());
@@ -90,26 +95,79 @@
       if (k === 'KeyP' && this.mode === 'replay') this.replay.playing = !this.replay.playing;
       if (k === 'Escape') this.restart();
     }
+    // Load a track and car. Everything fetched from the network is awaited before the scene is touched,
+    // then the old track/horizon/collision/car are swapped for the new ones in one transaction: if any
+    // step fails, the previously loaded track (if any) is restored rather than left half replaced, and
+    // nothing is disposed until the new track has fully committed.
     async load(trackName, carId) {
+      // 1. all async work first; a fetch failure here changes nothing that is on screen
       const trk = await this.assets.loadTrack(trackName);
-      this.world.horizon = await this.assets.loadHorizon(trk.horizon);
-      this.layout = this.world.buildTrack(trk);
-      this.collision = buildCollision(this.assets, this.layout);
-      this.carData = await this.assets.loadCar(carId);
-      try { this.dash = await this.assets.loadDash(carId); } catch (e) { this.dash = null; }
-      if (this.model) this.world.scene.remove(this.model);
-      this.model = this.world.carModel(this.carData, 0);
-      this.wheelMap = null;
-      this.world.scene.add(this.model);
-      this.car = new P.Car(this.carData.spec, this.collision);
-      // track tiles for lap validation
-      this.roadTiles = new Set();
-      trk.items.forEach((row, r) => row.forEach((e, c) => { if (e && e < 0x97 || (e >= 0xB3 && e <= 0xC5)) this.roadTiles.add(c + ',' + r); }));
-      // TV cameras: beside every other track piece, raised above elevated road, offset to alternating sides
-      this.tvCams = this.layout.place.filter(p => p.kind === 'track').filter((_, i) => i % 2 === 0)
-        .map((p, i) => [p.x * S + (i & 1 ? 16 : -16), p.y * S + 9, -p.z * S + (i & 2 ? 16 : -16)]);
-      this.tvCam = null;
-      this.restart();
+      const horizon = await this.assets.loadHorizon(trk.horizon);
+      const carData = await this.assets.loadCar(carId);
+      let dash = null;
+      try { dash = await this.assets.loadDash(carId); } catch (e) { dash = null; }
+
+      // 2. snapshot the live state so a failure can put it back
+      const world = this.world, scene = world.scene;
+      const old = {
+        track: world.track, horizon: world.horizonMesh, model: this.model,
+        collision: this.collision, car: this.car, layout: this.layout, carData: this.carData,
+        dash: this.dash, roadTiles: this.roadTiles, tvCams: this.tvCams, background: scene.background,
+      };
+      let built = null, detached = null, newModel = null;
+      try {
+        world.horizon = horizon;
+        built = world.buildTrack(trk);                 // builds off-scene; old track still live
+        this.layout = built.layout;
+        this.collision = buildCollision(this.assets, this.layout);
+        newModel = world.carModel(carData, 0);          // build the new car before removing the old one
+
+        // 3. swap the scene contents (old objects detached, not yet disposed)
+        detached = world.installTrack(built);
+        if (old.model) scene.remove(old.model);
+        scene.add(newModel);
+
+        // 4. commit the game state
+        this.model = newModel;
+        this.carData = carData; this.dash = dash;
+        this.car = new P.Car(carData.spec, this.collision);
+        // track tiles for lap validation
+        this.roadTiles = new Set();
+        trk.items.forEach((row, r) => row.forEach((e, c) => { if (e && e < 0x97 || (e >= 0xB3 && e <= 0xC5)) this.roadTiles.add(c + ',' + r); }));
+        // TV cameras: beside every other track piece, raised above elevated road, offset to alternating sides
+        this.tvCams = this.layout.place.filter(p => p.kind === 'track').filter((_, i) => i % 2 === 0)
+          .map((p, i) => [p.x * S + (i & 1 ? 16 : -16), p.y * S + 9, -p.z * S + (i & 2 ? 16 : -16)]);
+        this.resetCamera();
+        this.restart();
+      } catch (e) {
+        if (detached) {
+          // the swap happened: take the half-built new track, horizon and car back out of the scene and
+          // free them, then re-attach every previous object exactly as it was.
+          if (built) { scene.remove(built.track, built.horizon); world.disposeObject(built.track); world.disposeObject(built.horizon); }
+          if (newModel && newModel !== old.model) { scene.remove(newModel); world.disposeObject(newModel); }
+          world.track = detached.track; world.horizonMesh = detached.horizon;
+          if (detached.track) scene.add(detached.track);
+          if (detached.horizon) scene.add(detached.horizon);
+          if (old.model && old.model.parent !== scene) scene.add(old.model);
+          scene.background = old.background;
+        } else {
+          // nothing was swapped: the previous scene is still live; just discard the off-scene new build
+          if (newModel && newModel !== old.model) world.disposeObject(newModel);
+          if (built) { world.disposeObject(built.track); world.disposeObject(built.horizon); }
+        }
+        this.model = old.model; this.collision = old.collision; this.car = old.car;
+        this.layout = old.layout; this.carData = old.carData; this.dash = old.dash;
+        this.roadTiles = old.roadTiles; this.tvCams = old.tvCams;
+        throw e;
+      }
+      // 5. success: the old track and car are gone for good, free their GPU resources
+      world.disposeTrack(detached);
+      world.disposeObject(old.model);
+    }
+    // Chase/TV/orbit camera state belongs to one race only; clear it on load and on restart so the new
+    // track never starts looking from the previous one's chase direction or TV spot.
+    resetCamera() {
+      this.chase = null; this.chaseDir = null; this.tvCam = null; this.orbitA = 0; this.wheelMap = null;
     }
     restart() {
       const st = this.layout.start || { x: 15360, y: 0, z: 15360, rot: 0 };
@@ -118,8 +176,11 @@
       this.car.reset(this.startPos, this.startYaw);
       this.safe = { pos: this.startPos.slice(), yaw: this.startYaw, t: 0 };
       this.time = 0; this.acc = 0; this.mode = 'countdown'; this.count = 3.2;
-      this.visited = new Set(); this.leftStart = false; this.crashTimer = 0;
-      this.rec = []; this.replay = null; this.penalty = 0;
+      // clean race: no replay, visited tiles, start-line state, penalties or crash timer from the last run
+      this.visited = new Set(); this.leftStart = false; this.warned = false;
+      this.crashTimer = 0; this.penalty = 0;
+      this.rec = []; this.replay = null;
+      this.resetCamera();
       this.hud.msg('');
     }
     recover() {

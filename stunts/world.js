@@ -22,6 +22,22 @@
       this.classic = true; this.hemi.visible = this.sun.visible = false;
     }
     material() { return this.classic ? this.flat : this.lit; }
+    // Release the GPU resources of a removed object. The lit/flat/line materials are shared by every
+    // track and car, so they are never disposed here; everything owned by the object (its geometry,
+    // textures and one-off materials) is.
+    disposeObject(o) {
+      if (!o) return;
+      const shared = new Set([this.lit, this.flat, this.lineMat]);
+      o.traverse(c => {
+        if (c.geometry) c.geometry.dispose();
+        const mats = c.material ? (Array.isArray(c.material) ? c.material : [c.material]) : [];
+        for (const m of mats) {
+          if (!m || shared.has(m)) continue;
+          for (const k of Object.keys(m)) { const v = m[k]; if (v && v.isTexture) v.dispose(); }
+          m.dispose();
+        }
+      });
+    }
     setClassic(on) {
       this.classic = on;
       this.scene.traverse(o => { if (o.isMesh && o.userData.stunts) o.material = this.material(); });
@@ -33,12 +49,14 @@
       if (geo.lines) grp.add(new THREE.LineSegments(geo.lines, this.lineMat));
       return grp;
     }
+    // Build the new track group and horizon without touching the scene. Nothing the caller is still
+    // rendering is removed or disposed here, so a later failure can leave the previous track in place.
+    // installTrack() performs the swap once the whole load has succeeded.
     buildTrack(trk) {
       const THREE = T();
-      if (this.track) this.scene.remove(this.track);
       const S = root.StuntsTrack.buildScene(this.A.tables, trk);
       this.layout = S;
-      const g = this.track = new THREE.Group();
+      const g = new THREE.Group();
       for (const p of S.place) {
         if (!this.A.shapes[p.shape]) continue;
         const o = this.meshFor(this.A.cached(p.shape, p.paint));
@@ -54,28 +72,44 @@
       ground.userData.ground = true;
       g.add(ground);
       g.scale.setScalar(this.scale);
-      this.scene.add(g);
+      const horizon = this.makeHorizon(H);
+      return { layout: S, track: g, horizon, sky: c3(H.sky) };
+    }
+    // Swap the built track into the scene, detaching the previous track group and horizon. The old
+    // objects are only detached here; their GPU resources are freed by disposeTrack() once the caller's
+    // whole load has committed, keeping rollback possible up to that point.
+    installTrack(built) {
+      const oldTrack = this.track, oldHorizon = this.horizonMesh;
+      if (oldTrack) this.scene.remove(oldTrack);
+      if (oldHorizon) this.scene.remove(oldHorizon);
+      this.track = built.track; this.horizonMesh = built.horizon;
+      this.scene.add(built.track, built.horizon);
       // flat sky colour, as the original fills above the horizon line
-      this.scene.background = c3(H.sky);
+      this.scene.background = built.sky;
       this.scene.fog = null;
-      this.buildHorizon(H);
-      return S;
+      return { track: oldTrack, horizon: oldHorizon };
+    }
+    // Free the GPU resources of a track detached by installTrack().
+    disposeTrack(old) {
+      if (!old) return;
+      this.disposeObject(old.track);
+      this.disposeObject(old.horizon);
     }
     // The horizon art as a band around the viewer at a fixed distance, so it never gets closer.
     // 1024 px = 360 degrees around; vertically a strip pixel is about 0.28 degrees, matching how tall the
-    // strip sits on the original 320x200 screen.
-    buildHorizon(H) {
+    // strip sits on the original 320x200 screen. Returns the mesh without adding it to the scene, so a
+    // failed build cannot leave the old horizon removed.
+    makeHorizon(H) {
       const THREE = T();
-      if (this.horizonMesh) this.scene.remove(this.horizonMesh);
       const c = document.createElement('canvas'); c.width = H.w; c.height = H.h; c.getContext('2d').putImageData(H.img, 0, 0);
       const tex = new THREE.CanvasTexture(c); tex.magFilter = THREE.NearestFilter; tex.minFilter = THREE.NearestFilter;
       tex.wrapS = THREE.RepeatWrapping;
       const R = 4000, h = R * Math.tan(H.h * 0.28 * Math.PI / 180);
       const geo = new THREE.CylinderGeometry(R, R, h, 256, 1, true);
       const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, alphaTest: 0.5, side: THREE.BackSide, depthWrite: false, fog: false });
-      const m = this.horizonMesh = new THREE.Mesh(geo, mat);
+      const m = new THREE.Mesh(geo, mat);
       m.renderOrder = -1; m.frustumCulled = false; m.userData.h = h;
-      this.scene.add(m);
+      return m;
     }
     followCamera(cam) {
       if (this.horizonMesh) this.horizonMesh.position.set(cam.position.x, this.horizonMesh.userData.h / 2 - 2, cam.position.z);
