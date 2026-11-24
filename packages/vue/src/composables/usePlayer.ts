@@ -7,7 +7,7 @@ import {
   exitFullscreen,
   getFullscreenElement,
 } from '@vue-player/core'
-import type { PlayerState, PlayerError, Track } from '@vue-player/core'
+import type { PlayerError, PlayerState, Track } from '@vue-player/core'
 
 export interface PlayerControls {
   play: () => Promise<void>
@@ -62,6 +62,19 @@ export function usePlayer(videoRef: Ref<HTMLVideoElement | null>) {
   let hlsInstance: any = null
   let lastSrc = ''
 
+  // ─── Session lifecycle ───
+  // Every loadSource() gets a unique, monotonically increasing id. All async
+  // work (dynamic hls.js import, MANIFEST_PARSED / LEVEL_SWITCHED / ERROR
+  // callbacks) captures its own id and only touches state while it is still the
+  // current session. A superseded session destroys its own Hls instance and
+  // never the instance that belongs to the newer session.
+  let activeSessionId = 0
+  const hlsBySession = new Map<number, any>()
+  let manifestParsed = false
+  // A concrete quality chosen before the manifest finished parsing; applied
+  // once MANIFEST_PARSED fires (with an auto fallback if it no longer exists).
+  let pendingQuality: number | null = null
+
   function clearVideo() {
     const video = videoRef.value
     if (!video) return
@@ -70,10 +83,17 @@ export function usePlayer(videoRef: Ref<HTMLVideoElement | null>) {
     video.load()
   }
 
+  function destroyHls(sessionId: number, hls: any) {
+    hlsBySession.delete(sessionId)
+    if (hlsInstance === hls) hlsInstance = null
+    hls.destroy()
+  }
+
   function destroyAdapters() {
     nativeAdapter?.destroy()
     nativeAdapter = null
-    hlsInstance?.destroy()
+    hlsBySession.forEach((hls, sessionId) => destroyHls(sessionId, hls))
+    hlsBySession.clear()
     hlsInstance = null
     // Always clear video element between source switches
     clearVideo()
@@ -98,85 +118,139 @@ export function usePlayer(videoRef: Ref<HTMLVideoElement | null>) {
     const video = videoRef.value
     if (!video) return
 
+    // Begin a new session: any previously pending async work is now stale and
+    // must destroy its own resources instead of touching this state.
+    const sessionId = ++activeSessionId
     lastSrc = src
     destroyAdapters()
+    manifestParsed = false
+    pendingQuality = null
 
     state.error = null
     state.isLoading = true
+    state.isBuffering = false
     state.currentTime = 0
     state.duration = 0
     state.buffered = 0
     state.isLive = false
     state.availableQualities = []
     state.currentQuality = 'auto'
+    state.currentTrack = null
+    state.availableTracks = []
 
     const type = detectSourceType(src)
 
-    if (type === 'hls') {
-      try {
-        const { default: Hls } = await import('hls.js')
+    if (type !== 'hls') {
+      nativeAdapter = createNativeAdapter(video)
+      nativeAdapter.load(src)
+      return
+    }
 
-        if (!Hls.isSupported()) {
-          // Safari — native HLS support
-          video.src = src
+    try {
+      const { default: Hls } = await import('hls.js')
+
+      // The dynamic import may resolve after the user already switched away.
+      if (sessionId !== activeSessionId) {
+        return
+      }
+
+      if (!Hls.isSupported()) {
+        // Safari — native HLS support
+        video.src = src
+        return
+      }
+
+      const hls = new Hls({ enableWorker: true })
+      hlsBySession.set(sessionId, hls)
+      hlsInstance = hls
+
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        if (sessionId !== activeSessionId) {
+          // Stale manifest: clean up this replaced instance, never the new one.
+          destroyHls(sessionId, hls)
           return
         }
 
-        const hls = new Hls({ enableWorker: true })
+        const seen = new Set<number>()
+        state.availableQualities = (hls.levels as any[])
+          .map((level, i) => ({
+            value: level.height as number,
+            label: level.height ? `${level.height}p` : `Level ${i}`,
+            bitrate: level.bitrate as number,
+          }))
+          .filter((q) => {
+            if (seen.has(q.value)) return false
+            seen.add(q.value)
+            return true
+          })
+          .sort((a, b) => b.value - a.value)
 
-        hls.on(Hls.Events.MANIFEST_PARSED, () => {
-          const seen = new Set<number>()
-          state.availableQualities = (hls.levels as any[])
-            .map((level, i) => ({
-              value: level.height as number,
-              label: level.height ? `${level.height}p` : `Level ${i}`,
-              bitrate: level.bitrate as number,
-            }))
-            .filter((q) => {
-              if (seen.has(q.value)) return false
-              seen.add(q.value)
-              return true
-            })
-            .sort((a, b) => b.value - a.value)
+        manifestParsed = true
+
+        // Honor a quality the user picked while the manifest was still loading.
+        if (pendingQuality !== null) {
+          const wanted = pendingQuality
+          const idx = (hls.levels as any[]).findIndex((l) => l.height === wanted)
+          if (idx !== -1) {
+            hls.nextLevel = idx
+            state.currentQuality = wanted
+          } else {
+            // Requested level no longer exists — follow ABR instead.
+            hls.currentLevel = -1
+            state.currentQuality = 'auto'
+          }
+          pendingQuality = null
+        } else {
           state.currentQuality = 'auto'
-        })
+        }
+      })
 
-        hls.on(Hls.Events.LEVEL_SWITCHED, (_, data) => {
-          // Only update displayed quality when ABR switches automatically
-          if (state.currentQuality === 'auto') return
-          const level = (hls.levels as any[])[data.level]
-          if (level && level.height !== state.currentQuality) {
-            // nextLevel has fully applied — confirm it
-            state.currentQuality = level.height
-          }
-        })
+      hls.on(Hls.Events.LEVEL_SWITCHED, (_, data) => {
+        if (sessionId !== activeSessionId) {
+          return
+        }
+        // Auto mode: keep following ABR and never overwrite the user's choice.
+        if (state.currentQuality === 'auto') return
+        const level = (hls.levels as any[])[data.level]
+        if (level && level.height !== state.currentQuality) {
+          // nextLevel has fully applied — confirm the manually selected height
+          state.currentQuality = level.height
+        }
+      })
 
-        hls.on(Hls.Events.ERROR, (_, data) => {
-          if (!data.fatal) return
-          const code = (data as any).response?.code ?? 0
-          const isNotFound = code === 404
-          state.error = {
-            code,
-            message: isNotFound
-              ? 'Stream not found (404).'
-              : 'Failed to load the stream. Check the URL or try again.',
-            type: 'network',
-          }
-          state.isLoading = false
-          state.isBuffering = false
-          hls.destroy()
-        })
-
-        hls.loadSource(src)
-        hls.attachMedia(video)
-        hlsInstance = hls
-      } catch {
-        state.error = { code: 0, message: 'Failed to initialize HLS player.', type: 'source' }
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        if (sessionId !== activeSessionId) {
+          // A replaced session must only tear down its own instance.
+          destroyHls(sessionId, hls)
+          return
+        }
+        if (!data.fatal) return
+        const code = (data as any).response?.code ?? 0
+        const isNotFound = code === 404
+        state.error = {
+          code,
+          message: isNotFound
+            ? 'Stream not found (404).'
+            : 'Failed to load the stream. Check the URL or try again.',
+          type: 'network',
+        }
         state.isLoading = false
+        state.isBuffering = false
+        // Fatal error: drop the quality list and return to auto, as required.
+        state.availableQualities = []
+        state.currentQuality = 'auto'
+        pendingQuality = null
+        destroyHls(sessionId, hls)
+      })
+
+      hls.loadSource(src)
+      hls.attachMedia(video)
+    } catch {
+      if (sessionId !== activeSessionId) {
+        return
       }
-    } else {
-      nativeAdapter = createNativeAdapter(video)
-      nativeAdapter.load(src)
+      state.error = { code: 0, message: 'Failed to initialize HLS player.', type: 'source' }
+      state.isLoading = false
     }
   }
 
@@ -277,14 +351,32 @@ export function usePlayer(videoRef: Ref<HTMLVideoElement | null>) {
       if (videoRef.value) videoRef.value.playbackRate = rate
     },
     setQuality(value) {
-      if (!hlsInstance) return
       if (value === 'auto') {
-        hlsInstance.currentLevel = -1 // -1 re-enables ABR
-      } else {
-        const idx = (hlsInstance.levels as any[]).findIndex((l) => l.height === value)
-        // nextLevel switches at the next segment boundary — no buffer flush, no freeze
-        if (idx !== -1) hlsInstance.nextLevel = idx
+        // Only an explicit auto selection re-enables ABR.
+        pendingQuality = null
+        if (hlsInstance) hlsInstance.currentLevel = -1
+        state.currentQuality = 'auto'
+        return
       }
+
+      if (!manifestParsed) {
+        // Manifest not ready yet: remember the choice and apply it (or fall
+        // back to auto) from MANIFEST_PARSED.
+        pendingQuality = value
+        state.currentQuality = value
+        return
+      }
+
+      if (!hlsInstance) return
+      const idx = (hlsInstance.levels as any[]).findIndex((l) => l.height === value)
+      if (idx === -1) {
+        // Level unavailable on this stream — stay on ABR and sync the UI.
+        hlsInstance.currentLevel = -1
+        state.currentQuality = 'auto'
+        return
+      }
+      // nextLevel switches at the next segment boundary — no buffer flush, no freeze
+      hlsInstance.nextLevel = idx
       state.currentQuality = value
     },
     setTrack(track) {
@@ -325,6 +417,8 @@ export function usePlayer(videoRef: Ref<HTMLVideoElement | null>) {
   })
 
   onUnmounted(() => {
+    // Invalidate every session so late callbacks become no-ops.
+    activeSessionId++
     destroyAdapters()
     document.removeEventListener('fullscreenchange', onFullscreenChange)
   })

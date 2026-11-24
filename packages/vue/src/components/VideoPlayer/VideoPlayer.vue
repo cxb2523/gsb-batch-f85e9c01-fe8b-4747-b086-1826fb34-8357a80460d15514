@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import type { Chapter, ThumbnailCue, Track, VideoSource } from '@vue-player/core'
-import { isPiPSupported, parseThumbnailVtt } from '@vue-player/core'
+import type { Chapter, Track, VideoSource } from '@vue-player/core'
+import { isPiPSupported } from '@vue-player/core'
 import { usePlayer } from '../../composables/usePlayer'
+import { useThumbnails } from '../../composables/useThumbnails'
 import IcoPlay from '../icons/IcoPlay.vue'
 import IcoPause from '../icons/IcoPause.vue'
 import VpPlayButton from '../controls/VpPlayButton.vue'
@@ -157,15 +158,9 @@ watch(
 )
 
 // ─── Thumbnails ───
-const thumbnailCues = ref<ThumbnailCue[]>([])
-
-watch(
-  () => props.thumbnails,
-  async (url) => {
-    thumbnailCues.value = url ? await parseThumbnailVtt(url) : []
-  },
-  { immediate: true },
-)
+// Race-safe: stale VTT requests can never overwrite a newer one and are
+// aborted on source change and on unmount.
+const { thumbnailCues } = useThumbnails(() => props.thumbnails)
 
 // ─── Controls visibility ───
 const controlsVisible = ref(true)

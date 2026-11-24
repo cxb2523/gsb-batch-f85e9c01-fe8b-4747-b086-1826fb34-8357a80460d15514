@@ -9,13 +9,17 @@ function resolveUrl(base: string, url: string): string {
   }
 }
 
-export async function parseThumbnailVtt(url: string): Promise<ThumbnailCue[]> {
+export async function parseThumbnailVtt(
+  url: string,
+  signal?: AbortSignal,
+): Promise<ThumbnailCue[]> {
   try {
-    const res = await fetch(url)
+    const res = await fetch(url, signal ? { signal } : undefined)
     if (!res.ok) return []
     const text = await res.text()
     return parseVttText(text, url)
   } catch {
+    // Aborted requests and network failures simply yield no cues
     return []
   }
 }
@@ -39,7 +43,10 @@ export function parseVttText(text: string, baseUrl = ''): ThumbnailCue[] {
     // Parse "HH:MM:SS.mmm --> HH:MM:SS.mmm" — ignore position settings after the second timestamp
     const arrowIdx = line.indexOf('-->')
     const start = parseTimecode(line.slice(0, arrowIdx).trim())
-    const endPart = line.slice(arrowIdx + 3).trim().split(/\s/)[0]
+    const endPart = line
+      .slice(arrowIdx + 3)
+      .trim()
+      .split(/\s/)[0]
     const end = parseTimecode(endPart)
 
     i++
