@@ -22,7 +22,7 @@ export class Routing<N> {
     return this.#pairs;
   }
 
-  set(pairs: TPair<N>[]) {
+  set(pairs: readonly TPair<N>[]) {
     const has = (list: TPair<N>[], [a, b]: TPair<N>) => list.some(([c, d]) => a === c && b === d);
     const next: TPair<N>[] = [];
 

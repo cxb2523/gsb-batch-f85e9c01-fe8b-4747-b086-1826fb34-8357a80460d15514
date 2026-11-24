@@ -1,6 +1,7 @@
 import { BookmarkPlus, Boxes, ChevronRight, PackageOpen, X, Zap } from "lucide-react";
 import { Editor, NodeProject, TExportPurpose, TNodeProjectProps, blurMap, focusMap } from "$components/node-editor";
 import { IBlock, TSlot, openBlocks, slotId } from "./state";
+import { ProgramSwitch } from "./switching";
 import { Row, TextInput } from "../lib/Row";
 import { TProgram, buildProgram } from "./program";
 import { checkPorts, programSignals } from "./ports";
@@ -112,10 +113,20 @@ export default class Group extends BaseNode implements IBlock {
       } catch { }
     },
   });
+  // Единственная точка переключения «мосты ↔ процессор»
+  switching = new ProgramSwitch<AudioNode>({
+    routing: this.routing,
+    bridges: () => bridgePairs(this.slots, id => this.outerGain(id), id => this.innerGain(id)),
+    onProgram: program => {
+      this.program = program;
+    },
+    onError: reason => {
+      this.compileError = reason;
+    },
+  });
   container = dom('div', { className: s.blockEditor });
 
   #compileTimer: ReturnType<typeof setTimeout> | undefined;
-  #compileVersion = 0;
   #portRetries = 0;
 
   #gain(map: Map<string, GainNode>, id: string) {
@@ -249,14 +260,21 @@ export default class Group extends BaseNode implements IBlock {
 
   // Собирает граф блока в один процессор. Пока сборка не готова или не удалась, блок звучит как обычно.
   async recompile() {
-    const version = ++this.#compileVersion;
     const { inner } = this;
 
-    if (!this.compiled || !this.mounted)
-      return this.setProgram(null);
+    if (!this.compiled) {
+      this.switching.disable();
+      return;
+    }
+
+    this.switching.want();
+    this.compileError = '';
+
+    if (!this.mounted)
+      return this.switching.disable();
 
     if (this.broken)
-      return this.failCompile('Block graph failed to load');
+      return this.switching.fail('Block graph failed to load');
 
     // Граф ещё грузится: попробуем позже
     if (!inner || this.pending || this.loading || inner.store.some(item => !item.ref.current))
@@ -267,7 +285,7 @@ export default class Group extends BaseNode implements IBlock {
     const result = compileBlock(data);
 
     if (!result.ok)
-      return this.failCompile(result.reason);
+      return this.switching.fail(result.reason);
 
     const mismatch = checkPorts(nodes, data);
 
@@ -276,69 +294,37 @@ export default class Group extends BaseNode implements IBlock {
       return this.scheduleCompile(500);
 
     if (mismatch)
-      return this.failCompile(mismatch);
+      return this.switching.fail(mismatch);
 
     this.#portRetries = 0;
 
-    const key = JSON.stringify([result.source, result.inputs, result.outputs, result.passthrough]);
+    const key = JSON.stringify([result.source, result.inputs, result.outputs, result.passthrough, result.params]);
     const signals = programSignals(nodes, result);
-    const current = this.program;
 
-    // Поменялись только значения или позиции — программа та же
-    if (current && current.key === key && current.signals.every((signal, i) => signal === signals[i])) {
-      this.compileError = '';
-      return;
-    }
-
-    try {
-      const program = await buildProgram({
+    this.switching.request({
+      key,
+      signals,
+      build: (signal, isCurrent) => buildProgram({
         key,
         result,
         signals,
         defaults: paramDefaults(data, result.params),
         outer: id => this.outerGain(id),
+        signal,
+        // Ошибка процессора: если эта программа всё ещё звучит — снимаем её и возвращаемся к мостам
         onError: () => {
-          if (this.program === program)
-            this.failCompile('Compiled block stopped with an error');
+          if (isCurrent())
+            this.switching.fail();
         },
-      });
-
-      if (version !== this.#compileVersion || !this.compiled || !this.mounted) {
-        program.stop();
-        return;
-      }
-
-      this.compileError = '';
-      this.setProgram(program);
-    } catch (error) {
-      console.error(error);
-
-      if (version === this.#compileVersion)
-        this.failCompile('Cannot load the compiled block');
-    }
-  }
-
-  failCompile(reason: string) {
-    this.compileError = reason;
-    this.setProgram(null);
-  }
-
-  // Новая программа уже подключена: переключаем мосты, потом снимаем старую
-  setProgram(program: TProgram | null) {
-    const old = this.program;
-
-    if (old === program)
-      return;
-
-    this.program = program;
-    old?.stop();
+      }),
+    });
   }
 
   stopCompiled() {
-    this.#compileVersion++;
     clearTimeout(this.#compileTimer);
+    this.#portRetries = 0;
     this.compileError = '';
-    this.setProgram(null);
+    this.switching.disable();
   }
 
   // Читает всё, от чего зависит сгенерированный код: ноды, провода, слоты и структурные поля
@@ -407,15 +393,11 @@ export default class Group extends BaseNode implements IBlock {
         if (e.key === 'Escape' && openBlocks.peek().at(-1) === this)
           this.close();
       }),
-      // Мосты слотов, а при скомпилированном блоке — только прямые «вход → выход»
+      // Мостами и прямыми «вход → выход» управляет только ProgramSwitch.
+      // Смена слотов без компиляции должна сразу дать новые мосты.
       effect(() => {
-        const { program } = this;
-
-        this.routing.set(program ? program.passthrough : bridgePairs(
-          this.slots,
-          id => this.outerGain(id),
-          id => this.innerGain(id)
-        ));
+        this.slots;
+        untracked(() => this.switching.syncBridges());
       }),
       effect(() => {
         if (!this.compiled) {
@@ -429,7 +411,8 @@ export default class Group extends BaseNode implements IBlock {
       }),
       () => {
         this.mounted = false;
-        this.stopCompiled();
+        clearTimeout(this.#compileTimer);
+        this.switching.dispose();
         this.routing.clear();
         this.close();
         this.container.remove();
