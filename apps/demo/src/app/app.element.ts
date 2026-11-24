@@ -1,6 +1,10 @@
 import './app.element.css';
 import { createScopedLogger } from '@cxing/logger';
-import { createPlayer, type CdgPlayer } from '@cxing/media-player';
+import {
+  createPlayer,
+  isPlayerLoadCancelledError,
+  type CdgPlayer,
+} from '@cxing/media-player';
 import {
   createControlsModel,
   createCurrentTimeDisplay,
@@ -573,6 +577,17 @@ export class AppElement extends HTMLElement {
             this.setStatusMessage('Track loaded.');
           })
           .catch((errorValue: unknown) => {
+            if (isPlayerLoadCancelledError(errorValue)) {
+              // A newer load superseded this one, or the player was disposed.
+              // This is not a playback failure, so leave the UI untouched.
+              logger.debug({
+                message: 'player.load cancelled',
+                file: selectedFile.name,
+                reason: errorValue.reason,
+              });
+              return;
+            }
+
             // Show a user-facing status, but keep detailed error info in debug logs.
             const message =
               errorValue instanceof Error

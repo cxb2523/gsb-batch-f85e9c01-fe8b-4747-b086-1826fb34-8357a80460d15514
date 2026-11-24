@@ -52,6 +52,9 @@ player.addEventListener('statechange', () => {
 - Debug trace logging is controlled by `options.debug`.
 - Failure paths use `error()` severity and are not hidden behind debug gating.
 - `statechange` is the primary state event; load failures dispatch `error` with `detail.errorValue`.
+- Each `load()` call is an independent, cancellable session. Starting a new load supersedes the previous one: a late result from the superseded session never changes player state, CDG output, or media elements. Superseded loads reject with `PlayerLoadCancelledError` (`reason: 'superseded'`), and loads still in flight at `dispose()` reject with `reason: 'disposed'`; neither dispatches `statechange` or `error`.
+- If your UI fires fire-and-forget loads on rapid track changes, ignore `PlayerLoadCancelledError` (it is not a user-facing failure). A load that already resolved its track is still committed atomically in call order.
+- Object URLs and media-element listeners are owned by the active session: replaced loads revoke their blob, old media `src`/listeners are torn down on track switches, and `dispose()` clears everything so no per-attach `timeupdate`/`play`/`pause`/`ended` handlers stack.
 
 ## Public Constants And Functions
 
@@ -61,6 +64,7 @@ The following utility functions are publicly exported from `@cxing/media-player`
 
 - `asMilliseconds({ seconds })`
 - `canElementPlayMimeType({ media, mimeType })`
+- `isPlayerLoadCancelledError(errorValue)`
 
 ## Common Mistakes
 

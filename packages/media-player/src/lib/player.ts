@@ -2,6 +2,7 @@ import {
   CDGPlayer,
   HEIGHT,
   WIDTH,
+  type CdgInstructionLike,
   type CdgRenderContext,
 } from '@cxing/media-parser-cdg';
 import { createScopedLogger } from '@cxing/logger';
@@ -87,6 +88,64 @@ type CdgCorePlayerAsyncLoad = CDGPlayer & {
   loadAsync?: (args: { data: Uint8Array }) => Promise<CDGPlayer>;
 };
 
+/** Deferred CDG work a session applies only at commit time. */
+type CdgCommitPayload =
+  | { kind: 'async'; instructions: CdgInstructionLike[] }
+  | { kind: 'sync'; bytes: Uint8Array }
+  | null;
+
+/** Reason an in-flight load session stopped being authoritative. */
+export type PlayerLoadCancelledReason = 'superseded' | 'disposed';
+
+/**
+ * Rejection value produced when a load session is invalidated before it could
+ * commit. Late results from cancelled sessions never emit `statechange` or
+ * `error` and never touch player state, CDG output, or media elements.
+ *
+ * Consumers that fire-and-forget rapid track switches can treat this as a
+ * no-op; loads that already fetched their track resolve normally instead.
+ */
+export class PlayerLoadCancelledError extends Error {
+  readonly reason: PlayerLoadCancelledReason;
+
+  constructor({ reason }: { reason: PlayerLoadCancelledReason }) {
+    super(
+      reason === 'disposed'
+        ? 'Player was disposed before the load completed.'
+        : 'Load was superseded by a newer request.',
+    );
+    this.name = 'PlayerLoadCancelledError';
+    this.reason = reason;
+  }
+}
+
+/**
+ * Returns true when a rejected `load()` value is a cancelled-session signal
+ * rather than a real playback failure. Use this to ignore stale loads when the
+ * UI switches tracks quickly.
+ */
+export const isPlayerLoadCancelledError = (
+  errorValue: unknown,
+): errorValue is PlayerLoadCancelledError =>
+  errorValue instanceof PlayerLoadCancelledError;
+
+/**
+ * Independent, cancellable load attempt. Every `load()` call owns exactly one
+ * session; starting a new one invalidates the previous session so its late
+ * results can no longer mutate player state, CDG state, or media elements.
+ */
+interface LoadSession {
+  readonly id: number;
+  cancelled: boolean;
+  cancelReason: PlayerLoadCancelledReason | null;
+  /** Object URL owned by this session until it is committed to the player. */
+  objectUrl: string | null;
+  /** Media element that received `objectUrl`, if any. */
+  mediaForObjectUrl: HTMLMediaElement | null;
+  /** Aborts awaits that are only meaningful while the session is current. */
+  readonly controller: AbortController;
+}
+
 /**
  * High-level karaoke player that orchestrates loading and audio playback.
  * CDG rendering/synchronization are enabled only when the loaded track includes
@@ -117,6 +176,15 @@ export class CdgPlayer extends EventTarget {
   private state: PlayerState = createInitialState();
   private currentObjectUrl: string | null = null;
   private hasGraphicsTrack = false;
+
+  /** Monotonic counter used to mint unique load-session ids. */
+  private loadSessionCounter = 0;
+  /** Session whose result is currently allowed to mutate player state. */
+  private activeLoadSession: LoadSession | null = null;
+  /** True once `dispose()` ran; all in-flight and future sessions are dead. */
+  private disposed = false;
+  /** Media elements that currently have the player's transport listeners. */
+  private readonly boundMedia = new Set<HTMLMediaElement>();
 
   /**
    * Creates a player bound to canvas/audio elements and optional strategy overrides.
@@ -193,15 +261,27 @@ export class CdgPlayer extends EventTarget {
   /**
    * Loads track assets and prepares playback for either karaoke (audio+graphics)
    * or audio-only content.
+   *
+   * Each call starts an independent, cancellable session. Starting a newer load
+   * invalidates the older one: a superseded session rejects with
+   * {@link PlayerLoadCancelledError} and never mutates player state, CDG output,
+   * or media elements afterwards.
    */
   async load({
     input,
     loaderOptions,
     autoplay = false,
   }: PlayerLoadOptions): Promise<LoadedTrack> {
+    if (this.disposed) {
+      throw new PlayerLoadCancelledError({ reason: 'disposed' });
+    }
+
+    const session = this.beginLoadSession();
+
     this.applyState({ status: 'loading' });
     this.logger.debug({
       message: 'load:start',
+      sessionId: session.id,
       inputKind: input.kind,
       loadTransport: this.loadTransport,
       autoplay,
@@ -218,6 +298,14 @@ export class CdgPlayer extends EventTarget {
       const effectiveLoaderOptions: LoaderOptions = {
         ...(loaderOptions ?? {}),
         debug: loaderOptions?.debug ?? this.debug,
+        // Propagate session cancellation to real loaders so superseded fetches
+        // stop early. A caller-supplied signal is combined, not replaced.
+        signal: this.resolveLoadSignal({
+          session,
+          ...(loaderOptions?.signal
+            ? { externalSignal: loaderOptions.signal }
+            : {}),
+        }),
       };
 
       if (useWorkerLoader) {
@@ -233,6 +321,8 @@ export class CdgPlayer extends EventTarget {
           });
         } catch (errorValue: unknown) {
           this.logger.debug({ message: 'load:worker-error', errorValue });
+          // A superseded/disposed session must never fall back and keep loading.
+          this.assertSessionActive({ session });
           if (!this.shouldFallbackToMainThreadLoad({ errorValue })) {
             throw errorValue;
           }
@@ -261,27 +351,65 @@ export class CdgPlayer extends EventTarget {
         });
       }
 
-      await this.attachLoadedTrack({ loadedTrack });
+      this.assertSessionActive({ session });
+
+      // The fetch succeeded, but a newer load may still have replaced us while
+      // the media attach awaited readiness. Discard instead of overwriting.
+      await this.attachLoadedTrack({ loadedTrack, session });
+      this.assertSessionActive({ session });
+
       this.applyState({
         status: 'ready',
         trackId: loadedTrack.trackId,
       });
 
       if (autoplay) {
-        await this.play();
+        await this.startPlayback({ session });
+        this.assertSessionActive({ session });
       }
 
       this.logger.debug({
         message: 'load:ready',
+        sessionId: session.id,
         trackId: loadedTrack.trackId,
       });
 
       return loadedTrack;
     } catch (errorValue: unknown) {
+      if (errorValue instanceof PlayerLoadCancelledError) {
+        this.releaseSessionObjectUrl({ session });
+        this.logger.debug({
+          message: 'load:cancelled',
+          sessionId: session.id,
+          reason: errorValue.reason,
+        });
+        throw errorValue;
+      }
+
+      if (!this.isSessionActive({ session })) {
+        // A late error from a superseded/disposed session is dropped: it must
+        // not drive `error` state or dispatch `error` for the current track.
+        this.releaseSessionObjectUrl({ session });
+        this.logger.debug({
+          message: 'load:error-ignored-stale-session',
+          sessionId: session.id,
+        });
+        throw new PlayerLoadCancelledError({
+          reason: this.disposed ? 'disposed' : 'superseded',
+        });
+      }
+
+      // An error from the active session is surfaced, but any blob it had
+      // already attached must not survive: the failed track never committed.
+      this.releaseSessionObjectUrl({ session });
       this.logger.error({ message: 'load:error', errorValue });
       this.applyState({ status: 'error' });
       this.dispatchEvent(new CustomEvent('error', { detail: { errorValue } }));
       throw errorValue;
+    } finally {
+      if (this.activeLoadSession === session) {
+        this.activeLoadSession = null;
+      }
     }
   }
 
@@ -289,6 +417,19 @@ export class CdgPlayer extends EventTarget {
    * Starts media playback and, when graphics exist, advances CDG frame playback.
    */
   async play(): Promise<void> {
+    await this.startPlayback({ session: null });
+  }
+
+  /**
+   * Shared playback start. When a `session` is supplied (autoplay after load),
+   * state is only advanced while that session is still current, so a superseded
+   * load cannot force a stale `playing` state.
+   */
+  private async startPlayback({
+    session,
+  }: {
+    session: LoadSession | null;
+  }): Promise<void> {
     this.logger.debug({
       message: 'play:called',
       currentTime: this.activeMedia.currentTime,
@@ -310,6 +451,11 @@ export class CdgPlayer extends EventTarget {
     } catch (err) {
       this.logger.debug({ message: 'play:error', errorValue: err });
     }
+
+    if (session && !this.isSessionActive({ session })) {
+      return;
+    }
+
     if (this.hasGraphicsTrack) {
       this.cdgPlayer.play();
     }
@@ -422,11 +568,32 @@ export class CdgPlayer extends EventTarget {
 
   /**
    * Releases player resources and event listeners.
+   *
+   * Any in-flight load session is invalidated immediately; its late results are
+   * discarded without dispatching `statechange` or `error`.
    */
   dispose(): void {
+    if (this.disposed) {
+      return;
+    }
+
     this.logger.debug({ message: 'dispose:start' });
+    this.disposed = true;
+
+    const pendingSession = this.activeLoadSession;
+    this.cancelLoadSession({ session: pendingSession, reason: 'disposed' });
+    if (pendingSession) {
+      // Release synchronously so no blob outlives teardown, even though the
+      // in-flight load's catch handler will also run later.
+      this.releaseSessionObjectUrl({ session: pendingSession });
+    }
+    this.activeLoadSession = null;
+
     this.stop();
-    this.unbindMediaListeners({ media: this.activeMedia });
+    for (const media of [...this.boundMedia]) {
+      this.unbindMediaListeners({ media });
+    }
+    this.boundMedia.clear();
     this.releaseObjectUrl();
 
     if (this.ownsLoader) {
@@ -444,20 +611,226 @@ export class CdgPlayer extends EventTarget {
     this.logger.debug({ message: 'dispose:done' });
   }
 
+  private beginLoadSession(): LoadSession {
+    this.cancelLoadSession({
+      session: this.activeLoadSession,
+      reason: 'superseded',
+    });
+
+    const session: LoadSession = {
+      id: (this.loadSessionCounter += 1),
+      cancelled: false,
+      cancelReason: null,
+      objectUrl: null,
+      mediaForObjectUrl: null,
+      controller: new AbortController(),
+    };
+
+    this.activeLoadSession = session;
+    return session;
+  }
+
+  private cancelLoadSession({
+    session,
+    reason,
+  }: {
+    session: LoadSession | null;
+    reason: PlayerLoadCancelledReason;
+  }): void {
+    if (!session || session.cancelled) {
+      return;
+    }
+
+    session.cancelled = true;
+    session.cancelReason = reason;
+    session.controller.abort(new PlayerLoadCancelledError({ reason }));
+  }
+
+  private isSessionActive({ session }: { session: LoadSession }): boolean {
+    return (
+      !this.disposed && !session.cancelled && this.activeLoadSession === session
+    );
+  }
+
+  /**
+   * Combines the session's cancellation signal with any caller-provided signal.
+   * `AbortSignal.any` is preferred; a manual bridge is used when unavailable.
+   */
+  private resolveLoadSignal({
+    session,
+    externalSignal,
+  }: {
+    session: LoadSession;
+    externalSignal?: AbortSignal;
+  }): AbortSignal {
+    const sessionSignal = session.controller.signal;
+    if (!externalSignal) {
+      return sessionSignal;
+    }
+
+    if (typeof AbortSignal.any === 'function') {
+      return AbortSignal.any([sessionSignal, externalSignal]);
+    }
+
+    const bridged = new AbortController();
+    const abort = (): void => bridged.abort();
+    if (sessionSignal.aborted || externalSignal.aborted) {
+      bridged.abort();
+    } else {
+      sessionSignal.addEventListener('abort', abort, { once: true });
+      externalSignal.addEventListener('abort', abort, { once: true });
+    }
+    return bridged.signal;
+  }
+
+  private assertSessionActive({ session }: { session: LoadSession }): void {
+    if (this.isSessionActive({ session })) {
+      return;
+    }
+
+    throw new PlayerLoadCancelledError({
+      reason:
+        this.disposed || session.cancelReason === 'disposed'
+          ? 'disposed'
+          : 'superseded',
+    });
+  }
+
+  /**
+   * Attaches a loaded track to the player. All mutations are deferred to a
+   * synchronous commit that only runs while `session` is still the current one,
+   * so a superseded load can never overwrite player, CDG, or media-element
+   * state.
+   */
   private async attachLoadedTrack({
     loadedTrack,
+    session,
   }: {
     loadedTrack: LoadedTrack;
+    session: LoadSession;
   }): Promise<void> {
+    this.assertSessionActive({ session });
+
     const resolvedMediaKind: LoadedTrackMediaKind =
       loadedTrack.mediaKind ?? 'audio';
     const resolvedMediaMimeType =
       loadedTrack.mediaMimeType ?? loadedTrack.audioMimeType;
-
     const nextMedia = this.resolveMediaElementForTrack({ loadedTrack });
-    if (this.activeMedia !== nextMedia) {
+
+    this.logger.debug({
+      message: 'attach:start',
+      sessionId: session.id,
+      trackId: loadedTrack.trackId,
+      mediaKind: resolvedMediaKind,
+      mediaMimeType: resolvedMediaMimeType,
+      hasGraphics: loadedTrack.hasGraphics,
+      cdgBytes: loadedTrack.cdgBytes?.byteLength ?? 0,
+      audioBytes: loadedTrack.audioBuffer.byteLength,
+    });
+
+    if (
+      resolvedMediaKind === 'video' &&
+      !canElementPlayMimeType({
+        media: nextMedia,
+        mimeType: resolvedMediaMimeType,
+      })
+    ) {
+      throw new Error(
+        `This browser cannot play ${resolvedMediaKind} format ${resolvedMediaMimeType}.`,
+      );
+    }
+
+    const hasGraphicsTrack =
+      loadedTrack.hasGraphics && loadedTrack.cdgBytes !== null;
+
+    // Prepare CDG data without mutating the live player. The async path parses
+    // into an isolated candidate; the sync path defers the live `load` call to
+    // the synchronous commit so a superseded session can never switch the
+    // on-screen instructions mid-attach.
+    let cdgPayload: CdgCommitPayload = null;
+
+    if (hasGraphicsTrack && loadedTrack.cdgBytes) {
+      const corePlayer = this.cdgPlayer as CdgCorePlayerAsyncLoad;
+      if (typeof corePlayer.loadAsync === 'function') {
+        this.logger.debug({ message: 'attach:core-loadAsync' });
+        const candidate = new CDGPlayer();
+        await candidate.loadAsync({ data: loadedTrack.cdgBytes });
+        cdgPayload = { kind: 'async', instructions: candidate.instructions };
+        this.assertSessionActive({ session });
+      } else {
+        this.logger.debug({ message: 'attach:core-load-sync' });
+        cdgPayload = { kind: 'sync', bytes: loadedTrack.cdgBytes };
+      }
+    }
+
+    this.assertSessionActive({ session });
+
+    const mediaBlob = new Blob([loadedTrack.audioBuffer], {
+      type: resolvedMediaMimeType,
+    });
+    const objectUrl = URL.createObjectURL(mediaBlob);
+    session.objectUrl = objectUrl;
+    session.mediaForObjectUrl = nextMedia;
+
+    nextMedia.src = objectUrl;
+    nextMedia.load();
+
+    this.logger.debug({
+      message: 'attach:media-source-set',
+      sessionId: session.id,
+      mediaKind: resolvedMediaKind,
+      objectUrl,
+    });
+
+    if (resolvedMediaKind === 'video') {
+      await this.waitForMediaCanPlay({
+        media: nextMedia,
+        mediaKind: resolvedMediaKind,
+        signal: session.controller.signal,
+      });
+      this.assertSessionActive({ session });
+    }
+
+    this.commitLoadedTrack({
+      session,
+      media: nextMedia,
+      mediaKind: resolvedMediaKind,
+      objectUrl,
+      hasGraphicsTrack,
+      cdgPayload,
+    });
+
+    this.logger.debug({
+      message: 'attach:media-bound',
+      sessionId: session.id,
+      mediaKind: this.activeMediaKind,
+      objectUrl: this.currentObjectUrl,
+    });
+  }
+
+  /**
+   * Synchronous commit of an attached track. Runs only for the active session.
+   */
+  private commitLoadedTrack({
+    session,
+    media,
+    mediaKind,
+    objectUrl,
+    hasGraphicsTrack,
+    cdgPayload,
+  }: {
+    session: LoadSession;
+    media: HTMLMediaElement;
+    mediaKind: LoadedTrackMediaKind;
+    objectUrl: string;
+    hasGraphicsTrack: boolean;
+    cdgPayload: CdgCommitPayload;
+  }): void {
+    this.assertSessionActive({ session });
+
+    if (this.activeMedia !== media) {
       this.unbindMediaListeners({ media: this.activeMedia });
-      this.activeMedia = nextMedia;
+      this.activeMedia = media;
 
       const cachedEngine = this.audioEnginesByMedia.get(this.activeMedia);
       if (cachedEngine) {
@@ -500,62 +873,22 @@ export class CdgPlayer extends EventTarget {
       });
     }
 
-    this.activeMediaKind = resolvedMediaKind;
+    this.activeMediaKind = mediaKind;
     this.releaseObjectUrl();
-    this.logger.debug({
-      message: 'attach:start',
-      trackId: loadedTrack.trackId,
-      mediaKind: resolvedMediaKind,
-      mediaMimeType: resolvedMediaMimeType,
-      hasGraphics: loadedTrack.hasGraphics,
-      cdgBytes: loadedTrack.cdgBytes?.byteLength ?? 0,
-      audioBytes: loadedTrack.audioBuffer.byteLength,
-    });
+    this.currentObjectUrl = objectUrl;
+    session.objectUrl = null;
+    session.mediaForObjectUrl = null;
 
-    this.hasGraphicsTrack =
-      loadedTrack.hasGraphics && loadedTrack.cdgBytes !== null;
+    this.hasGraphicsTrack = hasGraphicsTrack;
 
-    if (this.hasGraphicsTrack && loadedTrack.cdgBytes) {
-      const corePlayer = this.cdgPlayer as CdgCorePlayerAsyncLoad;
-      if (typeof corePlayer.loadAsync === 'function') {
-        this.logger.debug({ message: 'attach:core-loadAsync' });
-        await corePlayer.loadAsync({ data: loadedTrack.cdgBytes });
-      } else {
-        this.logger.debug({ message: 'attach:core-load-sync' });
-        this.cdgPlayer.load({ data: loadedTrack.cdgBytes });
-      }
-
-      this.cdgPlayer.reset().render();
-    } else {
-      this.cdgPlayer.reset().render();
+    // Apply prepared CDG data, then reset/render, matching the original
+    // per-track behavior for both sync and async load paths.
+    if (cdgPayload?.kind === 'async') {
+      this.cdgPlayer.instructions = cdgPayload.instructions;
+    } else if (cdgPayload?.kind === 'sync') {
+      this.cdgPlayer.load({ data: cdgPayload.bytes });
     }
-
-    const mediaBlob = new Blob([loadedTrack.audioBuffer], {
-      type: resolvedMediaMimeType,
-    });
-
-    if (
-      resolvedMediaKind === 'video' &&
-      !canElementPlayMimeType({
-        media: this.activeMedia,
-        mimeType: resolvedMediaMimeType,
-      })
-    ) {
-      throw new Error(
-        `This browser cannot play ${resolvedMediaKind} format ${resolvedMediaMimeType}.`,
-      );
-    }
-
-    this.currentObjectUrl = URL.createObjectURL(mediaBlob);
-    this.activeMedia.src = this.currentObjectUrl;
-    this.activeMedia.load();
-
-    if (resolvedMediaKind === 'video') {
-      await this.waitForMediaCanPlay({
-        media: this.activeMedia,
-        mediaKind: resolvedMediaKind,
-      });
-    }
+    this.cdgPlayer.reset().render();
 
     if (this.activeMedia === this.audio && this.video) {
       this.video.pause();
@@ -568,12 +901,26 @@ export class CdgPlayer extends EventTarget {
       this.audio.removeAttribute('src');
       this.audio.load();
     }
+  }
 
-    this.logger.debug({
-      message: 'attach:media-bound',
-      mediaKind: this.activeMediaKind,
-      objectUrl: this.currentObjectUrl,
-    });
+  private releaseSessionObjectUrl({ session }: { session: LoadSession }): void {
+    const objectUrl = session.objectUrl;
+    if (!objectUrl) {
+      return;
+    }
+
+    const media = session.mediaForObjectUrl;
+    session.objectUrl = null;
+    session.mediaForObjectUrl = null;
+
+    // Only clear the element source if it still points at this session's blob;
+    // a newer session may already own the element.
+    if (media && media.getAttribute('src') === objectUrl) {
+      media.removeAttribute('src');
+      media.load();
+    }
+
+    URL.revokeObjectURL(objectUrl);
   }
 
   private releaseObjectUrl(): void {
@@ -609,12 +956,17 @@ export class CdgPlayer extends EventTarget {
   private async waitForMediaCanPlay({
     media,
     mediaKind,
+    signal,
   }: {
     media: HTMLMediaElement;
     mediaKind: LoadedTrackMediaKind;
+    signal?: AbortSignal;
   }): Promise<void> {
     if (mediaKind === 'video' && media instanceof HTMLVideoElement) {
-      await this.waitForVideoMetadata({ video: media });
+      await this.waitForVideoMetadata({
+        video: media,
+        ...(signal ? { signal } : {}),
+      });
       if (media.videoWidth <= 0 || media.videoHeight <= 0) {
         throw new Error('Video track could not be decoded by this browser.');
       }
@@ -624,60 +976,97 @@ export class CdgPlayer extends EventTarget {
       return;
     }
 
-    await new Promise<void>((resolve, reject) => {
-      const onCanPlay = (): void => {
-        cleanup();
-        resolve();
-      };
-
-      const onError = (): void => {
-        cleanup();
-        reject(new Error(`Unable to load ${mediaKind} media in this browser.`));
-      };
-
-      const cleanup = (): void => {
-        media.removeEventListener('canplay', onCanPlay);
-        media.removeEventListener('error', onError);
-      };
-
-      media.addEventListener('canplay', onCanPlay, { once: true });
-      media.addEventListener('error', onError, { once: true });
+    await this.waitForMediaEvent({
+      media,
+      events: ['canplay'],
+      errorMessage: `Unable to load ${mediaKind} media in this browser.`,
+      ...(signal ? { signal } : {}),
     });
   }
 
   private async waitForVideoMetadata({
     video,
+    signal,
   }: {
     video: HTMLVideoElement;
+    signal?: AbortSignal;
   }): Promise<void> {
     if (video.readyState >= HTMLMediaElement.HAVE_METADATA) {
       return;
     }
 
+    await this.waitForMediaEvent({
+      media: video,
+      events: ['loadedmetadata'],
+      errorMessage: 'Unable to read video metadata in this browser.',
+      ...(signal ? { signal } : {}),
+    });
+  }
+
+  /**
+   * Waits for the first of `events`, rejecting on media `error` or abort.
+   * Listeners are always removed by `cleanup`, so no per-attach handlers leak.
+   */
+  private async waitForMediaEvent({
+    media,
+    events,
+    errorMessage,
+    signal,
+  }: {
+    media: HTMLMediaElement;
+    events: readonly string[];
+    errorMessage: string;
+    signal?: AbortSignal;
+  }): Promise<void> {
+    if (signal?.aborted) {
+      throw new PlayerLoadCancelledError({
+        reason: this.disposed ? 'disposed' : 'superseded',
+      });
+    }
+
     await new Promise<void>((resolve, reject) => {
-      const onLoadedMetadata = (): void => {
+      const onSuccess = (): void => {
         cleanup();
         resolve();
       };
 
       const onError = (): void => {
         cleanup();
-        reject(new Error('Unable to read video metadata in this browser.'));
+        reject(new Error(errorMessage));
+      };
+
+      const onAbort = (): void => {
+        cleanup();
+        reject(
+          new PlayerLoadCancelledError({
+            reason: this.disposed ? 'disposed' : 'superseded',
+          }),
+        );
       };
 
       const cleanup = (): void => {
-        video.removeEventListener('loadedmetadata', onLoadedMetadata);
-        video.removeEventListener('error', onError);
+        for (const eventName of events) {
+          media.removeEventListener(eventName, onSuccess);
+        }
+        media.removeEventListener('error', onError);
+        signal?.removeEventListener('abort', onAbort);
       };
 
-      video.addEventListener('loadedmetadata', onLoadedMetadata, {
-        once: true,
-      });
-      video.addEventListener('error', onError, { once: true });
+      for (const eventName of events) {
+        media.addEventListener(eventName, onSuccess, { once: true });
+      }
+      media.addEventListener('error', onError, { once: true });
+      signal?.addEventListener('abort', onAbort, { once: true });
     });
   }
 
   private bindMediaListeners({ media }: { media: HTMLMediaElement }): void {
+    if (this.boundMedia.has(media)) {
+      this.logger.debug({ message: 'bindMediaListeners:already-bound', media });
+      return;
+    }
+
+    this.boundMedia.add(media);
     this.logger.debug({ message: 'bindMediaListeners', media });
     media.addEventListener('timeupdate', this.handleTimeUpdate);
     media.addEventListener('play', this.handlePlay);
@@ -691,6 +1080,12 @@ export class CdgPlayer extends EventTarget {
   }
 
   private unbindMediaListeners({ media }: { media: HTMLMediaElement }): void {
+    if (!this.boundMedia.has(media)) {
+      this.logger.debug({ message: 'unbindMediaListeners:not-bound', media });
+      return;
+    }
+
+    this.boundMedia.delete(media);
     this.logger.debug({ message: 'unbindMediaListeners', media });
     media.removeEventListener('timeupdate', this.handleTimeUpdate);
     media.removeEventListener('play', this.handlePlay);

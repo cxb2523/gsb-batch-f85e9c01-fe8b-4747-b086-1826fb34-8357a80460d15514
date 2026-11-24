@@ -28,6 +28,11 @@ const {
 
 vi.mock('@cxing/media-player', () => ({
   createPlayer: createPlayerMock,
+  // Mirrors the real guard's intent using the error name so tests can
+  // distinguish cancelled-session signals from real failures.
+  isPlayerLoadCancelledError: (errorValue: unknown): boolean =>
+    errorValue instanceof Error &&
+    errorValue.name === 'PlayerLoadCancelledError',
 }));
 
 vi.mock('@cxing/media-playback-controls', () => ({
@@ -457,6 +462,52 @@ describe('AppElement', () => {
     expect(shell?.classList.contains('show-player')).toBe(true);
     expect(shell?.classList.contains('has-track')).toBe(false);
     expect(input.value).toBe('');
+
+    document.body.removeChild(app);
+  });
+
+  it('ignores a cancelled load rejection instead of showing a failure state', async () => {
+    const cancelledError = new Error('Load was superseded by a newer request.');
+    cancelledError.name = 'PlayerLoadCancelledError';
+
+    const harness = createDemoHarness({
+      loadError: cancelledError,
+      playerState: { status: 'ready' },
+    });
+
+    registerAppElement();
+    const app = document.createElement('cdgplayer-demo-app') as AppElement;
+    document.body.appendChild(app);
+
+    const input = app.querySelector<HTMLInputElement>('#track-input');
+    const status = app.querySelector<HTMLElement>('[data-role="status"]');
+    const file = new File(['zip-content'], 'superseded.zip', {
+      type: 'application/zip',
+    });
+
+    if (!input) {
+      throw new Error('Expected file input to exist.');
+    }
+
+    Object.defineProperty(input, 'files', {
+      configurable: true,
+      value: {
+        item: (index: number) => (index === 0 ? file : null),
+        length: 1,
+        0: file,
+      },
+    });
+
+    input.dispatchEvent(new Event('change'));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // A superseded load must not flip the UI into an error status: the
+    // pre-load "Loading track..." message and shell state are left untouched.
+    expect(status?.textContent).toBe('Loading track...');
+    expect(status?.textContent).not.toContain('Load failed');
+    expect(input.value).toBe('');
+    expect(harness.player.stop).toHaveBeenCalledOnce();
 
     document.body.removeChild(app);
   });

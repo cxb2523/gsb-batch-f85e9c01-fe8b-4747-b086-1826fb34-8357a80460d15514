@@ -1,5 +1,6 @@
 import { useCallback } from 'react';
 import type { ChangeEvent } from 'react';
+import { isPlayerLoadCancelledError } from '@cxing/media-player';
 import useFrameworkDemoContext from '../../../hooks/useFrameworkDemo.context';
 
 const VIDEO_EXTENSION_TO_MIME: Record<string, string> = {
@@ -124,6 +125,12 @@ function useFilePickerRowProps(): FilePickerRowResolvedProps {
 
         showStatusMessage('Track loaded.');
       } catch (errorValue: unknown) {
+        if (isPlayerLoadCancelledError(errorValue)) {
+          // A newer load superseded this one, or the player was disposed. This
+          // is not a playback failure, so leave the current UI state intact.
+          return;
+        }
+
         // Keep status user-friendly while preserving details through Error.message.
         const message =
           errorValue instanceof Error

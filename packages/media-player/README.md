@@ -66,6 +66,7 @@ player.setPitchSemitones({ value: -2 });
 - `setPlaybackRate` remains available as a compatibility alias.
 - Audio-only tracks are supported; playback state and transport remain functional without a graphics stream.
 - Video tracks are supported when you provide a `video` element in `options`.
+- Each `load()` is an independent, cancellable session. Starting a new load supersedes the previous one; a late result from a superseded (or post-`dispose()`) session never mutates player state, CDG output, or media elements. Superseded loads reject with `PlayerLoadCancelledError` — ignore it for rapid track switching, since it is not a playback failure.
 - CDG render and sync operations are conditional on graphics availability.
 - Best cross-browser video compatibility comes from MP4 files encoded as H.264 video with AAC audio.
 - A container can look supported and still fail decode; the player performs extra runtime checks for video metadata and decoded dimensions.
@@ -79,6 +80,7 @@ Only the utility functions below are exported from `@cxing/media-player`.
 
 - `asMilliseconds({ seconds })`
 - `canElementPlayMimeType({ media, mimeType })`
+- `isPlayerLoadCancelledError(errorValue)` — true when a rejected `load()` was superseded/disposed rather than failing.
 
 ## Docs
 

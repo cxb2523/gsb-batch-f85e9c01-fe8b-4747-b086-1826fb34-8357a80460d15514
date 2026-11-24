@@ -14,6 +14,9 @@ const { createPlayerMock, createControlsModelMock } = vi.hoisted(() => ({
 
 vi.mock('@cxing/media-player', () => ({
   createPlayer: createPlayerMock,
+  // Mirrors the real guard: these tests reject with plain Errors, not
+  // cancelled-session signals.
+  isPlayerLoadCancelledError: () => false,
 }));
 
 vi.mock('@cxing/media-playback-controls', () => ({
