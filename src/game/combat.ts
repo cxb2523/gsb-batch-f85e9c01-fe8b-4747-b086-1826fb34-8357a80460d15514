@@ -146,10 +146,33 @@ export class Combat {
     }
     this.teles.push(t); return t;
   }
+  // 특정 소유자의 공권을 전부 수렴시킨다(페이즈 전환/무적 연출/사망용).
+  // 호출 시점에 이미 존재하는 객체만 스냅샷으로 청산하므로, 호출 이후 생성된
+  // 다음 페이즈의 예고·투사체·장판은 절대 함께 지워지지 않는다.
+  // - 예고: 취소 처리하고 아이콘을 제거, then 콜백은 영영 실행하지 않음
+  // - 근접 판정: 즉시 배열에서 제거해 이후 프레임 타격을 막음
+  // - 투사체: 데드 처리 + 이미지 즉시 파괴, onEnd(폭발 등) 콜백도 호출하지 않음
+  // - 장판: 배열에서 제거해 다음 프레임부터 틱 데미지가 발생하지 않음
+  // 다른 소유자(플레이어 등)의 공격과 필드 효과는 건드리지 않는다.
   cancelOwner(owner: Actor) {
-    for (const t of this.teles) if (t.owner === owner) { t.cancelled = true; t.icon?.destroy(); }
-    this.teles = this.teles.filter((t) => !t.cancelled);
-    this.atks = this.atks.filter((a) => a.owner !== owner);
+    // 예고: 소유자 일치분만 골라 취소(스냅샷)
+    const killTele = new Set<Tele>();
+    for (const t of this.teles) if (t.owner === owner) { t.cancelled = true; t.icon?.destroy(); killTele.add(t); }
+    if (killTele.size) this.teles = this.teles.filter((t) => !killTele.has(t));
+    // 근접 판정: 활성화된 잔여 히트박스 제거(스냅샷)
+    if (this.atks.some((a) => a.owner === owner)) this.atks = this.atks.filter((a) => a.owner !== owner);
+    // 투사체: onEnd 없이 즉시 제거 — 폭발 투사체의 잔여 타격/데미지 콜백 방지
+    for (const p of this.projs) {
+      if (p.owner !== owner || p.dead) continue;
+      p.dead = true;
+      if (p.img && p.img.active) p.img.destroy();
+    }
+    if (this.projs.some((p) => p.dead)) this.projs = this.projs.filter((p) => !p.dead);
+    // 장판: 공유 그래픽스(gZone)는 매 프레임 다시 그려지므로 배열 이탈만으로 표시·틱 모두 중단
+    if (this.zones.some((z) => z.owner === owner)) this.zones = this.zones.filter((z) => z.owner !== owner);
+    // 남은 예고/장판이 없으면 이번 프레임 잔상도 즉시 지운다
+    if (!this.teles.length) this.gTele.clear();
+    if (!this.zones.length) this.gZone.clear();
   }
   projectile(owner: Actor, x: number, y: number, ang: number, speed: number, range: number, r: number, tex: string, tint: number, info: Omit<HitInfo, 'src'>, o: Partial<Proj> = {}) {
     const img = this.W.add.image(x, y, tex).setTint(tint).setBlendMode(Phaser.BlendModes.ADD).setScale(Math.max(0.12, r / 40)).setRotation(ang).setDepth(100001);

@@ -396,7 +396,10 @@ export class Boss extends Actor {
     const ph = this.B.phases[this.phase]; this.phase++;
     Object.assign(this.mods, ph.mods);
     if (ph.mods.guard) this.guardCharges = 1;
-    this.cancelAll(); this.W.combat.clearEnemy();
+    // 예약 콜백 + 이 보스 소유의 예고/근접판정/투사체/장판을 이 시점 스냅샷으로 수렴.
+    // clearEnemy(적군 전체 일괄 삭제)가 아니라 소유자 기준 청산이라 플레이어 공격과
+    // 다른 적의 효과는 보존되고, 이 호출 뒤에 생성되는 다음 페이즈 공격도 남는다.
+    this.cancelAll();
     this.fsm = 'PHASE_CHANGE'; this.stateEnd = this.W.now + 1200 + 1000; this.invuln = this.W.now + 2200;
     this.W.onBossPhase(this, this.phase, ph.text);
     this.W.fx.burst(this.x, this.y, this.B.tint, 200, 'fx_light'); this.W.fx.shake(300, 0.008); sfx('boss', 0.8);
@@ -437,7 +440,10 @@ export class Boss extends Actor {
   }
   die() {
     if (this.fsm === 'DEAD') return;
-    this.fsm = 'DEAD'; this.alive = false; this.hp = 0; this.cancelAll(); this.W.combat.clearEnemy();
+    this.fsm = 'DEAD'; this.alive = false; this.hp = 0;
+    // 사망 시점까지 살아남은 이 보스 소유의 모든 잔여 공격을 수렴:
+    // 예고 아이콘/투사체 이미지가 화면에 남지 않고, 이후 프레임 콜백·데미지도 멈춘다.
+    this.cancelAll();
     for (const m of this.minors) m.kill();
     for (const e of this.W.enemies) if (e.alive && e !== (this as any)) (e as any).die?.();
     this.W.fx.flashScreen(0xffffff, 300); this.W.fx.shake(400, 0.012); sfx('boss', 1);
