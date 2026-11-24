@@ -17,12 +17,27 @@ export class VideoPlayer {
     // Has the user already interacted with the video player?
     private userInteractedWithVideo: boolean = false;
 
+    // Whether the player is currently attached to the video element. This guards `attach`/`detach`
+    // so repeated calls (e.g. rapid settings changes) can never create duplicate controls or
+    // duplicate event listeners.
+    private attached: boolean = false;
+
+    // Whether the player is currently attached.
+    public get isAttached(): boolean {
+        return this.attached;
+    }
+
     public constructor(playbackManager: PlaybackManager) {
         this.playbackManager = playbackManager;
     }
 
     // Attaches to the video player and adds custom element and events.
+    // Calling this while already attached is a no-op, so repeated calls never create duplicate
+    // controls or duplicate event listeners. Use `updateControlMode()` to rebuild the UI.
     public attach() {
+        if (this.attached) return;
+        this.attached = true;
+
         this.createVideoControl();
 
         this.registerEvents();
@@ -34,7 +49,12 @@ export class VideoPlayer {
     }
 
     // Detaches the custom player from the video tag. Removes all custom element and events.
+    // It is safe to call this multiple times or on a player that was never attached: only the first
+    // call for a given attached state performs cleanup.
     public detach() {
+        if (!this.attached) return;
+        this.attached = false;
+
         this.unregisterEvents();
 
         this.removeVideoControl();
@@ -45,25 +65,33 @@ export class VideoPlayer {
     // Register all video events.
     private registerEvents() {
         const videoElement = this.videoElementRef?.deref();
-        if (!videoElement) return;
         const videoRootElement = this.videoRootElementRef?.deref();
         const nativeControlsElement = this.nativeControlsElementRef?.deref();
 
-        videoElement.addEventListener('play', this.onPlay);
-        videoElement.addEventListener('pause', this.onPause);
-        videoElement.addEventListener('ended', this.onEnded);
-        videoElement.addEventListener('timeupdate', this.onTimeUpdate);
-        videoElement.addEventListener('volumechange', this.onVolumeChange);
-        videoElement.addEventListener('ratechange', this.onPlaybackSpeedChange);
+        if (videoElement) {
+            videoElement.addEventListener('play', this.onPlay);
+            videoElement.addEventListener('pause', this.onPause);
+            videoElement.addEventListener('ended', this.onEnded);
+            videoElement.addEventListener('timeupdate', this.onTimeUpdate);
+            videoElement.addEventListener('volumechange', this.onVolumeChange);
+            videoElement.addEventListener(
+                'ratechange',
+                this.onPlaybackSpeedChange
+            );
+            videoElement.addEventListener(
+                'enterpictureinpicture',
+                this.onPictureInPictureChange
+            );
+            videoElement.addEventListener(
+                'leavepictureinpicture',
+                this.onPictureInPictureChange
+            );
+        }
+
+        // The fullscreen event is dispatched on `document` and must be registered/removed
+        // independently of the video element being reachable.
         document.addEventListener('fullscreenchange', this.onFullscreenChange);
-        videoElement.addEventListener(
-            'enterpictureinpicture',
-            this.onPictureInPictureChange
-        );
-        videoElement.addEventListener(
-            'leavepictureinpicture',
-            this.onPictureInPictureChange
-        );
+
         videoRootElement?.addEventListener('mouseenter', this.onMouseEnter);
         videoRootElement?.addEventListener('mouseleave', this.onMouseLeave);
         videoRootElement?.addEventListener('mousemove', this.onMouseMove);
@@ -76,31 +104,37 @@ export class VideoPlayer {
     // Unregisters all video events.
     private unregisterEvents() {
         const videoElement = this.videoElementRef?.deref();
-        if (!videoElement) return;
         const videoRootElement = this.videoRootElementRef?.deref();
         const nativeControlsElement = this.nativeControlsElementRef?.deref();
 
-        videoElement.removeEventListener('play', this.onPlay);
-        videoElement.removeEventListener('pause', this.onPause);
-        videoElement.removeEventListener('ended', this.onEnded);
-        videoElement.removeEventListener('timeupdate', this.onTimeUpdate);
-        videoElement.removeEventListener('volumechange', this.onVolumeChange);
-        videoElement.removeEventListener(
-            'ratechange',
-            this.onPlaybackSpeedChange
-        );
+        if (videoElement) {
+            videoElement.removeEventListener('play', this.onPlay);
+            videoElement.removeEventListener('pause', this.onPause);
+            videoElement.removeEventListener('ended', this.onEnded);
+            videoElement.removeEventListener('timeupdate', this.onTimeUpdate);
+            videoElement.removeEventListener(
+                'volumechange',
+                this.onVolumeChange
+            );
+            videoElement.removeEventListener(
+                'ratechange',
+                this.onPlaybackSpeedChange
+            );
+            videoElement.removeEventListener(
+                'enterpictureinpicture',
+                this.onPictureInPictureChange
+            );
+            videoElement.removeEventListener(
+                'leavepictureinpicture',
+                this.onPictureInPictureChange
+            );
+        }
+
         document.removeEventListener(
             'fullscreenchange',
             this.onFullscreenChange
         );
-        videoElement.removeEventListener(
-            'enterpictureinpicture',
-            this.onPictureInPictureChange
-        );
-        videoElement.removeEventListener(
-            'leavepictureinpicture',
-            this.onPictureInPictureChange
-        );
+
         videoRootElement?.removeEventListener('mouseenter', this.onMouseEnter);
         videoRootElement?.removeEventListener('mouseleave', this.onMouseLeave);
         videoRootElement?.removeEventListener('mousemove', this.onMouseMove);
@@ -383,7 +417,8 @@ export class VideoPlayer {
         this.updateLoopSetting();
     }
 
-    // Is called when the control mode was changed. This rebuilds the UI.
+    // Is called when the control mode was changed. This rebuilds the UI. It goes through the exact
+    // same detach/attach lifecycle as player unmount/mount to guarantee a single, wired controller.
     public updateControlMode() {
         this.detach();
         this.attach();

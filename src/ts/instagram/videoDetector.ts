@@ -13,6 +13,10 @@ import { ReactDevToolsHook } from '../react/reactDevToolsHook';
 
 // Detects changes of <video> tags and attaches the custom video players to the Instagram page.
 export class VideoDetector implements PlaybackManager {
+    // Delay before attaching to a newly detected video. Instagram needs a few ticks to create the
+    // audio indicators. Exported so tests can advance their timers by the exact amount.
+    public static readonly ATTACH_DELAY_MS = 100;
+
     // The extension settings.
     private readonly settings = Settings.shared;
 
@@ -26,16 +30,47 @@ export class VideoDetector implements PlaybackManager {
     private videoPlayersByElement = new WeakMap<HTMLElement, VideoPlayer>();
     private videoPlayers: VideoPlayer[] = [];
 
+    // Delayed attach operations that have not fired yet, keyed by their Polaris root element.
+    // Keeping track of them makes sure a video removed within the attach delay never gets controls
+    // and never ends up in `videoPlayers`.
+    private pendingAttachTimeouts = new Map<
+        HTMLElement,
+        ReturnType<typeof setTimeout>
+    >();
+
     // Initialize the video detector.
     public async init() {
         this.startMessageHandling();
     }
 
+    // Releases all listeners, pending attach timers and attached players. Mostly useful for tests
+    // and hot-reloading; the page itself creates a single detector for its whole lifetime.
+    public destroy() {
+        window.removeEventListener('message', this.onWindowMessage);
+        this.settings.changed.unsubscribe(this.onSettingsChanged);
+
+        for (const timeoutId of this.pendingAttachTimeouts.values()) {
+            clearTimeout(timeoutId);
+        }
+        this.pendingAttachTimeouts.clear();
+
+        for (const videoPlayer of this.videoPlayers) {
+            videoPlayer.detach();
+        }
+        this.videoPlayers.length = 0;
+        this.videoPlayersByElement = new WeakMap<HTMLElement, VideoPlayer>();
+        this.source = null;
+    }
+
     //#region Messaging
+
+    // Stable message listener so it can be removed again in `destroy`.
+    private readonly onWindowMessage = (ev: MessageEvent) =>
+        this.onMessageHandler(ev);
 
     // Adding the message handler.
     private startMessageHandling() {
-        window.addEventListener('message', (ev) => this.onMessageHandler(ev));
+        window.addEventListener('message', this.onWindowMessage);
     }
 
     // Handling messages from the extension.
@@ -79,8 +114,12 @@ export class VideoDetector implements PlaybackManager {
         this.registerReactHooks();
 
         // Listen to setting changes.
-        this.settings.changed.subscribe((name) => this.onSettingChanged(name));
+        this.settings.changed.subscribe(this.onSettingsChanged);
     }
+
+    // Stable settings-change handler so the subscription can be removed again in `destroy`.
+    private readonly onSettingsChanged = (name: keyof SettingsData) =>
+        this.onSettingChanged(name);
 
     //#region Messaging
 
@@ -121,13 +160,12 @@ export class VideoDetector implements PlaybackManager {
                         );
 
                         if (polarisVideo && videoElement) {
-                            // Add a few ticks to let Instagram create the audio indicators.
-                            setTimeout(() => {
-                                this.tryAttachPolarisVideo(
-                                    polarisVideo,
-                                    videoElement
-                                );
-                            }, 100);
+                            // Add a few ticks to let Instagram create the audio indicators. The
+                            // scheduled attach is tracked, so unmounting within this window cancels it.
+                            this.schedulePolarisVideoAttach(
+                                polarisVideo,
+                                videoElement
+                            );
                         }
                     },
                 });
@@ -161,6 +199,44 @@ export class VideoDetector implements PlaybackManager {
         const player = new VideoPlayer(this);
         if (!player.tryDetect(polarisFiber, videoElement)) return;
         return player;
+    }
+
+    // Schedules attaching a player after a short delay. The operation is tracked by its Polaris
+    // root element so it can be cancelled if the video unmounts before the delay elapsed.
+    private schedulePolarisVideoAttach(
+        polarisFiber: ReactFiber,
+        videoElement: HTMLVideoElement
+    ) {
+        const polarisElement = ReactHelper.getNodeFromFiber(polarisFiber);
+        if (!polarisElement) {
+            return;
+        }
+
+        // A repeated commit for the same element replaces the previous pending attach.
+        this.cancelPolarisVideoAttach(polarisElement);
+
+        const timeoutId = setTimeout(() => {
+            this.pendingAttachTimeouts.delete(polarisElement);
+
+            // The player may have been removed (and its DOM detached) while waiting. Don't attach
+            // controls to an orphaned node in that case.
+            if (!polarisElement.isConnected || !videoElement.isConnected) {
+                return;
+            }
+
+            this.tryAttachPolarisVideo(polarisFiber, videoElement);
+        }, VideoDetector.ATTACH_DELAY_MS);
+
+        this.pendingAttachTimeouts.set(polarisElement, timeoutId);
+    }
+
+    // Cancels a previously scheduled attach for the given Polaris root element.
+    private cancelPolarisVideoAttach(polarisElement: HTMLElement) {
+        const timeoutId = this.pendingAttachTimeouts.get(polarisElement);
+        if (timeoutId === undefined) return;
+
+        clearTimeout(timeoutId);
+        this.pendingAttachTimeouts.delete(polarisElement);
     }
 
     private tryAttachPolarisVideo(
@@ -200,6 +276,10 @@ export class VideoDetector implements PlaybackManager {
         if (!polarisElement) {
             return;
         }
+
+        // Cancel an attach that was scheduled but hasn't run yet. Without this the timer would
+        // attach controls after the video was removed and leak a player into the registry.
+        this.cancelPolarisVideoAttach(polarisElement);
 
         const videoPlayer = this.videoPlayersByElement.get(polarisElement);
         if (!videoPlayer) {

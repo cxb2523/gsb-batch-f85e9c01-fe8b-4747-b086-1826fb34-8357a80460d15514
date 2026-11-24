@@ -24,6 +24,14 @@ export abstract class VideoController {
     // The main control background element.
     protected videoControlElement: HTMLElement | undefined;
 
+    // The video element the click blocker is attached to (see `onVideoClickBlocked`).
+    private clickBlockerElement: HTMLVideoElement | undefined;
+
+    // Stable click blocker handler so it can be removed again on rebuild/detach.
+    private readonly onVideoClickBlocked = (ev: Event) => {
+        ev.stopPropagation();
+    };
+
     // Create the control background.
     protected createVideoControlBackground() {
         const videoRootElement = this.videoPlayer.videoRootElementRef?.deref();
@@ -40,9 +48,11 @@ export abstract class VideoController {
 
         // Disable the video click event and not redirect to the post url on interaction.
         if (this.videoElement) {
-            this.videoElement.addEventListener('click', (ev) => {
-                ev.stopPropagation();
-            });
+            this.clickBlockerElement = this.videoElement;
+            this.videoElement.addEventListener(
+                'click',
+                this.onVideoClickBlocked
+            );
         }
     }
 
@@ -101,10 +111,19 @@ export abstract class VideoController {
 
     // Removes the video controls
     public remove() {
-        if (!this.videoElement) return;
+        // Remove the click blocker again.
+        if (this.clickBlockerElement) {
+            this.clickBlockerElement.removeEventListener(
+                'click',
+                this.onVideoClickBlocked
+            );
+            this.clickBlockerElement = undefined;
+        }
 
-        // Remove controls
-        this.videoElement.controls = false;
+        const videoElement = this.videoElement;
+        if (videoElement) {
+            videoElement.controls = false;
+        }
 
         if (this.videoControlElement) {
             this.videoControlElement.remove();

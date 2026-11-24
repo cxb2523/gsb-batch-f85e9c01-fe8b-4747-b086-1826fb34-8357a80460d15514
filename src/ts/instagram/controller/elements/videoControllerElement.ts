@@ -85,30 +85,38 @@ export abstract class VideoControllerElementBase<
     public pointerenter?: (ev: PointerEvent) => void;
     public pointerleave?: (ev: PointerEvent) => void;
 
+    // The actual wrapper listeners registered on the element. Keeping references makes sure they
+    // can be removed again with the exact same function.
+    private pointerenterListener?: (ev: PointerEvent) => void;
+    private pointerleaveListener?: (ev: PointerEvent) => void;
+
     private registerHooks(element: TElement) {
-        const pointerenter = this.pointerenter;
-        if (pointerenter) {
-            element.addEventListener('pointerenter', (ev) => pointerenter(ev));
+        if (this.pointerenter) {
+            this.pointerenterListener = (ev) => this.pointerenter?.(ev);
+            element.addEventListener('pointerenter', this.pointerenterListener);
         }
 
-        const pointerleave = this.pointerleave;
-        if (pointerleave) {
-            element.addEventListener('pointerleave', (ev) => pointerleave(ev));
+        if (this.pointerleave) {
+            this.pointerleaveListener = (ev) => this.pointerleave?.(ev);
+            element.addEventListener('pointerleave', this.pointerleaveListener);
         }
     }
 
     private unregisterHooks(element: TElement) {
-        const pointerenter = this.pointerenter;
-        if (pointerenter) {
-            element.removeEventListener('pointerenter', (ev) =>
-                pointerenter(ev)
+        if (this.pointerenterListener) {
+            element.removeEventListener(
+                'pointerenter',
+                this.pointerenterListener
             );
+            this.pointerenterListener = undefined;
         }
-        const pointerleave = this.pointerleave;
-        if (pointerleave) {
-            element.removeEventListener('pointerleave', (ev) =>
-                pointerleave(ev)
+
+        if (this.pointerleaveListener) {
+            element.removeEventListener(
+                'pointerleave',
+                this.pointerleaveListener
             );
+            this.pointerleaveListener = undefined;
         }
     }
 
