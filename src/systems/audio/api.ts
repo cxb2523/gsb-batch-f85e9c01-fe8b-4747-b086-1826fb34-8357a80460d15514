@@ -23,6 +23,14 @@ export interface LoopHandle {
   readonly id: number;
   readonly sound: SoundId;
   alive: boolean;
+  /**
+   * Optional owner hook, invoked exactly once when the loop's voice ends for any
+   * reason: an explicit `stop()`, the voice pool stealing it, natural expiry, or
+   * `dispose()`. Holders (vehicles, helicopters, ambient beds) set this to drop
+   * their reference synchronously instead of keeping a handle that can no longer
+   * be driven. Must be safe to call from inside `stop()`.
+   */
+  onEnded?: () => void;
 }
 
 /**
@@ -71,7 +79,11 @@ export class NullAudio implements AudioApi {
   }
 
   stop(handle: LoopHandle): void {
+    if (!handle.alive) return;
     handle.alive = false;
+    const ended = handle.onEnded;
+    handle.onEnded = undefined;
+    ended?.();
   }
 
   setLoopParams(): void {}

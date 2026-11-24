@@ -49,6 +49,7 @@ export class VehicleSystem implements GameSystem, IVehiclesPeer {
   private readonly hit: RaycastHit = { entity: null, point: new Vector3(), normal: new Vector3(), toi: 0, collider: null as unknown as RaycastHit['collider'] };
   private wreckSweep = 0;
   private offContact: (() => void) | null = null;
+  private readonly offs: (() => void)[] = [];
 
   constructor(private readonly game: Game) {
     this.pool = new Pool<Vehicle>(() => new Vehicle(game));
@@ -62,9 +63,22 @@ export class VehicleSystem implements GameSystem, IVehiclesPeer {
       if (e.a instanceof Vehicle) handleVehicleContact(this.game, e.a, e.b);
       if (e.b instanceof Vehicle) handleVehicleContact(this.game, e.b, e.a);
     });
+    this.offs.push(
+      // Taking control (player mount, mission driver) starts the engine loop at once;
+      // losing it (exit, wreck, driver bail) stops and releases the voice.
+      this.game.events.on('vehicle:entered', (e) => this.onControlChanged(e.vehicle)),
+      this.game.events.on('vehicle:exited', (e) => this.onControlChanged(e.vehicle)),
+    );
     const parked = spawnParkedCars(this.game, this, Random.fromString('leonida-parked'));
     this.game.perf.set('vehicles', this.live.length);
     console.info(`[vehicles] ${parked} parked cars spawned`);
+  }
+
+  private onControlChanged(vehicle: IVehicle): void {
+    const v = vehicle as Vehicle;
+    if (!(v instanceof Vehicle) || !v.isAlive) return;
+    if (v.hasController && !v.state.wrecked) this.audio.startEngine(v);
+    else this.audio.stopEngine(v);
   }
 
   // --- IVehiclesPeer -------------------------------------------------------------
@@ -84,6 +98,9 @@ export class VehicleSystem implements GameSystem, IVehiclesPeer {
     if (opts?.parked) v.body.sleep();
     this.live.push(v);
     this.hash.insert(v, position.x, position.z);
+    // Engine loop is bound to the entity's life: a driven vehicle starts it on spawn
+    // (parked cars get theirs when the player first takes control).
+    if (v.hasController) this.audio.startEngine(v);
     this.game.events.emit('vehicle:spawned', { vehicle: v });
     return v;
   }
@@ -261,6 +278,8 @@ export class VehicleSystem implements GameSystem, IVehiclesPeer {
 
   dispose(): void {
     this.offContact?.();
+    for (const off of this.offs) off();
+    this.offs.length = 0;
     for (let i = this.live.length - 1; i >= 0; i--) this.despawn(this.live[i]);
     this.audio.dispose();
     this.control.dispose();

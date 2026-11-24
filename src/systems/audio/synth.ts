@@ -1,15 +1,11 @@
 import { AudioConfig } from './config';
 import type { NoiseBank, NoiseKind } from './noise';
+import { PitchTrack, type PitchParam } from './pitchTrack';
 
 /** Smallest gain used by exponential ramps (they cannot reach 0). */
 export const MIN_GAIN = 0.0001;
 
 export type EngineFn = (rpm01: number, throttle01: number, speedMs: number, at: number) => void;
-
-interface Pitched {
-  param: AudioParam;
-  base: number;
-}
 
 interface Transient {
   src: AudioScheduledSourceNode;
@@ -60,7 +56,7 @@ export class Synth {
   /** Persistent sources (stopped when the voice is killed). */
   readonly sources: AudioScheduledSourceNode[] = [];
   private readonly transients: Transient[] = [];
-  private readonly pitched: Pitched[] = [];
+  private readonly pitches: PitchTrack;
   endTime: number;
   /** Absolute pitch multiplier after the latest `setPitch` (starts at `pitch`). */
   currentPitch: number;
@@ -78,6 +74,29 @@ export class Synth {
   ) {
     this.endTime = t;
     this.currentPitch = pitch;
+    this.pitches = new PitchTrack(pitch);
+  }
+
+  // --- Pitch-tracked frequencies -------------------------------------------------
+
+  /**
+   * Registers a frequency param whose value is always `base × pitch`. Recipes that
+   * drive frequencies over time (engine rpm, rotor speed) must use this for both the
+   * initial value and every later update, so pitch and engine updates compose.
+   */
+  trackPitch(param: PitchParam, base: number, at = this.t, ramp = AudioConfig.voices.paramRamp): void {
+    this.pitches.register(param, base);
+    param.setTargetAtTime(base * this.pitches.pitch, at, ramp);
+  }
+
+  /** Updates a pitch-tracked frequency's unscaled base (immediately scaled by pitch). */
+  setPitchBase(param: PitchParam, base: number, at: number, ramp = AudioConfig.voices.paramRamp): void {
+    this.pitches.setBase(param, base, at, ramp);
+  }
+
+  /** Combined frequency for a pitch-tracked base at the current pitch (for tests/inspection). */
+  pitchValue(base: number): number {
+    return this.pitches.valueFor(base);
   }
 
   // --- Randomness -----------------------------------------------------------
@@ -137,12 +156,12 @@ export class Synth {
   osc(type: OscillatorType, freq: number, dest: AudioNode = this.out, detune = 0, at = this.t): OscillatorNode {
     const o = this.ctx.createOscillator();
     o.type = type;
-    o.frequency.value = freq * this.pitch;
+    o.frequency.value = freq * this.pitches.pitch;
     o.detune.value = detune;
     o.connect(dest);
     o.start(at);
     this.sources.push(o);
-    this.pitched.push({ param: o.frequency, base: freq });
+    this.pitches.register(o.frequency, freq);
     return o;
   }
 
@@ -151,11 +170,11 @@ export class Synth {
     const s = this.ctx.createBufferSource();
     s.buffer = this.noise.get(kind);
     s.loop = true;
-    s.playbackRate.value = rate * this.pitch;
+    s.playbackRate.value = rate * this.pitches.pitch;
     s.connect(dest);
     s.start(at, Math.random() * AudioConfig.noise.seconds * 0.5);
     this.sources.push(s);
-    this.pitched.push({ param: s.playbackRate, base: rate });
+    this.pitches.register(s.playbackRate, rate);
     return s;
   }
 
@@ -216,7 +235,7 @@ export class Synth {
   /** Multiplies every registered frequency/playbackRate by `mult` with a short ramp. */
   setPitch(mult: number, at: number, ramp = AudioConfig.voices.paramRamp): void {
     this.currentPitch = mult;
-    for (const p of this.pitched) p.param.setTargetAtTime(p.base * mult, at, ramp);
+    this.pitches.setPitch(mult, at, ramp);
   }
 
   /** Immediate stop of everything (voice kill). */

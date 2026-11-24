@@ -42,9 +42,13 @@ export class AudioSystem implements GameSystem, AudioApi {
   private readonly onGesture = (): void => this.resume();
   private readonly onVoiceEnd = (voice: Voice): void => {
     this.pool.remove(voice);
-    if (voice.handle) {
-      voice.handle.alive = false;
-      this.loopVoices.delete(voice.handle.id);
+    const handle = voice.handle;
+    if (handle) {
+      voice.handle = null;
+      // A stolen/pruned/finished voice must synchronously invalidate its handle so
+      // owners (vehicles, helicopters) drop the reference instead of driving a
+      // voice that no longer exists.
+      this.endHandle(handle);
     }
   };
 
@@ -114,6 +118,8 @@ export class AudioSystem implements GameSystem, AudioApi {
     try {
       const voice = this.startVoice(id, true, opts);
       if (voice) {
+        // Starting a new voice steals the quietest loop when the pool is full; that
+        // victim's handle is ended (and its onEnded hook fired) by `onVoiceEnd`.
         voice.handle = handle;
         this.loopVoices.set(handle.id, voice);
       }
@@ -124,10 +130,10 @@ export class AudioSystem implements GameSystem, AudioApi {
   }
 
   stop(handle: LoopHandle): void {
-    handle.alive = false;
+    if (!handle.alive) return;
     const voice = this.loopVoices.get(handle.id);
+    this.endHandle(handle);
     if (!voice || !this.graph) return;
-    this.loopVoices.delete(handle.id);
     voice.handle = null;
     voice.fadeOut(this.graph.now, V.stopFade);
   }
@@ -212,6 +218,22 @@ export class AudioSystem implements GameSystem, AudioApi {
     this.graph = AudioGraph.tryCreate(this.busVolumes);
     if (!this.graph) this.graphFailed = true;
     return this.graph;
+  }
+
+  /** Marks a handle dead, forgets its voice and notifies the owner exactly once. */
+  private endHandle(handle: LoopHandle): void {
+    if (!handle.alive) return;
+    handle.alive = false;
+    this.loopVoices.delete(handle.id);
+    const ended = handle.onEnded;
+    handle.onEnded = undefined;
+    if (ended) {
+      try {
+        ended();
+      } catch (err) {
+        console.warn('[audio] loop onEnded handler failed', err);
+      }
+    }
   }
 
   private startVoice(id: SoundId, loop: boolean, opts?: PlayOptions): Voice | null {

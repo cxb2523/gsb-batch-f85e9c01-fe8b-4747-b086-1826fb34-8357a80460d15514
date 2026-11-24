@@ -87,7 +87,13 @@ export class Helicopter implements Entity, IDamageable {
       groups: Groups.VEHICLE,
       filter: Groups.BULLET_BLOCKER,
     });
-    this.loop = game.audio.loop('vehicle.engine.helicopter.loop', { position: this.position, pitch: H.loopPitch, bus: 'engine' });
+    const loop = game.audio.loop('vehicle.engine.helicopter.loop', { position: this.position, pitch: H.loopPitch, bus: 'engine' });
+    // If the voice pool steals/expires the rotor loop, drop our reference so we stop
+    // driving a dead voice (and `syncPose` stops writing to it) instead of leaking it.
+    loop.onEnded = () => {
+      if (this.loop === loop) this.loop = null;
+    };
+    this.loop = loop;
   }
 
   update(dt: number): void {
@@ -117,6 +123,11 @@ export class Helicopter implements Entity, IDamageable {
     }
     this.rotor.rotation.y += H.rotorSpeed * dt;
     this.tailRotor.rotation.x += H.rotorSpeed * 1.4 * dt;
+    // Drive the rotor loop from flight state so pitch/volume track the aircraft.
+    if (this.loop) {
+      const lift = 0.55 + Math.min(1, this.velocity.length() / H.speed) * 0.45;
+      this.ctx.game.audio.engine(this.loop, lift, this.leaving ? 1 : 0.7, this.velocity.length());
+    }
     this.syncPose();
   }
 

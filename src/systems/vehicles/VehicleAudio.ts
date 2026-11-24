@@ -21,7 +21,20 @@ const RANGE2: Record<LoopKind, number> = {
   siren: 400 ** 2,
 };
 
-/** Starts/stops the looping sounds each vehicle needs based on distance and state. */
+/**
+ * Starts/stops the looping sounds each vehicle needs.
+ *
+ * Ownership rules (the bug this replaces relied on the voice pool to tidy up):
+ * - The engine loop belongs to the vehicle entity: it is started when the entity is
+ *   created *and running* (`spawn` hands us traffic/police/mission cars with a driver)
+ *   or the moment the vehicle acquires a controller, and it is stopped and released
+ *   explicitly when the vehicle is destroyed, despawns, or loses its controller.
+ * - `startEngine` is idempotent, so two "start" calls for the same vehicle can never
+ *   stack a second voice.
+ * - Every handle is wired through `onEnded`. If the global voice pool ever steals or
+ *   expires a voice, the vehicle's Map entry is dropped synchronously and the next
+ *   update recreates a fresh voice instead of driving a dead handle.
+ */
 export class VehicleAudio {
   private readonly loops: Record<LoopKind, Map<Vehicle, LoopHandle>> = {
     engine: new Map(),
@@ -29,8 +42,16 @@ export class VehicleAudio {
     fire: new Map(),
     siren: new Map(),
   };
+  private readonly offs: (() => void)[] = [];
 
-  constructor(private readonly game: Game) {}
+  constructor(private readonly game: Game) {
+    // Destruction is immediate: release the engine voice now rather than waiting for
+    // the next distance poll to notice the wreck.
+    this.offs.push(
+      game.events.on('vehicle:exploded', ({ vehicle }) => this.stopEngine(vehicle as Vehicle)),
+      game.events.on('vehicle:despawned', ({ vehicle }) => this.remove(vehicle as Vehicle)),
+    );
+  }
 
   update(vehicles: readonly Vehicle[], listener: V3): void {
     const audio = this.game.audio;
@@ -40,8 +61,9 @@ export class VehicleAudio {
       const dz = v.position.z - listener.z;
       const d2 = dx * dx + dz * dz;
       const s = v.state;
+      // Engine lifetime follows the entity: alive + not wrecked + still has a controller.
       const running = v.isAlive && !s.wrecked && v.hasController;
-      const engine = this.sync('engine', v, running && d2 < RANGE2.engine);
+      const engine = running && d2 < RANGE2.engine ? this.startEngine(v) : this.stopEngine(v);
       if (engine) {
         audio.engine(engine, s.rpm01, v.controls.throttle, s.speedMs);
         audio.setLoopParams(engine, { position: v.position });
@@ -56,31 +78,77 @@ export class VehicleAudio {
     }
   }
 
-  private sync(kind: LoopKind, v: Vehicle, wanted: boolean): LoopHandle | null {
-    const map = this.loops[kind];
-    let handle = map.get(v) ?? null;
-    if (wanted && !handle) {
-      handle = this.game.audio.loop(LOOP_IDS[kind], { position: v.position });
-      if (kind === 'siren') this.game.audio.siren(handle, true);
-      map.set(v, handle);
-    } else if (!wanted && handle) {
-      if (kind === 'siren') this.game.audio.siren(handle, false);
-      this.game.audio.stop(handle);
-      map.delete(v);
-      handle = null;
+  /**
+   * Starts (or returns) the vehicle's engine loop. Idempotent: calling it twice for
+   * the same vehicle never creates a second voice.
+   */
+  startEngine(v: Vehicle): LoopHandle | null {
+    return this.sync('engine', v, true);
+  }
+
+  /** Stops and releases the vehicle's engine loop (idle inaudible, player out, wreck). */
+  stopEngine(v: Vehicle): null {
+    this.sync('engine', v, false);
+    return null;
+  }
+
+  /** Handle currently driving `v`'s engine loop, if any (introspection for tests/debug). */
+  engineHandle(v: Vehicle): LoopHandle | null {
+    const handle = this.loops.engine.get(v);
+    if (!handle) return null;
+    if (!handle.alive) {
+      this.loops.engine.delete(v);
+      return null;
     }
     return handle;
   }
 
-  /** Stop everything attached to a vehicle (despawn). */
+  /** Stop everything attached to a vehicle (despawn / destroy). */
   remove(v: Vehicle): void {
     for (const kind of Object.keys(this.loops) as LoopKind[]) this.sync(kind, v, false);
   }
 
   dispose(): void {
-    for (const map of Object.values(this.loops)) {
-      for (const handle of map.values()) this.game.audio.stop(handle);
-      map.clear();
+    for (const off of this.offs) off();
+    this.offs.length = 0;
+    for (const kind of Object.keys(this.loops) as LoopKind[]) {
+      const map = this.loops[kind];
+      for (const [v, handle] of [...map]) this.release(kind, v, handle);
     }
+  }
+
+  private sync(kind: LoopKind, v: Vehicle, wanted: boolean): LoopHandle | null {
+    const map = this.loops[kind];
+    let handle = map.get(v) ?? null;
+    // A handle the pool already ended must never be reused: drop it so `wanted`
+    // starts a fresh voice.
+    if (handle && !handle.alive) {
+      map.delete(v);
+      handle = null;
+    }
+    if (wanted) {
+      if (!handle) {
+        handle = this.game.audio.loop(LOOP_IDS[kind], { position: v.position });
+        // Headless (no Web Audio): the handle is inert but still a valid token.
+        if (!handle.alive) return null;
+        // Pool eviction / natural expiry must clear this vehicle's reference.
+        handle.onEnded = () => {
+          if (map.get(v) === handle) map.delete(v);
+        };
+        if (kind === 'siren') this.game.audio.siren(handle, true);
+        map.set(v, handle);
+      }
+    } else if (handle) {
+      this.release(kind, v, handle);
+      handle = null;
+    }
+    return handle;
+  }
+
+  private release(kind: LoopKind, v: Vehicle, handle: LoopHandle): void {
+    const map = this.loops[kind];
+    if (map.get(v) === handle) map.delete(v);
+    if (kind === 'siren') this.game.audio.siren(handle, false);
+    this.game.audio.stop(handle);
   }
 }

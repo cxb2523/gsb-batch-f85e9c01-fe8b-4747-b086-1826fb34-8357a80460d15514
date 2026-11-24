@@ -33,6 +33,15 @@
 - `AudioParam.value` writes for the listener every frame can zipper on very fast camera cuts; not audible in normal play.
 - Stealing picks by estimated loudness (volume × distance falloff), not measured RMS, so a quiet-but-important one-shot can be stolen during a 40-voice burst.
 
+### Fixed: engine loop lifecycle and pitch/engine overwrite
+
+- Engine/rotor loops are now owned by the vehicle entity, not the voice pool: `VehicleSystem.spawn` starts the engine loop for a driven car, `vehicle:entered`/`vehicle:exited` start/stop it as control changes, and `vehicle:exploded`/`vehicle:despawned` stop and release every loop for that vehicle (`VehicleAudio.startEngine/stopEngine/remove`). The helicopter does the same through `dispose()`/`applyDamage`.
+- `VehicleAudio` keeps one handle per (vehicle, loop kind) and `startEngine` is idempotent, so repeated start calls never stack duplicate voices.
+- Engine frequency and pitch compose through `Synth.trackPitch`/`setPitchBase` (`PitchTrack`): `onEngine` writes unscaled rpm-derived bases and every pitch change re-applies `base × pitch`, so `setLoopParams({ pitch })` after an engine update moves the engine frequency immediately instead of leaving two independently computed frequencies.
+- `LoopHandle.onEnded` fires exactly once when a voice ends for any reason (stop, pool steal, natural expiry). Owners drop their reference in that callback, so a stolen loop is recreated cleanly and engine updates never target a dead voice.
+- Tests: `tests/audio/system.test.ts`, `tests/audio/vehicleAudio.test.ts`, `tests/audio/pitchTrack.test.ts` (fake Web Audio in `tests/audio/fakeAudio.ts`).
+
+
 ## How to test
 
 - Unit tests: `npx vitest run tests/audio`

@@ -92,11 +92,13 @@ export function buildEngine(s: Synth, v: EngineVariant): void {
 
   s.onEngine = (rpm01, throttle01, speedMs, at) => {
     const rpm = model.effectiveRpm(rpm01, speedMs, at);
-    const hz = engineHz(v.baseHz, rpm) * s.currentPitch;
+    // Unscaled bases; `setPitchBase` applies the current voice pitch on top, so a
+    // later `setLoopParams({ pitch })` keeps the last rpm instead of losing it.
+    const hz = engineHz(v.baseHz, rpm);
     const r = E.ramp;
-    o1.frequency.setTargetAtTime(hz, at, r);
-    o2.frequency.setTargetAtTime(hz * v.detuneRatio, at, r);
-    sub.frequency.setTargetAtTime(hz * v.subRatio, at, r);
+    s.setPitchBase(o1.frequency, hz, at, r);
+    s.setPitchBase(o2.frequency, hz * v.detuneRatio, at, r);
+    s.setPitchBase(sub.frequency, hz * v.subRatio, at, r);
     lp.frequency.setTargetAtTime(v.cutoffIdle + rpm * v.cutoffRange + throttle01 * 600, at, r);
     intake.gain.setTargetAtTime(v.noiseGain * (0.4 + throttle01 * 0.6 + rpm * 0.3), at, r);
     level.gain.setTargetAtTime(v.gainIdle + throttle01 * 0.25 + rpm * 0.3, at, r);
@@ -105,7 +107,6 @@ export function buildEngine(s: Synth, v: EngineVariant): void {
 
 /** Rotor: pulsed brown noise (12 Hz LFO) + thin turbine whine; the LFO rate follows rpm. */
 export function buildHelicopter(s: Synth): void {
-  const model = new EngineModel();
   const level = s.gain(0.6);
   const lp = s.filter('lowpass', 520, 0.7, level);
   const rotorGain = s.gain(0.5, lp);
@@ -118,12 +119,15 @@ export function buildHelicopter(s: Synth): void {
   const chopBp = s.filter('bandpass', 90, 2, chop);
   s.noiseSrc('white', chopBp);
   s.lfo(12, 0.2, chop.gain, 'square');
+  // The LFO is a modulator and is not pitch-tracked by `osc`; register it explicitly
+  // so a pitch change moves the rotor beat rate with the rest of the engine.
+  s.trackPitch(rotorLfo.frequency, 12);
 
-  s.onEngine = (rpm01, throttle01, speedMs, at) => {
-    const rpm = model.effectiveRpm(rpm01, speedMs, at);
+  s.onEngine = (rpm01, throttle01, _speedMs, at) => {
+    const rpm = clamp01(rpm01);
     const r = E.ramp;
-    rotorLfo.frequency.setTargetAtTime((9 + rpm * 6) * s.currentPitch, at, r);
-    whine.frequency.setTargetAtTime((120 + rpm * 90) * s.currentPitch, at, r);
+    s.setPitchBase(rotorLfo.frequency, 9 + rpm * 6, at, r);
+    s.setPitchBase(whine.frequency, 120 + rpm * 90, at, r);
     lp.frequency.setTargetAtTime(420 + rpm * 700 + throttle01 * 300, at, r);
     level.gain.setTargetAtTime(0.5 + rpm * 0.3 + throttle01 * 0.2, at, r);
   };
