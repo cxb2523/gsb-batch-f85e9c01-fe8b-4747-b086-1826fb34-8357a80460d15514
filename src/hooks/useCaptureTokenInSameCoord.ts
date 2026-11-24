@@ -1,4 +1,4 @@
-import { useDispatch } from 'react-redux';
+import { useDispatch, useStore } from 'react-redux';
 import {
   deactivateAllTokens,
   lockToken,
@@ -9,14 +9,16 @@ import { type TSequenceCalculationResult } from '../types';
 import { type TToken } from '../types';
 import { useCallback } from 'react';
 import { transitionStates } from '../game/tokens/constants';
-import { defaultTokenAlignmentData } from '../game/tokens/alignment';
+import { defaultTokenAlignmentData, realignTokensAtCoord } from '../game/tokens/alignment';
 import { getGloballyUniqueTokenId } from '../game/tokens/logic';
 import { useCoordsToPosition } from './useCoordsToPosition';
 import { tokenMotionRegistry } from '../game/movement/tokenMotionRegistry';
 import { sleep } from '../utils/sleep';
+import type { RootState } from '../state/store';
 
 export function useCaptureTokenInSameCoord() {
   const dispatch = useDispatch();
+  const store = useStore<RootState>();
   const getPosition = useCoordsToPosition();
 
   return useCallback(
@@ -42,6 +44,7 @@ export function useCaptureTokenInSameCoord() {
         const entry = tokenMotionRegistry.get(getGloballyUniqueTokenId(colour, id));
         if (!entry) continue;
         entry.setExternallyAnimating(true);
+        // Tokens knocked back to base must restore their default alignment.
         dispatch(
           setTokenAlignmentData({ colour, id, newAlignmentData: defaultTokenAlignmentData })
         );
@@ -57,8 +60,18 @@ export function useCaptureTokenInSameCoord() {
         if (i < captureData.length - 1) await sleep(250);
       }
       if (animationPromises.length !== 0) await Promise.all(animationPromises);
+
+      // Every captured token was standing on the capturing token's destination
+      // tile. Now that lockToken has moved them back to base, realign the
+      // tokens still on that tile from the post-capture players state so the
+      // survivors (e.g. a single remaining token) drop their stale offsets.
+      const contestedCoord = captureData[0]?.token.coordinates;
+      if (contestedCoord) {
+        realignTokensAtCoord(contestedCoord, store.getState().players.players, dispatch);
+      }
+
       dispatch(setIsAnyTokenMoving(false));
     },
-    [dispatch, getPosition]
+    [dispatch, getPosition, store]
   );
 }

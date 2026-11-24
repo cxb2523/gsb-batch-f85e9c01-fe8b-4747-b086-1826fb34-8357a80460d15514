@@ -1,7 +1,6 @@
 import { useCallback } from 'react';
-import { applyAlignmentData } from '../game/tokens/alignment';
+import { realignTokensAtCoord } from '../game/tokens/alignment';
 import { TOKEN_START_COORDINATES } from '../game/tokens/constants';
-import { tokensWithCoord } from '../game/tokens/logic';
 import { unlockToken } from '../state/slices/playersSlice';
 import type { TTokenColourAndId } from '../types';
 import { useDispatch, useStore } from 'react-redux';
@@ -13,10 +12,12 @@ export const useUnlockAndAlignTokens = () => {
   return useCallback(
     ({ colour, id }: TTokenColourAndId) => {
       dispatch(unlockToken({ colour, id }));
+      // Read the players only AFTER the unlock so the start tile group size
+      // already includes the newly unlocked token. Tokens that were already
+      // waiting on the start tile get realigned to the new, larger group.
       const players = store.getState().players.players;
       const tokenStartCoord = TOKEN_START_COORDINATES[colour];
-      const tokensInStartCoord = tokensWithCoord(tokenStartCoord, players);
-      if (tokensInStartCoord.length !== 0) applyAlignmentData(tokensInStartCoord, dispatch);
+      realignTokensAtCoord(tokenStartCoord, players, dispatch);
     },
     [dispatch, store]
   );

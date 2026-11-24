@@ -1,12 +1,13 @@
 import { describe, it, expect, assert, vi } from 'vitest';
 import { expandTokenPath, getIntegersBetween, tokenPaths } from '../../src/game/tokens/paths';
-import type { TCoordinate, TPlayer, TToken, TTokenPath } from '../../src/types';
+import type { TCoordinate, TPlayer, TPlayerColour, TToken, TTokenPath } from '../../src/types';
 import { playerSequences } from '../../src/game/players/constants';
 import { genLockedTokens } from '../../src/game/tokens/factory';
 import {
   applyAlignmentData,
   defaultTokenAlignmentData,
   getTokenAlignmentData,
+  realignTokensAtCoord,
   tokenAlignmentData,
 } from '../../src/game/tokens/alignment';
 import { TOKEN_LOCKED_COORDINATES } from '../../src/game/tokens/constants';
@@ -147,6 +148,116 @@ describe('Test tokens/alignment', () => {
         { ...DUMMY_TOKEN, colour: 'green', id: 0, coordinates: { x: 11, y: 8 } },
       ];
       expect(() => applyAlignmentData(tokens, vi.fn())).toThrow();
+    });
+    it('should be a no-op (without throwing) for an empty group', () => {
+      const dispatch = vi.fn();
+      expect(() => applyAlignmentData([], dispatch)).not.toThrow();
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('realignTokensAtCoord', () => {
+    const buildStackedPlayers = (coord: TCoordinate, specs: [TPlayerColour, number][]) => {
+      const players = structuredClone(DUMMY_PLAYERS);
+      specs.forEach(([colour, id]) => {
+        const token = players.find((p) => p.colour === colour)!.tokens[id];
+        token.isLocked = false;
+        token.coordinates = coord;
+        token.tokenAlignmentData = { xOffset: 0.9, yOffset: -0.9, scaleFactor: 0.1 };
+      });
+      return players;
+    };
+
+    it('recomputes alignment for every token currently on the tile', () => {
+      const coord = { x: 6, y: 11 };
+      const players = buildStackedPlayers(coord, [
+        ['blue', 0],
+        ['blue', 1],
+        ['green', 2],
+      ]);
+      const dispatch = vi.fn();
+
+      realignTokensAtCoord(coord, players, dispatch);
+
+      expect(dispatch).toHaveBeenCalledTimes(3);
+      const alignmentForThree = getTokenAlignmentData(3);
+      const expectedSpecs: [TPlayerColour, number][] = [
+        ['blue', 0],
+        ['blue', 1],
+        ['green', 2],
+      ];
+      expectedSpecs.forEach(([colour, id], index) => {
+        expect(dispatch).toHaveBeenCalledWith({
+          type: 'players/setTokenAlignmentData',
+          payload: {
+            colour,
+            id,
+            newAlignmentData: alignmentForThree[index],
+          },
+        });
+      });
+    });
+
+    it('restores the default alignment for a single remaining token after another token leaves', () => {
+      const coord = { x: 6, y: 11 };
+      // Simulates the post-move state: only one token remains on the tile and
+      // it still carries the stale alignment of the former two-token group.
+      const players = buildStackedPlayers(coord, [['red', 0]]);
+      const dispatch = vi.fn();
+
+      realignTokensAtCoord(coord, players, dispatch);
+
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(dispatch).toHaveBeenCalledWith({
+        type: 'players/setTokenAlignmentData',
+        payload: {
+          colour: 'red',
+          id: 0,
+          newAlignmentData: defaultTokenAlignmentData,
+        },
+      });
+    });
+
+    it('uses the provided (post-movement) players snapshot rather than any earlier group size', () => {
+      const coord = { x: 8, y: 9 };
+      // Two tokens in the snapshot even though the caller used to hold a
+      // three-token group before the movement happened.
+      const players = buildStackedPlayers(coord, [
+        ['blue', 0],
+        ['yellow', 1],
+      ]);
+      const dispatch = vi.fn();
+
+      realignTokensAtCoord(coord, players, dispatch);
+
+      const alignmentForTwo = getTokenAlignmentData(2);
+      expect(dispatch).toHaveBeenNthCalledWith(1, {
+        type: 'players/setTokenAlignmentData',
+        payload: { colour: 'blue', id: 0, newAlignmentData: alignmentForTwo[0] },
+      });
+      expect(dispatch).toHaveBeenNthCalledWith(2, {
+        type: 'players/setTokenAlignmentData',
+        payload: { colour: 'yellow', id: 1, newAlignmentData: alignmentForTwo[1] },
+      });
+    });
+
+    it('does nothing and never throws when the tile is empty', () => {
+      const players = structuredClone(DUMMY_PLAYERS);
+      const dispatch = vi.fn();
+
+      expect(() => realignTokensAtCoord({ x: 7, y: 10 }, players, dispatch)).not.toThrow();
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+
+    it('never invokes alignment computation with an inconsistent (mixed-coordinate) group', () => {
+      const coord = { x: 6, y: 11 };
+      const players = buildStackedPlayers(coord, [['blue', 0]]);
+      // Tamper with the group so tokensWithCoord and the coord argument disagree.
+      players.find((p) => p.colour === 'blue')!.tokens[0].coordinates = { x: 0, y: 0 };
+      const dispatch = vi.fn();
+
+      expect(() => realignTokensAtCoord(coord, players, dispatch)).not.toThrow();
+      expect(dispatch).not.toHaveBeenCalled();
     });
   });
 });

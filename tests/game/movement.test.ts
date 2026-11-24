@@ -1,10 +1,15 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { calculateSequence } from '../../src/game/movement/calculateSequence';
 import { playerSequences } from '../../src/game/players/constants';
-import { defaultTokenAlignmentData } from '../../src/game/tokens/alignment';
-import { TOKEN_LOCKED_COORDINATES } from '../../src/game/tokens/constants';
+import {
+  defaultTokenAlignmentData,
+  getTokenAlignmentData,
+  realignTokensAtCoord,
+} from '../../src/game/tokens/alignment';
+import { TOKEN_LOCKED_COORDINATES, TOKEN_START_COORDINATES } from '../../src/game/tokens/constants';
 import { tokenPaths } from '../../src/game/tokens/paths';
-import { getPlayer, getToken } from '../../src/state/slices/playersSlice';
+import { tokensWithCoord } from '../../src/game/tokens/logic';
+import playersReducer, { getPlayer, getToken, unlockToken } from '../../src/state/slices/playersSlice';
 import type { RootState } from '../../src/state/store';
 import type { TToken } from '../../src/types';
 import { DUMMY_PLAYERS } from '../fixtures/players.dummy';
@@ -329,6 +334,182 @@ describe('Test game/movement', () => {
         const { nextState } = calculateSequence(state, mover, 4);
 
         expect(nextState.players.currentPlayerColour).toBe('blue');
+      });
+    });
+
+    describe('alignment recomputation after the move', () => {
+      it('realigns from the post-movement state: a tile left empty by the move triggers nothing', () => {
+        const state = buildState();
+        const mover = getToken(state.players, 'blue', 0);
+        placeOnPath(mover, 2);
+        const dispatch = vi.fn();
+
+        const { nextState } = calculateSequence(state, mover, 4);
+
+        // The tile the mover started from is now empty. Recomputing on it must
+        // be a safe no-op instead of throwing on a zero-length token group.
+        expect(() =>
+          realignTokensAtCoord(tokenPaths.blue[2], nextState.players.players, dispatch)
+        ).not.toThrow();
+        expect(dispatch).not.toHaveBeenCalled();
+      });
+
+      it('realigns the destination tile from the post-movement group size', () => {
+        const state = buildState();
+        const mover = getToken(state.players, 'blue', 0);
+        placeOnPath(mover, 2);
+        // A teammate is already waiting on the destination tile.
+        placeOnPath(getToken(state.players, 'blue', 1), 6);
+        const dispatch = vi.fn();
+
+        const { nextState } = calculateSequence(state, mover, 4);
+        const destination = tokenPaths.blue[6];
+        realignTokensAtCoord(destination, nextState.players.players, dispatch);
+
+        const tokensOnDestination = tokensWithCoord(destination, nextState.players.players);
+        expect(tokensOnDestination).toHaveLength(2);
+        const alignmentForTwo = getTokenAlignmentData(2);
+        expect(dispatch).toHaveBeenCalledTimes(2);
+        expect(dispatch).toHaveBeenCalledWith({
+          type: 'players/setTokenAlignmentData',
+          payload: {
+            colour: 'blue',
+            id: 0,
+            newAlignmentData: alignmentForTwo[0],
+          },
+        });
+        expect(dispatch).toHaveBeenCalledWith({
+          type: 'players/setTokenAlignmentData',
+          payload: {
+            colour: 'blue',
+            id: 1,
+            newAlignmentData: alignmentForTwo[1],
+          },
+        });
+      });
+
+      it('captured tokens keep the default alignment once they are knocked back to base', () => {
+        const state = buildState();
+        const mover = getToken(state.players, 'blue', 0);
+        placeOnPath(mover, 2);
+        const enemy = getToken(state.players, 'red', 0);
+        placeOnPath(enemy, 45);
+        enemy.tokenAlignmentData = { xOffset: 0.4, yOffset: -0.4, scaleFactor: 0.6 };
+
+        const { nextState, captureData } = calculateSequence(state, mover, 4);
+
+        expect(captureData).toHaveLength(1);
+        const capturedToken = getToken(nextState.players, 'red', 0);
+        expect(capturedToken.isLocked).toBe(true);
+        expect(capturedToken.coordinates).toEqual(TOKEN_LOCKED_COORDINATES.red[0]);
+        expect(capturedToken.tokenAlignmentData).toEqual(defaultTokenAlignmentData);
+      });
+
+      it('after a capture, a single token remaining on the contested tile restores default alignment', () => {
+        const state = buildState();
+        const mover = getToken(state.players, 'blue', 0);
+        placeOnPath(mover, 2);
+        // Two opponent tokens stacked on the destination tile.
+        placeOnPath(getToken(state.players, 'red', 0), 45);
+        placeOnPath(getToken(state.players, 'red', 1), 45);
+        const contestedCoord = tokenPaths.red[45];
+
+        const { nextState, captureData } = calculateSequence(state, mover, 4);
+
+        expect(captureData).toHaveLength(2);
+        // Post-capture state: both opponents are back in base, only the mover
+        // remains on the contested tile.
+        const remaining = tokensWithCoord(contestedCoord, nextState.players.players);
+        expect(remaining).toHaveLength(1);
+        expect(remaining[0].colour).toBe('blue');
+
+        const dispatch = vi.fn();
+        realignTokensAtCoord(contestedCoord, nextState.players.players, dispatch);
+
+        expect(dispatch).toHaveBeenCalledTimes(1);
+        expect(dispatch).toHaveBeenCalledWith({
+          type: 'players/setTokenAlignmentData',
+          payload: {
+            colour: 'blue',
+            id: 0,
+            newAlignmentData: defaultTokenAlignmentData,
+          },
+        });
+      });
+
+      it('after reaching home, the former tile is realigned for the tokens still occupying it', () => {
+        const lastIndex = tokenPaths.blue.length - 1;
+        const state = buildState();
+        const mover = getToken(state.players, 'blue', 0);
+        placeOnPath(mover, lastIndex - 2);
+        // A teammate stays on the tile the mover is about to leave.
+        const teammate = getToken(state.players, 'blue', 1);
+        placeOnPath(teammate, lastIndex - 2);
+        const formerCoord = tokenPaths.blue[lastIndex - 2];
+        const dispatch = vi.fn();
+
+        const { nextState } = calculateSequence(state, mover, 2);
+
+        const reachedToken = getToken(nextState.players, 'blue', 0);
+        expect(reachedToken.hasTokenReachedHome).toBe(true);
+        const remaining = tokensWithCoord(formerCoord, nextState.players.players);
+        expect(remaining).toHaveLength(1);
+        expect(remaining[0].id).toBe(1);
+
+        realignTokensAtCoord(formerCoord, nextState.players.players, dispatch);
+
+        expect(dispatch).toHaveBeenCalledTimes(1);
+        expect(dispatch).toHaveBeenCalledWith({
+          type: 'players/setTokenAlignmentData',
+          payload: {
+            colour: 'blue',
+            id: 1,
+            newAlignmentData: defaultTokenAlignmentData,
+          },
+        });
+      });
+
+      it('after an unlock, the start tile is realigned using the post-unlock group size', () => {
+        const state = buildState();
+        const startCoord = TOKEN_START_COORDINATES.blue;
+        // One token already unlocked and sitting on the start tile.
+        const waitingToken = getToken(state.players, 'blue', 0);
+        waitingToken.isLocked = false;
+        waitingToken.coordinates = startCoord;
+        // A locked token about to be unlocked.
+        const lockedToken = getToken(state.players, 'blue', 1);
+        expect(lockedToken.isLocked).toBe(true);
+        const dispatch = vi.fn();
+
+        // Mirror useUnlockAndAlignTokens: unlock first, then read the NEW state.
+        const unlockedPlayersState = playersReducer(
+          state.players,
+          unlockToken({ colour: 'blue', id: 1 })
+        );
+
+        const startGroup = tokensWithCoord(startCoord, unlockedPlayersState.players);
+        expect(startGroup).toHaveLength(2);
+
+        realignTokensAtCoord(startCoord, unlockedPlayersState.players, dispatch);
+
+        const alignmentForTwo = getTokenAlignmentData(2);
+        expect(dispatch).toHaveBeenCalledTimes(2);
+        expect(dispatch).toHaveBeenCalledWith({
+          type: 'players/setTokenAlignmentData',
+          payload: {
+            colour: 'blue',
+            id: 0,
+            newAlignmentData: alignmentForTwo[0],
+          },
+        });
+        expect(dispatch).toHaveBeenCalledWith({
+          type: 'players/setTokenAlignmentData',
+          payload: {
+            colour: 'blue',
+            id: 1,
+            newAlignmentData: alignmentForTwo[1],
+          },
+        });
       });
     });
   });

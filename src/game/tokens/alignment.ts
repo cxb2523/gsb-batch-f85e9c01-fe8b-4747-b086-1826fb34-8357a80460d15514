@@ -1,7 +1,8 @@
 import type { Dispatch, UnknownAction } from '@reduxjs/toolkit';
-import type { TToken, TTokenAlignmentData } from '../../types';
+import type { TToken, TTokenAlignmentData, TCoordinate, TPlayer } from '../../types';
 import { setTokenAlignmentData } from '../../state/slices/playersSlice';
 import { areCoordsEqual } from '../coords/logic';
+import { tokensWithCoord } from './logic';
 
 export const defaultTokenAlignmentData = { xOffset: 0, yOffset: 0, scaleFactor: 1 };
 
@@ -721,6 +722,7 @@ export function getTokenAlignmentData(numberOfTokensInOneTile: number): TTokenAl
 }
 
 export function applyAlignmentData(tokens: TToken[], dispatch: Dispatch<UnknownAction>) {
+  if (tokens.length === 0) return;
   if (!tokens.every((t) => areCoordsEqual(t.coordinates, tokens[0].coordinates)))
     throw new Error('All tokens must have the same coordinate');
 
@@ -736,4 +738,26 @@ export function applyAlignmentData(tokens: TToken[], dispatch: Dispatch<UnknownA
       })
     );
   }
+}
+
+/**
+ * Recalculates the alignment data of every token occupying a tile.
+ *
+ * The players array MUST represent the state AFTER the movement/capture/unlock
+ * has been applied, so that the group size and each token's coordinate reflect
+ * the latest situation rather than a pre-move snapshot.
+ *
+ * Empty tiles are a no-op and never throw. Groups whose tokens do not actually
+ * share the given coordinate are skipped instead of throwing, so a stale group
+ * reference can never crash the game.
+ */
+export function realignTokensAtCoord(
+  coord: TCoordinate,
+  players: TPlayer[],
+  dispatch: Dispatch<UnknownAction>
+): void {
+  const tokensInCoord = tokensWithCoord(coord, players);
+  if (tokensInCoord.length === 0) return;
+  if (!tokensInCoord.every((t) => areCoordsEqual(t.coordinates, coord))) return;
+  applyAlignmentData(tokensInCoord, dispatch);
 }
