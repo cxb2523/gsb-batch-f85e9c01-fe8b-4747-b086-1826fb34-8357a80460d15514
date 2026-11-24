@@ -299,17 +299,28 @@ function industrialPlan(
 ): MassingPlan {
   const { w, h, seed } = input;
   const boxes: MassingBox[] = [];
-  let ventRoof = outer;
+  // Roof region + lift the vent stacks attach to. Defaults to the single
+  // flat roof; the split branches may move it to a safe sub-region/host.
+  let ventRoof: FracRect = outer;
+  let ventLiftPx = bodyH;
 
   if (Math.min(w, h) >= 2 && bodyH >= 8) {
     const wingFrac = 0.28 + 0.08 * seedUnit(seed, 2);
     const { main, wing, axis } = splitMainWing(outer, wingFrac);
-    // The wing is sometimes a taller head house — vents go to the back half of
-    // the main roof so they stay clear of its screen projection.
+    // The wing is sometimes a taller head house. A taller FRONT wing projects
+    // up-screen over the main roof, so vents must not stay on the main block
+    // in that branch: host them on the head-house roof itself (front-most and
+    // tallest box → nothing can project over them). When the wing is shorter,
+    // main-roof vents use the back half, clear of the wing's projection.
     const wingH = Math.max(4, Math.round(bodyH * (seedUnit(seed, 3) < 0.5 ? 1.3 : 0.6)));
     boxes.push({ rect: main, baseLiftPx: 0, wallHeightPx: bodyH, roof: { kind: 'flat' }, facade: 'punched' });
     boxes.push({ rect: wing, baseLiftPx: 0, wallHeightPx: wingH, roof: { kind: 'flat' }, facade: 'punched' });
-    ventRoof = backHalf(main, axis);
+    if (wingH > bodyH) {
+      ventRoof = wing;
+      ventLiftPx = wingH;
+    } else {
+      ventRoof = backHalf(main, axis);
+    }
   } else {
     boxes.push({ rect: outer, baseLiftPx: 0, wallHeightPx: bodyH, roof: { kind: 'flat' }, facade: 'punched' });
   }
@@ -322,7 +333,7 @@ function industrialPlan(
       props.push({
         kind: 'vent',
         rect,
-        baseLiftPx: bodyH,
+        baseLiftPx: ventLiftPx,
         heightPx: 6 + Math.round(5 * seedUnit(seed, 30 + i)),
       });
     }
