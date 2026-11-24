@@ -18,9 +18,22 @@ class FifteenPuzzle {
         this.tiles = {};
         this.emptyPos = { x: 0, y: 0 };
         this.isPlaying = false;
-        
+        this.destroyed = false;
+
         this.gamepadLoop = null;
         this.lastGamepadState = false;
+
+        // Keep references to every listener and pending asynchronous task so
+        // destroy() can release exactly the resources owned by this instance.
+        this.tileClickHandlers = {};
+        this.timeoutIds = new Set();
+        this.animationFrameIds = new Set();
+        this.shuffleTimeout = null;
+        this.winTimeout = null;
+
+        this.keyDownHandler = (event) => this.handleKeyDown(event);
+        this.resizeHandler = () => this.handleResize();
+        this.gamepadConnectedHandler = (event) => this.handleGamepadConnected(event);
 
         this.init();
     }
@@ -35,9 +48,12 @@ class FifteenPuzzle {
         this.container.style.position = 'relative';
 
         // Setup resize handling
+        this.resizeListenerAttached = false;
         if (this.config.fill) {
+            this.addResizeListener();
             this.handleResize();
-            window.addEventListener('resize', () => this.handleResize(), true);
+        } else {
+            this.container.style.transform = "scale(1)";
         }
 
         const emptySlotTarget = this.config.emptySlot || (this.rows * this.cols);
@@ -85,7 +101,11 @@ class FifteenPuzzle {
             ${customStyle}
         `;
 
-        tile.addEventListener("click", () => this.handleTileClick(id));
+        const clickHandler = () => {
+            if (!this.destroyed) this.handleTileClick(id);
+        };
+        this.tileClickHandlers[id] = clickHandler;
+        tile.addEventListener("click", clickHandler);
         this.container.appendChild(tile);
         this.tiles[id] = tile;
     }
@@ -113,9 +133,10 @@ class FifteenPuzzle {
         }
 
         this.updateDOM(false); // Update without animation
-        
+
         // Enable transitions after shuffle
-        setTimeout(() => {
+        this.shuffleTimeout = this.setManagedTimeout(() => {
+            this.shuffleTimeout = null;
             this.isPlaying = true;
             Object.values(this.tiles).forEach(tile => {
                 if (this.config.time) tile.style.transition = `all ${this.config.time}s ease`;
@@ -123,8 +144,36 @@ class FifteenPuzzle {
         }, 50);
     }
 
+    setManagedTimeout(callback, delay) {
+        if (this.destroyed) return null;
+
+        let id;
+        id = setTimeout(() => {
+            this.timeoutIds.delete(id);
+            if (!this.destroyed) callback();
+        }, delay);
+
+        if (id === undefined || id === null) return null;
+        this.timeoutIds.add(id);
+        return id;
+    }
+
+    setManagedAnimationFrame(callback) {
+        if (this.destroyed || typeof requestAnimationFrame !== "function") return null;
+
+        let id;
+        id = requestAnimationFrame((timestamp) => {
+            this.animationFrameIds.delete(id);
+            if (!this.destroyed) callback(timestamp);
+        });
+
+        if (id === undefined || id === null) return null;
+        this.animationFrameIds.add(id);
+        return id;
+    }
+
     handleTileClick(id) {
-        if (!this.isPlaying) return;
+        if (this.destroyed || !this.isPlaying) return;
 
         let target = null;
         for (let y = 0; y < this.rows; y++) {
@@ -137,6 +186,8 @@ class FifteenPuzzle {
 
     // Allows sliding multiple blocks in the same row/column at once
     moveTile(x, y) {
+        if (this.destroyed) return false;
+
         const ex = this.emptyPos.x;
         const ey = this.emptyPos.y;
 
@@ -167,6 +218,8 @@ class FifteenPuzzle {
     }
 
     updateDOM(animate) {
+        if (this.destroyed) return;
+
         for (let y = 0; y < this.rows; y++) {
             for (let x = 0; x < this.cols; x++) {
                 const tileId = this.matrix[y][x];
@@ -180,6 +233,8 @@ class FifteenPuzzle {
     }
 
     checkWin() {
+        if (this.destroyed) return;
+
         let expectedId = 1;
         const max = this.rows * this.cols;
 
@@ -196,62 +251,174 @@ class FifteenPuzzle {
 
         // Win state logic
         this.isPlaying = false;
-        setTimeout(() => {
+        this.winTimeout = this.setManagedTimeout(() => {
+            this.winTimeout = null;
             alert('win');
         }, (this.config.time ? this.config.time * 1000 : 50));
     }
 
+    addResizeListener() {
+        if (this.resizeListenerAttached || typeof window === "undefined") return;
+        window.addEventListener('resize', this.resizeHandler, true);
+        this.resizeListenerAttached = true;
+    }
+
+    removeResizeListener() {
+        if (!this.resizeListenerAttached || typeof window === "undefined") return;
+        window.removeEventListener('resize', this.resizeHandler, true);
+        this.resizeListenerAttached = false;
+    }
+
     handleResize() {
+        if (this.destroyed || !this.container || !this.container.parentNode) return;
+
         const rect = this.container.parentNode.getBoundingClientRect();
         const scale = Math.min(rect.width / this.config.size[0], rect.height / this.config.size[1]);
         this.container.style.transform = `scale(${scale})`;
         this.container.style.transformOrigin = "center center";
     }
 
+    handleKeyDown(event) {
+        if (this.destroyed || !this.isPlaying) return;
+
+        const { x, y } = this.emptyPos;
+
+        // Arrows pull tiles *into* the empty slot securely
+        if (event.keyCode === 37 && x < this.cols - 1) this.moveTile(x + 1, y); // Left
+        else if (event.keyCode === 39 && x > 0) this.moveTile(x - 1, y);        // Right
+        else if (event.keyCode === 38 && y < this.rows - 1) this.moveTile(x, y + 1); // Up
+        else if (event.keyCode === 40 && y > 0) this.moveTile(x, y - 1);        // Down
+    }
+
+    pollGamepads() {
+        if (this.destroyed || typeof navigator === "undefined" || typeof navigator.getGamepads !== "function") return;
+
+        const gamepads = navigator.getGamepads() || [];
+        for (let gamepad of gamepads) {
+            if (!gamepad) continue;
+            const isPressed = gamepad.buttons.some(btn => btn.pressed);
+
+            if (this.lastGamepadState !== isPressed && this.isPlaying) {
+                this.lastGamepadState = isPressed;
+                const { x, y } = this.emptyPos;
+
+                // Standard D-Pad Mapping (Safely accessing bounds)
+                if (gamepad.buttons[12].pressed && y < this.rows - 1) this.moveTile(x, y + 1); // Up
+                else if (gamepad.buttons[13].pressed && y > 0) this.moveTile(x, y - 1);        // Down
+                else if (gamepad.buttons[14].pressed && x < this.cols - 1) this.moveTile(x + 1, y); // Left
+                else if (gamepad.buttons[15].pressed && x > 0) this.moveTile(x - 1, y);        // Right
+            }
+        }
+    }
+
+    startGamepadLoop() {
+        if (this.destroyed || this.gamepadLoop !== null) return;
+
+        const updateGamepad = () => {
+            if (this.destroyed) return;
+            this.pollGamepads();
+            this.gamepadLoop = this.setManagedAnimationFrame(updateGamepad);
+        };
+
+        this.gamepadLoop = this.setManagedAnimationFrame(updateGamepad);
+    }
+
+    handleGamepadConnected() {
+        if (this.destroyed) return;
+
+        // Preserve the original immediate poll, while ensuring repeated
+        // connection events cannot create multiple RAF polling loops.
+        this.pollGamepads();
+        this.startGamepadLoop();
+    }
+
     bindInputs() {
         // Keyboard Support
         if (this.config.keyBoard) {
-            document.addEventListener("keydown", (e) => {
-                if (!this.isPlaying) return;
-                const { x, y } = this.emptyPos;
-                
-                // Arrows pull tiles *into* the empty slot securely
-                if (e.keyCode === 37 && x < this.cols - 1) this.moveTile(x + 1, y); // Left
-                else if (e.keyCode === 39 && x > 0) this.moveTile(x - 1, y);        // Right
-                else if (e.keyCode === 38 && y < this.rows - 1) this.moveTile(x, y + 1); // Up
-                else if (e.keyCode === 40 && y > 0) this.moveTile(x, y - 1);        // Down
-            });
+            document.addEventListener("keydown", this.keyDownHandler);
         }
 
         // Gamepad Support
         if (this.config.gamePad) {
-            window.addEventListener('gamepadconnected', () => {
-                const updateGamepad = () => {
-                    const gamepads = navigator.getGamepads();
-                    for (let gamepad of gamepads) {
-                        if (!gamepad) continue;
-                        const isPressed = gamepad.buttons.some(btn => btn.pressed);
-                        
-                        if (this.lastGamepadState !== isPressed && this.isPlaying) {
-                            this.lastGamepadState = isPressed;
-                            const { x, y } = this.emptyPos;
+            window.addEventListener('gamepadconnected', this.gamepadConnectedHandler);
 
-                            // Standard D-Pad Mapping (Safely accessing bounds)
-                            if (gamepad.buttons[12].pressed && y < this.rows - 1) this.moveTile(x, y + 1); // Up
-                            else if (gamepad.buttons[13].pressed && y > 0) this.moveTile(x, y - 1);        // Down
-                            else if (gamepad.buttons[14].pressed && x < this.cols - 1) this.moveTile(x + 1, y); // Left
-                            else if (gamepad.buttons[15].pressed && x > 0) this.moveTile(x - 1, y);        // Right
+            // A replacement instance can be created after the gamepad was
+            // already connected, in which case the browser will not fire
+            // gamepadconnected again. Start polling only if a pad is present.
+            if (typeof navigator !== "undefined" && typeof navigator.getGamepads === "function") {
+                try {
+                    let hasGamepad = false;
+                    const existingGamepads = navigator.getGamepads() || [];
+                    for (const gamepad of existingGamepads) {
+                        if (gamepad) {
+                            hasGamepad = true;
+                            break;
                         }
                     }
-                    this.gamepadLoop = requestAnimationFrame(updateGamepad);
-                };
-                updateGamepad();
-            });
+                    if (hasGamepad) this.handleGamepadConnected();
+                } catch (error) {
+                    // Some embedders restrict gamepad access. The
+                    // gamepadconnected listener remains available as a fallback.
+                }
+            }
         }
     }
+
+    destroy() {
+        if (this.destroyed) return;
+        this.destroyed = true;
+        this.isPlaying = false;
+
+        if (this.config.keyBoard) {
+            document.removeEventListener("keydown", this.keyDownHandler);
+        }
+        if (this.config.gamePad) {
+            window.removeEventListener('gamepadconnected', this.gamepadConnectedHandler);
+        }
+        this.removeResizeListener();
+
+        // Remove click listeners from all tiles owned by this instance.
+        Object.keys(this.tileClickHandlers).forEach((id) => {
+            const tile = this.tiles[id];
+            if (tile) tile.removeEventListener("click", this.tileClickHandlers[id]);
+        });
+        this.tileClickHandlers = {};
+
+        // Cancel pending shuffle/win callbacks and all other tracked timers.
+        if (this.shuffleTimeout !== null) {
+            clearTimeout(this.shuffleTimeout);
+            this.timeoutIds.delete(this.shuffleTimeout);
+            this.shuffleTimeout = null;
+        }
+        if (this.winTimeout !== null) {
+            clearTimeout(this.winTimeout);
+            this.timeoutIds.delete(this.winTimeout);
+            this.winTimeout = null;
+        }
+        this.timeoutIds.forEach((id) => clearTimeout(id));
+        this.timeoutIds.clear();
+
+        // Stop the active gamepad loop and any other pending animation frames.
+        if (this.gamepadLoop !== null && this.gamepadLoop !== undefined) {
+            cancelAnimationFrame(this.gamepadLoop);
+            this.animationFrameIds.delete(this.gamepadLoop);
+            this.gamepadLoop = null;
+        }
+        this.animationFrameIds.forEach((id) => cancelAnimationFrame(id));
+        this.animationFrameIds.clear();
+    }
+}
+// Expose the constructor without changing the browser/exported-HTML usage.
+if (typeof window !== "undefined") {
+    window.FifteenPuzzle = FifteenPuzzle;
+}
+if (typeof module !== "undefined" && module.exports) {
+    module.exports = FifteenPuzzle;
+    module.exports.FifteenPuzzle = FifteenPuzzle;
+    module.exports.default = FifteenPuzzle;
 }
 
 // Automatically start game if the global setup object exists (backward compatibility)
-if (typeof setup !== 'undefined' && setup.puzzle_fifteen) {
+if (typeof setup !== 'undefined' && setup.puzzle_fifteen && typeof window !== 'undefined') {
     window.gameInstance = new FifteenPuzzle(setup.puzzle_fifteen, "fifteen");
 }

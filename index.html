@@ -129,7 +129,7 @@ input:checked+.slider:before{transform:translateX(26px);}
         <tr>
         <td style="height:34px;padding-right:8px;" align="right">Puzzle fill</td>
         <td align="center"><label class="switch">
-            <input type="checkbox" onchange="setup.puzzle_fifteen.fill=this.checked;if(!this.checked){window.removeEventListener('resize',fifteen_resize,true);f.style.transform='scale(1)'};fifteen_update();" checked>
+            <input type="checkbox" onchange="setup.puzzle_fifteen.fill=this.checked;fifteen_update();" checked>
             <span class="slider round"></span>
         </label></td>
         </tr>
@@ -199,8 +199,14 @@ function auto_style(){
     }slot_style.value=s.style;
 }
 function fifteen_update(){
-    fifteen.innerHTML="";
-    new FifteenPuzzle(setup.puzzle_fifteen);
+    var container=document.getElementById('fifteen');
+    if(window.gameInstance&&typeof window.gameInstance.destroy==='function'){
+        window.gameInstance.destroy();
+        window.gameInstance=null;
+    }
+    container.innerHTML="";
+    window.gameInstance=new FifteenPuzzle(setup.puzzle_fifteen);
+    return window.gameInstance;
 }
 function fifteen_build(){
     let reader=new FileReader();
