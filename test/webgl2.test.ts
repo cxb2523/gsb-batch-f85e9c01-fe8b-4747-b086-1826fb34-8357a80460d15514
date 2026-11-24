@@ -513,5 +513,139 @@ describe("WebGL2Backend", () => {
       // Objects from before the loss died with that context; everything made since is freed.
       expect(created.slice(restoredFrom).filter((o) => !o.deleted)).toEqual([]);
     });
+
+    it("recreates a target blank on its first draw after a restore, once per frame, and frees it on dispose", () => {
+      const { gl, created, fire, count, calls } = fakeGL();
+      const backend = new WebGL2Backend(gl);
+      const draw = new Draw(backend, false);
+      draw.begin("#000", 100, 50, 1);
+      const t = draw.createTarget(8, 8);
+      draw.into(t, () => draw.rect(0, 0, 8, 8, "#fff"));
+      draw.sprite(t, 50, 25);
+      draw.end();
+      // Everything made for the target before the loss dies with the context.
+      const dead = created.filter((o) => o.kind === "Framebuffer" || o.kind === "Texture");
+      fire("webglcontextlost");
+      const restoredFrom = created.length;
+      fire("webglcontextrestored");
+      const fbos = count("createFramebuffer");
+      const texs = count("createTexture");
+      draw.begin("#000", 100, 50, 1);
+      // Drawn into twice and sampled in between: one store per target, not one per call.
+      draw.into(t, () => draw.rect(0, 0, 8, 8, "#f00"));
+      draw.sprite(t, 50, 25);
+      draw.into(t, () => draw.rect(0, 0, 8, 8, "#0f0"));
+      draw.sprite(t, 50, 25);
+      draw.end();
+      expect(count("createFramebuffer") - fbos).toBe(1);
+      // Just one texture for the target: the white one was remade by setup() during the restore event.
+      expect(count("createTexture") - texs).toBe(1);
+      // The new target starts transparent before anything draws into it: a clear with the transparent colour.
+      const clears = calls.slice(restoredFrom).filter((c) => c.name === "clearColor").map((c) => c.args);
+      expect(clears).toContainEqual([0, 0, 0, 0]);
+      // draw.dispose() must free the objects remade after the restore, not just forget them.
+      draw.dispose();
+      expect(created.slice(restoredFrom).filter((o) => !o.deleted)).toEqual([]);
+      // The dead objects are not touched: the backend never deletes across contexts.
+      expect(dead.filter((o) => o.deleted)).toEqual([]);
+    });
+  });
+
+  it("re-uploads images, re-asks the host for borrowed textures and rebuilds targets on the first draw after a restore", () => {
+    const { gl, fire, count, calls } = fakeGL();
+    const hostA = { kind: "Host", deleted: false };
+    const hostB = { kind: "Host", deleted: false };
+    let host = hostA as unknown as WebGLTexture;
+    let asked = 0;
+    class LendingBackend extends WebGL2Backend {
+      // Only the lent source is the host's; others upload, as `borrow` returning null would.
+      protected override borrow(src: unknown): { texture: WebGLTexture; width: number; height: number; flipY: boolean } | null {
+        if (src !== lent) return null;
+        asked++;
+        return { texture: host, width: 16, height: 16, flipY: false };
+      }
+    }
+    const backend = new LendingBackend(gl);
+    const draw = new Draw(backend, false);
+    const img = image();
+    const lent = image(32, 32);
+    const target = draw.createTarget(8, 8);
+    draw.begin("#000", 100, 50, 1);
+    draw.into(target, () => draw.rect(0, 0, 8, 8, "#fff"));
+    draw.sprite(img, 10, 10);
+    draw.sprite(lent, 20, 20);
+    draw.end();
+    expect(asked).toBe(1);
+    fire("webglcontextlost");
+    fire("webglcontextrestored");
+    // The host rebuilt its texture on the new context.
+    host = hostB as unknown as WebGLTexture;
+    const texs = count("createTexture");
+    const uploads = count("texImage2D");
+    const from = calls.length;
+    draw.begin("#000", 100, 50, 1);
+    draw.into(target, () => draw.rect(0, 0, 8, 8, "#fff"));
+    draw.sprite(img, 10, 10);
+    draw.sprite(lent, 20, 20);
+    draw.end();
+    // The host is asked again, and its new texture is the one bound.
+    expect(asked).toBe(2);
+    const bound = calls.slice(from).filter((c) => c.name === "bindTexture").map((c) => c.args[1]);
+    expect(bound).toContain(hostB);
+    expect(bound).not.toContain(hostA);
+    // The plain image re-uploads, and the target's texture is made again (the white texture alone at setup).
+    expect(count("texImage2D") - uploads).toBe(2);
+    expect(count("createTexture") - texs).toBe(2);
+    // Disposing frees what the restore remade, and never the host's texture.
+    draw.dispose();
+    expect(hostA.deleted).toBe(false);
+    expect(hostB.deleted).toBe(false);
+  });
+
+  it("drops a shape batch queued before the loss instead of drawing it with dead texture units", () => {
+    const { gl, fire, count } = fakeGL();
+    const draw = new Draw(new WebGL2Backend(gl), false);
+    draw.begin("#000", 100, 50, 1);
+    // Queued in the shape batch, never flushed before the loss.
+    ring(draw, 20, 20, 10, 2, "#fff");
+    fire("webglcontextlost");
+    fire("webglcontextrestored");
+    draw.begin("#000", 100, 50, 1);
+    draw.end();
+    expect(count("drawElements")).toBe(0);
+  });
+
+  it("never binds a lent texture from the old context after a restore", () => {
+    const { gl, fire, count, calls } = fakeGL();
+    const backend = new WebGL2Backend(gl);
+    const lent = image(32, 32);
+    const staleHost = { kind: "Host", deleted: false } as unknown as WebGLTexture;
+    // The host lent this texture on the old context.
+    backend.lend(lent, staleHost, 32, 32);
+    backend.begin("#000", 100, 50, 1);
+    backend.quad(M, lent, 0, 0, 32, 32, 0xffffffff, 0, false);
+    backend.end();
+    fire("webglcontextlost");
+    fire("webglcontextrestored");
+    const uploads = count("texImage2D");
+    const from = calls.length;
+    backend.begin("#000", 100, 50, 1);
+    backend.quad(M, lent, 0, 0, 32, 32, 0xffffffff, 0, false);
+    backend.end();
+    // Not re-lent: spryte uploads its own copy rather than sampling a texture from the dead context.
+    expect(calls.slice(from).filter((c) => c.name === "bindTexture").map((c) => c.args[1])).not.toContain(staleHost);
+    expect(count("texImage2D") - uploads).toBe(1);
+    // Re-lending after the restore makes the host's new texture the one drawn.
+    const freshHost = { kind: "Host", deleted: false } as unknown as WebGLTexture;
+    backend.lend(lent, freshHost, 32, 32);
+    const again = calls.length;
+    backend.begin("#000", 100, 50, 1);
+    backend.quad(M, lent, 0, 0, 32, 32, 0xffffffff, 0, false);
+    backend.end();
+    expect(calls.slice(again).filter((c) => c.name === "bindTexture").map((c) => c.args[1])).toContain(freshHost);
+    backend.dispose();
+    // Never the host's, on either context.
+    expect(staleHost.deleted).toBe(false);
+    expect(freshHost.deleted).toBe(false);
   });
 });

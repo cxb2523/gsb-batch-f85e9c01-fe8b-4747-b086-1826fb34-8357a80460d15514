@@ -397,15 +397,32 @@ export class WebGL2Backend implements Backend {
     this.customs.clear();
     this.eachCustoms.clear();
     this.layers = new WeakMap();
+    // Nothing GPU-derived may survive. Dropping the cached textures makes the next draw resolve every
+    // source afresh: a render target through `targetStore` (a new, blank framebuffer and texture), a borrowed
+    // texture by asking the host again, and an image by uploading it again. Dropping the targets' stores frees
+    // their dead framebuffers, and the first use makes exactly one new pair per target.
     this.textures.clear();
     this.targets.clear();
     this.target = null;
     this.lastSrc = null;
     this.last = undefined;
+    // The batch, its texture units and any pending shapes were built from objects on the dead context:
+    // forget them all, so nothing queued before the loss is flushed with stale state afterwards.
     this.count = 0;
     this.unitCount = 0;
+    this.units.fill(null);
+    this.unitSmooth.fill(false);
+    this.unitInfo.fill(undefined);
+    this.unitSrc.fill(null);
+    this.lastUnit = 0;
+    this.lastSmooth = false;
     this.sprites = false;
     this.armed = false;
+    this.bver = -1;
+    if (this.shapes) {
+      this.shapes.count = 0;
+      this.shapes.icount = 0;
+    }
     this.setup();
     this.lost = false;
     if (shader) this.setShader(shader);
@@ -1543,9 +1560,12 @@ export class WebGL2Backend implements Backend {
   }
 
   private texture(src: TextureSource): CachedTexture {
+    // A render target's framebuffer and texture belong to `targets`, the only authority for them. Asking the
+    // store (rather than the texture cache) means a target is never served a texture from a lost context: after
+    // a restore its cache entry is gone, and the store makes a new, blank pair exactly once.
+    if (src instanceof RenderTarget) return this.targetStore(src).cached;
     const hit = this.textures.get(src);
     if (hit) return hit;
-    if (src instanceof RenderTarget) return this.targetStore(src).cached;
     const w = "naturalWidth" in src ? src.naturalWidth : src.width;
     const h = "naturalHeight" in src ? src.naturalHeight : src.height;
     // An image still loading is 0×0: nothing to upload, and nothing to remember.
