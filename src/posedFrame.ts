@@ -429,3 +429,35 @@ export function frameOf(
   }
   return { order };
 }
+
+/**
+ * Detaches a frame built by `frameOf` for a retained `posedFrame()` snapshot:
+ * every vertex array and every clip polygon gets its own copy, so a later pose
+ * can never move a snapshot's geometry through shared storage.
+ *
+ * `uvs` and `triangles` are the frame source's immutable, identity-canonical
+ * caches and stay shared by design (they never change with the pose). The
+ * tint/dark tuples are already per-slot allocations. Clip objects are copied
+ * once per distinct source clip so the "covered slots share one clip" identity
+ * stays true *within* the snapshot, while snapshots never share a clip object
+ * with each other or with any later frame.
+ *
+ * @internal
+ */
+export function detachFrame(frame: PosedFrame): PosedFrame {
+  const clips = new Map<PosedClip, PosedClip>();
+  const order = frame.order.map((slot): PosedSlot => {
+    if (slot.clip !== undefined) {
+      let copy = clips.get(slot.clip);
+      if (copy === undefined) {
+        copy = { polygon: slot.clip.polygon.slice(), inverse: slot.clip.inverse, convex: slot.clip.convex };
+        clips.set(slot.clip, copy);
+      }
+      if (slot.kind === 'region') return { ...slot, clip: copy, corners: slot.corners.slice() };
+      return { ...slot, clip: copy, vertices: slot.vertices.slice() };
+    }
+    if (slot.kind === 'region') return { ...slot, corners: slot.corners.slice() };
+    return { ...slot, vertices: slot.vertices.slice() };
+  });
+  return { order };
+}

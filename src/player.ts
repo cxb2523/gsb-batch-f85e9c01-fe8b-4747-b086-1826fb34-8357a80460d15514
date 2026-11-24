@@ -4,7 +4,7 @@ import { checkedLiveFrame, oracleLiveFrame, RuntimeFrames, type LiveFrame } from
 import { CanvasRenderer } from './CanvasRenderer.js';
 import { DomRenderer, type MeshBackend } from './DomRenderer.js';
 import type { ModelAssets, ReadDocument, RigSet } from './loadModel.js';
-import { type FrameSource, frameOf, frameSource, type PosedFrame } from './posedFrame.js';
+import { type FrameSource, detachFrame, frameOf, frameSource, type PosedFrame } from './posedFrame.js';
 
 /**
  * Plays a rig built by `rigc build` on a DOM root.
@@ -2478,7 +2478,16 @@ export class RigPlayer {
     const generation = this.poseGeneration;
     const state = this.runtimeFrames;
     const revision = state?.revision;
-    return checkedLiveFrame(frame, () => this.poseGeneration === generation && (state === null || state.revision === revision) ? generation : -1);
+    const player = this;
+    return checkedLiveFrame(
+      frame,
+      // Valid only while the player is still on the same pose path (the exact
+      // RuntimeFrames object, or the oracle's null), on the same generation:
+      // a runtime→oracle hand-over replaces the object even where numbering is
+      // restored, so the old lease dies with the path rather than by accident.
+      () => player.poseGeneration === generation && player.runtimeFrames === state && (state === null || state.revision === revision) ? generation : -1,
+      () => (player.liveDisposed ? 'LIVE_FRAME_DISPOSED' : null),
+    );
   }
 
   /** Monotonic pose generation counter matching `posedFrame().generation` and `slotIdentity().generation`. */
@@ -2496,7 +2505,14 @@ export class RigPlayer {
   posedFrame(slots?: SlotFilter | null): PosedFrame {
     const draws = slots === undefined ? this.draws : slots === null ? () => true : typeof slots === 'function' ? slots : predicateOf(slots);
     if (this.runtimeFrames !== null) this.runtimeFrames.update(this.poseGeneration, this.color, this.draws, false);
-    const frame: PosedFrame = this.runtimeFrames !== null ? this.runtimeFrames.snapshot(draws) : this.pose === null ? { order: [] } : frameOf(this.source, this.pose, this.color, draws);
+    // The runtime path already allocates its own detached arrays in snapshot();
+    // the oracle frame reuses the core's pose arrays, so detach it before
+    // handing it out — a retained snapshot must never alias the next pose.
+    const frame: PosedFrame = this.runtimeFrames !== null
+      ? this.runtimeFrames.snapshot(draws)
+      : this.pose === null
+        ? { order: [] }
+        : detachFrame(frameOf(this.source, this.pose, this.color, draws));
     Object.defineProperty(frame, 'generation', {
       value: this.poseGeneration,
       enumerable: false,

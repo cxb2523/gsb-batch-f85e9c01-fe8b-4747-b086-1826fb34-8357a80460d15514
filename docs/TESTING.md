@@ -144,6 +144,17 @@ no-draw pixel skips explicitly; they never count as pixel passes.
 `scripts/live-frame-allocation.mjs <model> <animation>` remains the separate
 production-loop meter, with its unretained object plant.
 
+`tests/liveFrameLease.spec.ts` drives the end-to-end borrow contract through
+`window.rigPlayHarness` (`tests/liveFrameLeaseProbe.ts`): consecutive borrows in
+normal playback, every held view (frame, nested vertex/tint/attachment, clip and
+its polygon) going `LIVE_FRAME_STALE` after an advance, `LIVE_FRAME_READONLY`
+on writes and `buffer` access, a `posedFrame()` snapshot keeping its numbers and
+sharing no vertex array or clip object with later frames, the runtime→oracle
+hand-over invalidating the old lease while `poser` names the fallback reason
+(track composition and the physics policy), and `LIVE_FRAME_DISPOSED` for new
+borrows and old-lease reads after `dispose()`. It runs on the same focused
+config (`playwright.live-frame.config.ts`) in Chromium and WebKit.
+
 `scripts/pose-clipping-bench.mjs --help` describes the CPU-only clipping adapter
 for the checksum-pinned core#1589 stage helpers. It measures the core oracle's
 `openTrack` path against spine-core, with A/A and same-frame AB/BA controls;

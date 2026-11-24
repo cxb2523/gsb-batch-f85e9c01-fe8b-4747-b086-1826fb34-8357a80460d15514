@@ -389,14 +389,28 @@ the setup slot index, not the index among visible draws.
 
 The runtime preallocates its production buffers and render view. Development
 builds add generation-capturing leases: reading a held frame **or a retained
-nested buffer** after mutation throws `LIVE_FRAME_STALE`; drawing a stale lease
-also refuses before touching the renderer. Writes and backing-storage escape
-routes refuse as `LIVE_FRAME_READONLY`. `liveFrameChecks` can explicitly select
-this diagnostic behavior. Those leases allocate; they are reported separately
-from the production allocation measurement. Listener delivery creates the same
-detached callback payloads as the oracle and is measured separately; the
-no-listener advance/liveFrame path reuses event records and frame buffers. The oracle fallback packs a borrowed
-view from its snapshot and also carries no zero-allocation promise.
+nested buffer** (a vertex array, tint, attachment, clipping polygon or any other
+view) after a pose change throws `LIVE_FRAME_STALE`; drawing a stale lease
+also refuses before touching the renderer. A lease dies with its pose path, so
+a runtime→oracle hand-over (track composition, a physics constraint or another
+named fallback) invalidates the held view immediately even where the public
+generation numbering is carried over. Writes and backing-storage escape routes
+refuse as `LIVE_FRAME_READONLY`. After `dispose()`, a new `liveFrame()` borrow
+and every read of a lease taken earlier throw `LIVE_FRAME_DISPOSED` rather than
+returning old data. `liveFrameChecks` can explicitly select this diagnostic
+behavior. Those leases allocate; they are reported separately from the
+production allocation measurement. Listener delivery creates the same detached
+callback payloads as the oracle and is measured separately; the no-listener
+advance/liveFrame path reuses event records and frame buffers. The oracle
+fallback packs a borrowed view from its snapshot and also carries no
+zero-allocation promise.
+
+`posedFrame()` is the retaining counterpart: on both poser paths it returns a
+fully detached snapshot — its own vertex arrays and its own clip objects and
+polygons (covered slots still share one clip *within* the snapshot) — so later
+pose changes, including a runtime→oracle switch, can never move or alias a
+retained frame. The frame source's immutable `uvs`/`triangles` caches stay
+shared by identity because they never change with the pose.
 
 Supported skin changes rebuild the view and preserve accumulated track time
 and its wrapped animation time. A held checked live view becomes stale; retained

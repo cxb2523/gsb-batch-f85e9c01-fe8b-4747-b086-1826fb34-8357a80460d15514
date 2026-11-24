@@ -62,12 +62,16 @@ function numbers(buffer: Float64Array, offset: number, count: number): number[] 
 }
 
 /** @internal Deep development lease. No typed-array method can expose writable backing storage. */
-export function checkedLiveFrame(frame: LiveFrame, current: () => number): LiveFrame {
+export function checkedLiveFrame(frame: LiveFrame, current: () => number, invalidReason: () => string | null = () => null): LiveFrame {
   const generation = current();
   const frameGeneration = frame.generation;
   const proxies = new WeakMap<object, object>();
   const check = (): void => {
-    if (current() !== generation) throw new Error(`LIVE_FRAME_STALE: borrowed generation ${frameGeneration} was invalidated; call liveFrame() again`);
+    if (current() !== generation) {
+      const reason = invalidReason();
+      if (reason !== null) throw new Error(`${reason}: borrowed generation ${frameGeneration} can no longer be read; call liveFrame() on a live player`);
+      throw new Error(`LIVE_FRAME_STALE: borrowed generation ${frameGeneration} was invalidated; call liveFrame() again`);
+    }
   };
   const wrap = <T extends object>(value: T): T => {
     const found = proxies.get(value);
