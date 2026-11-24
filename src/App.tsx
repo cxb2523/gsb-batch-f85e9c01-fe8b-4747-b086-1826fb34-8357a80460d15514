@@ -24,7 +24,7 @@ import {
   isScrolling,
   showFlame as shouldShowFlame,
 } from "./game/state";
-import { appendEvent, type Recording } from "./game/recording";
+import { RecordingSession } from "./game/recordingSession";
 import {
   getStoredPlayerName,
   leaderboard,
@@ -61,8 +61,16 @@ export default function App() {
   );
 
   // ---- Recording ----------------------------------------------------------
-  const recordingRef = useRef<Recording>([]);
-  const recordingStartRef = useRef<number | null>(null);
+  // One session per run; each playable flight (level entry, or a restart after
+  // game over) gets a fresh local tape while finished flights accumulate into
+  // the run-level tape that is submitted.
+  const recordingSessionRef = useRef<RecordingSession | null>(null);
+  const getRecordingSession = useCallback(() => {
+    if (!recordingSessionRef.current) {
+      recordingSessionRef.current = new RecordingSession();
+    }
+    return recordingSessionRef.current;
+  }, []);
   const [runId, setRunId] = useState(0);
 
   // ---- Ghost --------------------------------------------------------------
@@ -114,36 +122,46 @@ export default function App() {
     }
   }, [state.phase]);
 
-  // Recording lifecycle: start a fresh tape when a run begins; stop when it ends.
+  // Recording lifecycle: a fresh tape and local clock for every playable
+  // flight; flights are stitched into the run tape as levels end, and the
+  // recording freezes once a crash reaches game over.
   useEffect(() => {
-    if (state.phase === "playing" && recordingStartRef.current === null) {
-      recordingStartRef.current = performance.now();
-      recordingRef.current = [[0, false]];
-      setRunId((id) => id + 1);
-      setSubmitted(false);
-    }
-    if (state.phase === "title" || state.phase === "idle") {
-      // resetting state outside an active run
-      if (state.phase === "idle" && state.level === 1) {
-        recordingStartRef.current = null;
+    const session = getRecordingSession();
+
+    if (state.phase === "playing") {
+      if (!session.isRecording()) {
+        session.beginFlight(performance.now());
+        // A new flight identity restarts the ghost's replay clock.
+        setRunId((id) => id + 1);
+        setSubmitted(false);
       }
+      return;
     }
-  }, [state.phase, state.level]);
 
-  // Capture every playerUp edge into the tape.
-  useEffect(() => {
-    if (recordingStartRef.current === null) return;
-    if (state.phase !== "playing") return;
-    const t = performance.now() - recordingStartRef.current;
-    recordingRef.current = appendEvent(recordingRef.current, t, state.playerUp);
-  }, [state.playerUp, state.phase]);
+    if (state.phase === "levelEnding") {
+      // Freeze the cleared level's tape before the transition overlays play.
+      session.endFlight();
+      return;
+    }
 
-  // On game over, freeze the recording (it stays in recordingRef for submission).
-  useEffect(() => {
     if (state.phase === "gameOver") {
-      recordingStartRef.current = null;
+      // Final flight (the crash) completes the run; nothing more is recorded.
+      session.endFlight();
+      return;
     }
-  }, [state.phase]);
+
+    if (state.phase === "idle" && state.level === 1) {
+      // First run, or a restart from game over: discard the previous run.
+      session.reset();
+    }
+  }, [state.phase, state.level, getRecordingSession]);
+
+  // Capture every playerUp edge into the active flight's local timeline.
+  useEffect(() => {
+    const session = getRecordingSession();
+    if (!session.isRecording() || state.phase !== "playing") return;
+    session.recordEdge(performance.now(), state.playerUp);
+  }, [state.playerUp, state.phase, getRecordingSession]);
 
   const tick = useCallback(() => {
     if (state.phase !== "playing") return;
@@ -221,7 +239,7 @@ export default function App() {
         name,
         score: state.gameScore,
         level: state.level,
-        recording: recordingRef.current,
+        recording: getRecordingSession().runRecording(),
       });
       setSubmitted(true);
       setLeaderboardRefresh((n) => n + 1);

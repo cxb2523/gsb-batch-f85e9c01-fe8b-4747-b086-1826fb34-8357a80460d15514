@@ -40,3 +40,31 @@ export function recordingDurationMs(recording: Recording): number {
   if (recording.length === 0) return 0;
   return recording[recording.length - 1][0];
 }
+
+/**
+ * Stitch a completed flight's tape onto the run-level tape. Every timestamp is
+ * shifted past the accumulated recording so each flight keeps its own local
+ * origin, and a redundant leading edge that repeats the run's last value is
+ * dropped so the result stays a compact sequence of value changes.
+ */
+export function mergeRecording(
+  runRecording: Recording,
+  flightRecording: Recording,
+): Recording {
+  if (flightRecording.length === 0) return runRecording;
+
+  const offset = recordingDurationMs(runRecording);
+  const lastRunValue =
+    runRecording.length === 0
+      ? undefined
+      : runRecording[runRecording.length - 1][1];
+
+  const merged: Recording = [...runRecording];
+  for (const [t, up] of flightRecording) {
+    if (merged.length === runRecording.length && up === lastRunValue) {
+      continue;
+    }
+    merged.push([Math.max(0, Math.round(t + offset)), up]);
+  }
+  return merged;
+}

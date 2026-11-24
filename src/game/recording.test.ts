@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   appendEvent,
+  mergeRecording,
   recordingDurationMs,
   valueAt,
   type Recording,
@@ -60,5 +61,50 @@ describe("recording", () => {
         [1234, false],
       ]),
     ).toBe(1234);
+  });
+
+  describe("mergeRecording", () => {
+    it("offsets the second tape past the first and keeps every edge", () => {
+      const first: Recording = [
+        [0, false],
+        [100, true],
+        [200, false],
+      ];
+      const second: Recording = [
+        [0, false],
+        [150, true],
+      ];
+      expect(mergeRecording(first, second)).toEqual([
+        [0, false],
+        [100, true],
+        [200, false],
+        [350, true],
+      ]);
+    });
+
+    it("drops a leading edge that repeats the run's last value", () => {
+      const first: Recording = [
+        [0, false],
+        [100, true],
+      ];
+      const second: Recording = [
+        [0, true],
+        [120, false],
+      ];
+      expect(mergeRecording(first, second)).toEqual([
+        [0, false],
+        [100, true],
+        [220, false],
+      ]);
+    });
+
+    it("treats an empty run tape as a zero offset and an empty flight as a no-op", () => {
+      const flight: Recording = [
+        [0, false],
+        [80, true],
+      ];
+      expect(mergeRecording([], flight)).toEqual(flight);
+      expect(mergeRecording(flight, [])).toEqual(flight);
+    });
   });
 });
