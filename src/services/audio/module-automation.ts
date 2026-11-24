@@ -48,11 +48,51 @@ type ExternalEventCallbackProps = { c: number, t: number };
 export type ExternalEventCallback = ( props: ExternalEventCallbackProps ) => void;
 
 /**
+ * glide state is tracked per event id, keyed by the AudioParam that is
+ * performing the glide (a single event / voice can glide both its VOLUME gain
+ * and its PITCH frequency simultaneously). Keeping this registry outside of the
+ * individual EventVoice objects guarantees a retriggered event (which receives a
+ * fresh event id and fresh voices) never inherits the "gliding" marker of the
+ * event it replaces, while the previous event keeps gliding independently until
+ * its release completes and its entry is purged via clearGlideStateForEvent().
+ */
+const glideStates: Map<number, Map<AudioParam, boolean>> = new Map();
+
+/**
+ * remove all glide state registered for given event id. Invoked once all of the
+ * events voices have completed their release and have been returned to the pool.
+ */
+export const clearGlideStateForEvent = ( eventId: number ): void => {
+    glideStates.delete( eventId );
+};
+
+/**
+ * remove all registered glide state (e.g. when halting all playback)
+ */
+export const clearAllGlideStates = (): void => {
+    glideStates.clear();
+};
+
+const getGlideState = ( eventId: number ): Map<AudioParam, boolean> => {
+    let state = glideStates.get( eventId );
+    if ( !state ) {
+        state = new Map();
+        glideStates.set( eventId, state );
+    }
+    return state;
+};
+
+/**
  * apply a module parameter change defined inside an audioEvent during playback
  */
 export const applyModuleParamChange = ( audioContext: BaseAudioContext, audioEvent: EffluxAudioEvent,
     modules: InstrumentModules, instrument: Instrument, voiceLists: EventVoiceList[],
     startTimeInSeconds: number, output: AudioNode, optEventCallback?: ExternalEventCallback ) => {
+
+    // events without module parameter automation must not lead to any scheduled changes
+    if ( !audioEvent.mp ) {
+        return;
+    }
     const { value, module } = audioEvent.mp;
 
     // @todo should all enabled states here determine whether the node is actually connected ?
@@ -238,7 +278,7 @@ function applyVolumeEnvelope( audioEvent: EffluxAudioEvent, voiceLists: EventVoi
 
     processVoiceLists( voiceLists, ( voice: EventVoice ): void => {
         scheduleParameterChange(
-            voice.gain.gain, target, startTimeInSeconds, durationInSeconds, doGlide, voice
+            voice.gain.gain, target, startTimeInSeconds, durationInSeconds, doGlide, voice.eventId
         );
     });
 }
@@ -264,7 +304,7 @@ function applyPitchShift( audioEvent: EffluxAudioEvent, voiceLists: EventVoiceLi
                 target = voice.frequency - ( target / 2 );
             }
             scheduleParameterChange(
-                generator.frequency, target, startTimeInSeconds, durationInSeconds, doGlide, voice
+                generator.frequency, target, startTimeInSeconds, durationInSeconds, doGlide, voice.eventId
             );
         }
         else if ( isAudioBufferSourceNode( voice.generator )) {
@@ -272,7 +312,7 @@ function applyPitchShift( audioEvent: EffluxAudioEvent, voiceLists: EventVoiceLi
             tmp = ( mp.value / 100 );
             target = ( goingUp ) ? generator.playbackRate.value + tmp : generator.playbackRate.value - tmp;
             scheduleParameterChange(
-                generator.playbackRate, target, startTimeInSeconds, durationInSeconds, doGlide, voice
+                generator.playbackRate, target, startTimeInSeconds, durationInSeconds, doGlide, voice.eventId
             );
         }
     });
@@ -403,20 +443,25 @@ function applyExternalEvent( audioContext: BaseAudioContext, event: EffluxAudioE
  * @param {number} startTimeInSeconds relative to the currentTime of the AudioContext, when the change should take place
  * @param {number=} durationInSeconds the total duration of the change (only rqeuired when 'doGlide' is true)
  * @param {boolean=} doGlide whether to "glide" to the value (linear change), defaults to false for instant change
- * @param {Object=} data optional data Object to track the status of the scheduled parameter changes (can for instance
- *                  be EventVoiceList which shouldn't cancel previously scheduled changes upon repeated invocation)
+ * @param {number=} eventId optional id of the event that owns the scheduled changes. When provided the
+ *                  gliding state is tracked per event id (and per AudioParam) so a retriggered event
+ *                  neither inherits the gliding marker of a previous event nor cancels that events
+ *                  scheduled automation. When omitted the change applies to a shared instrument module
+ *                  parameter and no scheduled values are cancelled for glides.
  */
 function scheduleParameterChange( param: AudioParam, value: number, startTimeInSeconds: number,
-    durationInSeconds: number, doGlide?: boolean, data?: any ): void {
+    durationInSeconds: number, doGlide?: boolean, eventId?: number ): void {
 
-    if ( !doGlide || ( data && !data.gliding )) {
+    const hasEventScope = typeof eventId === "number";
+    const glideState    = hasEventScope ? getGlideState( eventId ) : undefined;
+    const isGliding     = glideState?.get( param ) === true;
+
+    if ( !doGlide || ( hasEventScope && !isGliding )) {
         param.cancelScheduledValues( startTimeInSeconds );
         param.setValueAtTime(( doGlide ) ? param.value : value, startTimeInSeconds );
     }
     if ( doGlide ) {
         param.linearRampToValueAtTime( value, startTimeInSeconds + durationInSeconds );
-        if ( data ) {
-            data.gliding = true;
-        }
+        glideState?.set( param, true );
     }
 }

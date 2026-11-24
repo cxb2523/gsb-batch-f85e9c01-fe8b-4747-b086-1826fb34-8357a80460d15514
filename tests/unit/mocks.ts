@@ -31,6 +31,111 @@ export const mockGainNode: GainNode = {
     }
 } as unknown as GainNode;
 
+/**
+ * creates a controllable mock of an AudioParam, keeping a local "value" property
+ * while recording all scheduling calls so tests can assert automation lifecycles
+ */
+export const createMockAudioParam = ( value = 0 ): AudioParam => ({
+    value,
+    cancelScheduledValues: vi.fn(),
+    setValueAtTime: vi.fn(),
+    linearRampToValueAtTime: vi.fn(),
+    exponentialRampToValueAtTime: vi.fn(),
+    setTargetAtTime: vi.fn(),
+    setValueCurveAtTime: vi.fn(),
+    cancelAndHoldAtTime: vi.fn(),
+}) as unknown as AudioParam;
+
+/**
+ * creates a generic mock AudioNode whose connect/disconnect calls are recorded.
+ * Optional AudioParams (e.g. gain, frequency, pan, playbackRate, delayTime) can
+ * be supplied via the params argument
+ */
+export const createMockAudioNode = ( params: Record<string, AudioParam> = {} ): AudioNode & Record<string, unknown> => {
+    const node = {
+        connect: vi.fn(),
+        disconnect: vi.fn(),
+        ...params
+    };
+    return node as unknown as AudioNode & Record<string, unknown>;
+};
+
+/**
+ * creates a mock of an AudioScheduledSourceNode (e.g. an OscillatorNode /
+ * AudioBufferSourceNode) with a manually invokable "onended" handler so tests can
+ * deterministically simulate the end of a nodes playback / release phase
+ */
+export const createMockSourceNode = ( params: Record<string, AudioParam> = {} ): AudioScheduledSourceNode & Record<string, unknown> => ({
+    ...createMockAudioNode( params ),
+    start: vi.fn(),
+    stop: vi.fn(),
+    // legacy WebAudio fallback names used when no standards compliant AudioContext is feature detected
+    noteOn: vi.fn(),
+    noteOff: vi.fn(),
+    onended: null,
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+    dispatchEvent: vi.fn(),
+});
+
+/**
+ * creates a mock AudioContext providing all factory methods the AudioService
+ * pipeline uses. The created source nodes are tracked in "sources" and expose an
+ * onended handler allowing tests to flush the release-phase callbacks
+ */
+export const createMockAudioContext = (): BaseAudioContext & { sources: Array<AudioScheduledSourceNode & Record<string, unknown>> } => {
+    const sources: Array<AudioScheduledSourceNode & Record<string, unknown>> = [];
+    const context = {
+        sampleRate: 44100,
+        currentTime: 0,
+        destination: createMockAudioNode(),
+        sources,
+        createGain: () => createMockAudioNode({ gain: createMockAudioParam( 1 ) }),
+        // legacy WebAudio fallback name used when no standards compliant AudioContext is feature detected
+        createGainNode: function() { return this.createGain(); },
+        createBiquadFilter: () => createMockAudioNode({
+            frequency: createMockAudioParam(),
+            Q: createMockAudioParam(),
+            gain: createMockAudioParam(),
+            type: "" as unknown as AudioParam
+        }),
+        createOscillator: () => {
+            const node = createMockSourceNode({ frequency: createMockAudioParam() });
+            node.setPeriodicWave = vi.fn();
+            sources.push( node );
+            return node;
+        },
+        createBufferSource: () => {
+            const node = createMockSourceNode({ playbackRate: createMockAudioParam( 1 ) });
+            node.buffer = null;
+            node.loop = false;
+            sources.push( node );
+            return node;
+        },
+        createBuffer: ( numberOfChannels: number, length: number, sampleRate: number ): AudioBuffer => ({
+            numberOfChannels, length, sampleRate, duration: length / sampleRate,
+            getChannelData: () => new Float32Array( length ),
+            copyFromChannel: vi.fn(),
+            copyToChannel: vi.fn()
+        }) as unknown as AudioBuffer,
+        createStereoPanner: () => createMockAudioNode({ pan: createMockAudioParam() }),
+        createWaveShaper: () => createMockAudioNode({ curve: null }),
+        createDelay: () => createMockAudioNode({ delayTime: createMockAudioParam( 1 ) }),
+        createChannelSplitter: () => createMockAudioNode(),
+        createChannelMerger: () => createMockAudioNode(),
+        createAnalyser: () => createMockAudioNode(),
+        createPeriodicWave: vi.fn((): PeriodicWave => ({}) as PeriodicWave),
+        createDynamicsCompressor: () => createMockAudioNode({
+            threshold: createMockAudioParam(),
+            knee: createMockAudioParam(),
+            ratio: createMockAudioParam(),
+            attack: createMockAudioParam(),
+            release: createMockAudioParam()
+        })
+    };
+    return context as unknown as BaseAudioContext & { sources: Array<AudioScheduledSourceNode & Record<string, unknown>> };
+};
+
 export const createMockOscillatorNode = (): OscillatorNode => ({
     disconnect: vi.fn(),
 } as unknown as OscillatorNode );

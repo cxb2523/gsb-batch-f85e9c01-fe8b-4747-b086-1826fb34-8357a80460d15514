@@ -34,7 +34,12 @@ export type EventVoice = {
     outputNode: GainNode;
     frequency: number;
     vo: InstrumentOscillator,
-    gliding: false
+    /**
+     * unique id of the audio event that owns this voice. Automation glide state
+     * is tracked per event id (see module-automation) rather than on the voice itself,
+     * so a retriggered note never inherits the gliding state of its predecessor
+     */
+    eventId: number
 };
 
 /**

@@ -27,7 +27,7 @@ import OscillatorTypes from "@/definitions/oscillator-types";
 import ModuleFactory from "@/model/factories/module-factory";
 import { ACTION_NOTE_ON } from "@/model/types/audio-event";
 import { applyRouting } from "./audio/module-router";
-import { applyModuleParamChange, getCurrentValueForParam } from "./audio/module-automation";
+import { applyModuleParamChange, getCurrentValueForParam, clearGlideStateForEvent, clearAllGlideStates } from "./audio/module-automation";
 import type { ExternalEventCallback } from "./audio/module-automation";
 import type OutputRecorder from "./audio/output-recorder";
 import type WaveTables from "./audio/wave-tables";
@@ -144,8 +144,10 @@ export const reset = ( resetEventCounter = false ): void => {
             returnVoiceNodesToPoolOnPlaybackEnd( instrumentModulesList[ instrumentIndex ], oscillatorIndex, voice, instrumentIndex );
             stopOscillation( voice.generator, audioContext.currentTime );
         });
+        Object.keys( eventList ).forEach(( eventId: string ) => clearGlideStateForEvent( Number( eventId )));
         playingEventVoices[ instrumentIndex ] = {};
     });
+    clearAllGlideStates();
     if ( resetEventCounter ) {
         UNIQUE_EVENT_ID = 0;
     }
@@ -339,7 +341,7 @@ export const noteOn = ( event: EffluxAudioEvent, instrument: Instrument,
                 vo: oscillatorVO,
                 gain: oscillatorNode,
                 outputNode: adsrNode,
-                gliding: false
+                eventId: event.id
             });
 
             // start playback and attach listener to track playback end
@@ -352,14 +354,23 @@ export const noteOn = ( event: EffluxAudioEvent, instrument: Instrument,
         playingEventVoices[ instrument.index ][ event.id ] = voices;
     }
     // module parameter change specified ? process it.
+    // note: for noteOn events only the voices created for this exact event id are passed, so automation
+    // of a retriggered note can never touch the voices of the replaced event (which may still be in its
+    // release phase) nor cancel their scheduled values. For automation-only events there are no own
+    // voices and all currently playing voices of the instrument are addressed instead.
 
     if ( event.mp ) {
+        const ownVoiceList = playingEventVoices[ instrument.index ][ event.id ];
+        const targetVoiceLists = Array.isArray( ownVoiceList )
+            ? [ ownVoiceList ]
+            : ( Object.values( playingEventVoices[ instrument.index ]) as EventVoiceList[] );
+
         applyModuleParamChange(
             audioContext,
             event,
             instrumentModulesList[ instrument.index ],
             instrument,
-            Object.values( playingEventVoices[ instrument.index ]) as EventVoiceList[],
+            targetVoiceLists,
             startTimeInSeconds,
             masterBus,
             eventCallback
@@ -380,6 +391,15 @@ export const noteOff = ( event: EffluxAudioEvent, startTimeInSeconds = audioCont
 
     if ( !voiceList ) {
         return; // event has no reference to playing nodes
+    }
+
+    // when all voices have already ended naturally the entry is an empty, stale list.
+    // Purge it (and its glide state) so no residual event entries accumulate across loops
+
+    if ( voiceList.filter( Boolean ).length === 0 ) {
+        delete playingEventVoices[ instrumentIndex ][ eventId ];
+        clearGlideStateForEvent( eventId );
+        return;
     }
     // console.info(`NOTE OFF for ${event.id} ( ${event.note}${event.octave} @ ${startTimeInSeconds}s`);
 
@@ -511,6 +531,16 @@ export const applyModule = ( type: string, instrumentIndex: number, props: any )
     ModuleFactory.applyConfiguration( type, instrumentModulesList[ instrumentIndex ], props, masterBus );
 };
 
+/**
+ * exposes the internal playback registries for unit testing only (not part of the
+ * public playback API). Allows tests to assert voice pool contents and the entries
+ * in playingEventVoices across retrigger / release lifecycles.
+ */
+export const getInternalState = (): {
+    playingEventVoices: Record<number, EventVoiceList>[],
+    instrumentModulesList: InstrumentModules[]
+} => ({ playingEventVoices, instrumentModulesList });
+
 /* internal methods */
 
 function setupRouting(): void {
@@ -584,7 +614,14 @@ function returnVoiceNodesToPoolOnPlaybackEnd( instrumentModules: InstrumentModul
                 voiceList[ oscillatorIndex ] = undefined;
                 if ( voiceList.filter( Boolean ).length === 0 ) {
                     delete playingEventVoices[ instrumentIndex ][ eventId ];
+                    // the event no longer has any playing voices, release its isolated
+                    // automation glide state so nothing lingers beyond the events lifecycle
+                    clearGlideStateForEvent( eventId );
                 }
+            } else {
+                // entry was already removed (e.g. via a noteOff on a stale list), make sure
+                // no glide state remains registered for the completed event
+                clearGlideStateForEvent( eventId );
             }
         }
 
