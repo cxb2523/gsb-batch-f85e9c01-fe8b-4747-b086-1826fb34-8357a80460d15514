@@ -74,32 +74,43 @@ export class WorkletTransport implements TransportLike {
     }
     const instance = new WorkletTransport(context, options);
     await loadTransportWorklet(context);
-    const node = new AudioWorkletNode(context, 'transport-clock', {
-      numberOfInputs: 0,
-      numberOfOutputs: 3,
-      outputChannelCount: [1, 1, 1],
-    });
-    // Keep the worklet pulling audio without audibly monitoring the CV pulses.
-    const keepAlive = context.createGain();
-    keepAlive.gain.value = 0;
-    node.connect(keepAlive);
-    keepAlive.connect(context.destination);
-    node.port.onmessage = (event) => {
-      const message = event.data as TransportTick;
-      if (message.type !== 'tick') {
-        return;
-      }
-      instance.listeners.forEach((listener) => listener(message));
-    };
-    node.port.postMessage({
-      type: 'init',
-      bpm: instance.transport.bpm,
-      startBeat: options.startBeat ?? 0,
-      tickIntervalSec: instance.tickIntervalSec,
-    } satisfies WorkletCommand);
-    instance.node = node;
-    instance.keepAliveGain = keepAlive;
-    return instance;
+    let node: AudioWorkletNode;
+    try {
+      node = new AudioWorkletNode(context, 'transport-clock', {
+        numberOfInputs: 0,
+        numberOfOutputs: 3,
+        outputChannelCount: [1, 1, 1],
+      });
+      // Publish the node immediately so the catch path can disconnect it if a
+      // later wiring step throws.
+      instance.node = node;
+      // Keep the worklet pulling audio without audibly monitoring the CV pulses.
+      const keepAlive = context.createGain();
+      keepAlive.gain.value = 0;
+      instance.keepAliveGain = keepAlive;
+      node.connect(keepAlive);
+      keepAlive.connect(context.destination);
+      node.port.onmessage = (event) => {
+        const message = event.data as TransportTick;
+        if (message.type !== 'tick') {
+          return;
+        }
+        // `listeners` is cleared synchronously by dispose(), so a message that
+        // was already queued can never reach a released subscriber.
+        instance.listeners.forEach((listener) => listener(message));
+      };
+      node.port.postMessage({
+        type: 'init',
+        bpm: instance.transport.bpm,
+        startBeat: options.startBeat ?? 0,
+        tickIntervalSec: instance.tickIntervalSec,
+      } satisfies WorkletCommand);
+      return instance;
+    } catch (error) {
+      // Do not strand a partially constructed node/graph if wiring fails.
+      instance.dispose();
+      throw error;
+    }
   }
 
   getNode(): AudioWorkletNode | null {
@@ -184,18 +195,36 @@ export class WorkletTransport implements TransportLike {
   }
 
   dispose(): void {
-    if (!this.node) {
-      return;
-    }
-    this.node.port.onmessage = null;
-    this.node.disconnect();
-    this.node = null;
-    if (this.keepAliveGain) {
-      this.keepAliveGain.disconnect();
-      this.keepAliveGain = null;
-    }
+    const node = this.node;
+    const keepAliveGain = this.keepAliveGain;
+
+    // Clear subscriber state first so any in-flight/queued port message observes
+    // an empty listener set even before the port handler is detached.
     this.listeners.clear();
     this.eventListeners.clear();
+
+    if (node) {
+      try {
+        node.port.onmessage = null;
+      } catch {
+        /* some mock/older implementations may expose a read-only port handler */
+      }
+      try {
+        node.disconnect();
+      } catch {
+        /* already disconnected */
+      }
+      this.node = null;
+    }
+
+    if (keepAliveGain) {
+      try {
+        keepAliveGain.disconnect();
+      } catch {
+        /* already disconnected */
+      }
+      this.keepAliveGain = null;
+    }
   }
 
   private post(message: WorkletCommand): void {

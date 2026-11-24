@@ -112,7 +112,14 @@ export const Clock = React.forwardRef<ClockHandle, ClockProps>(({
     }
 
     let cancelled = false;
-    acquireSharedTransport(audioContext).then(({ transport, bus }) => {
+    let acquisitionFailed = false;
+    const acquisition = acquireSharedTransport(audioContext);
+    // Track acquisition rejection separately so an error thrown while wiring a
+    // successfully acquired clock is not mistaken for a rolled-back claim.
+    acquisition.catch(() => {
+      acquisitionFailed = true;
+    });
+    acquisition.then(({ transport, bus }) => {
       if (cancelled) return;
       transportRef.current = transport;
       transportBusRef.current = bus;
@@ -144,11 +151,27 @@ export const Clock = React.forwardRef<ClockHandle, ClockProps>(({
 
     return () => {
       cancelled = true;
+      // Detach this Clock's own gains before tearing the refs down.
       clockGain.disconnect();
       output.current = null;
       clockGainRef.current = null;
-      if (workletNodeRef.current) {
-        try { workletNodeRef.current.disconnect(); } catch (e) {}
+      const sharedNode = workletNodeRef.current;
+      if (sharedNode) {
+        // The worklet node is shared by every Clock on this AudioContext, so a
+        // argument-less disconnect() would also silence all other mounted
+        // Clocks. Only remove the connections owned by this Clock. The registry
+        // performs the full node.disconnect() once the last user releases.
+        const disconnectFrom = (destination: AudioNode | null) => {
+          if (!destination) return;
+          try {
+            (sharedNode as AudioWorkletNode).disconnect(destination);
+          } catch {
+            /* connection already removed, or mock without destination overload */
+          }
+        };
+        disconnectFrom(clockGain);
+        disconnectFrom(startGainRef.current);
+        disconnectFrom(stopGainRef.current);
         workletNodeRef.current = null;
       }
       if (startGainRef.current) {
@@ -165,7 +188,9 @@ export const Clock = React.forwardRef<ClockHandle, ClockProps>(({
       if (stopOutput) {
         stopOutput.current = null;
       }
-      if (audioContext) {
+      // Always balance an in-flight/successful acquisition; skip only a claim
+      // that already failed and was rolled back by the registry.
+      if (audioContext && !acquisitionFailed) {
         releaseSharedTransport(audioContext);
       }
       transportRef.current = null;
