@@ -1,21 +1,40 @@
 import { describe, expect, it } from 'vitest';
 
-import { damage } from './tanky-town-bullets';
+import { damage, stepBullets } from './tanky-town-bullets';
 import { LEVEL_COUNT, parseLevel } from './tanky-town-level';
 import {
   applySnapshot,
   coast,
   isRoomId,
+  joinSnapshots,
   newRoomId,
   sameInput,
   snapshot,
   type Snapshot,
 } from './tanky-town-net';
-import { addTank, playerTank, tankPos, type Input, type World } from './tanky-town-state';
+import {
+  addTank,
+  playerTank,
+  setTile,
+  tankPos,
+  type Input,
+  type TankEvent,
+  type World,
+} from './tanky-town-state';
 import { createWorld, step } from './tanky-town-world';
 
 const fixed = (value: number) => () => value;
 const IDLE: Input = { dir: null, fire: false };
+/** mulberry32: same seed, same game - keeps the lifecycle tests deterministic. */
+function seeded(seed = 7) {
+  let a = seed;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
 const run = (world: World, seconds: number, inputs: Input[]) => {
   for (let t = 0; t < seconds; t += 0.02) step(world, 0.02, inputs);
 };
@@ -26,7 +45,24 @@ const duo = () => {
   world.spawnIn = 999;
   return world;
 };
+/** Two players with nothing left to beat: the next step clears the level. */
+const cleared = (rng: () => number = seeded(), level = 0) => {
+  const world = createWorld(rng, level, 2);
+  world.queue = [];
+  world.spawnIn = 999;
+  return world;
+};
 const overTheWire = (snap: Snapshot) => JSON.parse(JSON.stringify(snap)) as Snapshot;
+/** The numbers coasting must never touch, plus the drawn positions it may move. */
+const frozen = (world: World) => ({
+  tanks: world.tanks.map((tank) => tankPos(tank)),
+  bullets: world.bullets.map(({ x, y }) => ({ x, y })),
+  phase: world.phase,
+  clearIn: world.clearIn,
+  lives: world.lives,
+  score: world.score,
+  events: world.events.length,
+});
 
 describe('two players', () => {
   it('gives each seat a free home tile on every level', () => {
@@ -131,15 +167,152 @@ describe('snapshots', () => {
     const tank = playerTank(world, 0)!;
     const before = tankPos(tank).y;
     world.bullets = [{ x: 5, y: 5, dir: 0, owner: 'enemy', tankId: 9 }];
+    const stats = { phase: world.phase, lives: world.lives, score: world.score };
     coast(world, 0.05);
     expect(tankPos(tank).y).toBeLessThan(before);
     expect(world.bullets[0].x).toBeCloseTo(5.25);
+    expect(world.phase).toBe(stats.phase);
+    expect(world.lives).toBe(stats.lives);
+    expect(world.score).toBe(stats.score);
+    expect(world.events).toHaveLength(0);
     coast(world, 5);
     expect(tank.off).toBe(0);
     expect(world.events).toHaveLength(0);
     world.phase = 'over';
     coast(world, 1);
     expect(world.bullets[0].x).toBeCloseTo(30.25);
+  });
+});
+
+describe('level lifecycle over the wire', () => {
+  it('carries the phase and the clear countdown in every snapshot', () => {
+    const host = cleared();
+    step(host, 0.02, [IDLE, IDLE]);
+    expect(host.phase).toBe('clear');
+    const snap = overTheWire(snapshot(host, []));
+    expect(snap.phase).toBe('clear');
+    expect(snap.clearIn).toBeGreaterThan(0);
+    const guest = createWorld(seeded(3), 0, 2);
+    applySnapshot(guest, snap);
+    expect(guest.phase).toBe('clear');
+    expect(guest.clearIn).toBe(snap.clearIn);
+  });
+
+  it('stops the friend on the clear pause and freezes the coast there', () => {
+    const host = cleared();
+    step(host, 0.02, [IDLE, IDLE]);
+    expect(host.phase).toBe('clear');
+    // Mid-hop tanks and a bullet still in the air must not drift on the guest's screen.
+    playerTank(host, 0)!.off = 0.5;
+    host.bullets = [{ x: 3.2, y: 6, dir: 2, owner: 'enemy', tankId: 77 }];
+
+    const guest = createWorld(seeded(3), 0, 2);
+    applySnapshot(guest, overTheWire(snapshot(host, [])));
+    expect(guest.phase).toBe('clear');
+    expect(guest.clearIn).toBeGreaterThan(0);
+
+    const before = frozen(guest);
+    coast(guest, 1);
+    expect(frozen(guest)).toEqual(before);
+    expect(guest.phase).toBe('clear');
+    expect(guest.clearIn).toBeGreaterThan(0);
+  });
+
+  it('follows the host onto the next level with a clean map, no old bullets, drops or events', () => {
+    const host = cleared();
+    host.bullets = [{ x: 4, y: 4, dir: 1, owner: 'player', tankId: 1 }];
+    host.pickup = { x: 1, y: 1, ttl: 9 };
+    step(host, 0.02, [IDLE, IDLE]);
+    expect(host.phase).toBe('clear');
+
+    const guest = createWorld(seeded(3), 0, 2);
+    // The guest is still on the old map, mid-fight, with an event waiting to be played.
+    guest.bullets = [{ x: 9, y: 9, dir: 0, owner: 'enemy', tankId: 5 }];
+    guest.pickup = { x: 2, y: 2, ttl: 3 };
+    guest.events.push({ type: 'boom', x: 1, y: 1 });
+    applySnapshot(guest, overTheWire(snapshot(host, [])));
+    guest.events.length = 0;
+
+    run(host, 2.6, [IDLE, IDLE]);
+    expect(host.levelIndex).toBe(1);
+    expect(host.phase).toBe('play');
+    const snap = overTheWire(snapshot(host, []));
+    applySnapshot(guest, snap);
+
+    expect(guest.levelIndex).toBe(1);
+    expect(guest.level).toEqual(parseLevel(1));
+    expect(guest.tiles).toEqual(host.tiles);
+    expect(guest.bullets).toEqual([]);
+    expect(guest.pickup).toBeNull();
+    expect(guest.events).toEqual([]);
+    expect(guest.phase).toBe('play');
+    expect(guest.clearIn).toBe(0);
+  });
+
+  it('freezes the friend on the end screen after a loss', () => {
+    const host = cleared();
+    host.bullets = [{ x: 5, y: 11.6, dir: 1, owner: 'enemy', tankId: 9 }];
+    setTile(host, 5, 11, 'empty');
+    stepBullets(host, 0.05);
+    expect(host.phase).toBe('over');
+
+    const guest = createWorld(seeded(3), 0, 2);
+    applySnapshot(guest, overTheWire(snapshot(host, host.events)));
+    expect(guest.phase).toBe('over');
+    expect(guest.events.map((event) => event.type)).toEqual(expect.arrayContaining(['over']));
+
+    guest.events.length = 0;
+    const before = frozen(guest);
+    coast(guest, 3);
+    expect(frozen(guest)).toEqual(before);
+  });
+
+  it('keeps a won game frozen on every snapshot', () => {
+    const host = cleared(seeded(), LEVEL_COUNT - 1);
+    step(host, 0.02, [IDLE, IDLE]);
+    expect(host.phase).toBe('won');
+    const guest = createWorld(seeded(3), 0, 2);
+    applySnapshot(guest, overTheWire(snapshot(host, [])));
+    const before = frozen(guest);
+    coast(guest, 2);
+    expect(frozen(guest)).toEqual(before);
+    expect(guest.phase).toBe('won');
+  });
+
+  it('replaces, never piles up, the events between two snapshots', () => {
+    const host = cleared();
+    const guest = createWorld(seeded(3), 0, 2);
+    guest.events.push({ type: 'clang', x: 0, y: 0 });
+    const events: TankEvent[] = [{ type: 'boom', x: 3, y: 4 }];
+    applySnapshot(guest, overTheWire(snapshot(host, events)));
+    expect(guest.events).toEqual(events);
+    applySnapshot(guest, overTheWire(snapshot(host, events)));
+    expect(guest.events).toEqual(events);
+    // The guest plays a copy: playing or clearing it never writes back to the host's list.
+    guest.events.length = 0;
+    expect(host.events).toEqual([]);
+    expect(events).toEqual([{ type: 'boom', x: 3, y: 4 }]);
+  });
+
+  it('merges a burst of snapshots: newest world, every event once and in order', () => {
+    const world = duo();
+    const a = overTheWire(snapshot(world, [{ type: 'shot', x: 1, y: 1 }]));
+    const b = overTheWire(snapshot(world, [{ type: 'brick', x: 2, y: 2 }]));
+    const c = overTheWire(snapshot(world, [{ type: 'boom', x: 3, y: 3 }]));
+    const merged = joinSnapshots([a, b, c]);
+    expect(merged).toMatchObject({ levelIndex: c.levelIndex, phase: c.phase, lives: c.lives });
+    expect(merged.events.map((event) => event.type)).toEqual(['shot', 'brick', 'boom']);
+    expect(joinSnapshots([a])).toBe(a);
+  });
+
+  it('drops old-map events when a level switch lands inside one burst', () => {
+    const oldMap = duo();
+    const newMap = createWorld(seeded(), 1, 2);
+    const a = overTheWire(snapshot(oldMap, [{ type: 'boom', x: 1, y: 1 }]));
+    const b = overTheWire(snapshot(newMap, [{ type: 'level', x: 3, y: 12 }]));
+    const merged = joinSnapshots([a, b]);
+    expect(merged.levelIndex).toBe(1);
+    expect(merged.events).toEqual([{ type: 'level', x: 3, y: 12 }]);
   });
 });
 

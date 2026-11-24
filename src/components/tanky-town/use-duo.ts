@@ -2,7 +2,14 @@
 
 import { useEffect, useRef, useState } from 'react';
 
-import { applySnapshot, coast, sameInput, snapshot, type Snapshot } from '@/lib/tanky-town-net';
+import {
+  applySnapshot,
+  coast,
+  joinSnapshots,
+  sameInput,
+  snapshot,
+  type Snapshot,
+} from '@/lib/tanky-town-net';
 import type { Input, TankEvent, World } from '@/lib/tanky-town-state';
 
 import { openRoom, type Drop, type Room } from './room';
@@ -20,7 +27,8 @@ const fresh = () => ({
   seat: -1,
   peers: 0,
   remote: IDLE,
-  pending: null as Snapshot | null,
+  /** Snapshots that arrived since the last frame; the newest wins, events are merged. */
+  pending: [] as Snapshot[],
   outbox: [] as TankEvent[],
   sendIn: 0,
   sent: IDLE,
@@ -67,7 +75,7 @@ export function useDuo(options: Options) {
         optionsRef.current.onRole(n.seat, count);
       },
       onMessage: (message) => {
-        if (message.t === 'snap') n.pending = message.s;
+        if (message.t === 'snap') n.pending.push(message.s);
         else if (message.t === 'input') n.remote = { dir: message.dir, fire: message.fire };
         else optionsRef.current.onAgain();
       },
@@ -90,11 +98,11 @@ export function useDuo(options: Options) {
     n.outbox = [];
   };
 
-  /** Guest: show the newest snapshot (true when one arrived) and send the input when it changes. */
+  /** Guest: show every snapshot that arrived since the last frame and send the input on change. */
   const guestFrame = (world: World, dt: number, input: Input) => {
     const n = net.current;
-    const snap = n.pending;
-    n.pending = null;
+    const snap = n.pending.length > 0 ? joinSnapshots(n.pending) : null;
+    n.pending = [];
     if (snap) applySnapshot(world, snap);
     else coast(world, dt);
     n.sendIn -= dt;
