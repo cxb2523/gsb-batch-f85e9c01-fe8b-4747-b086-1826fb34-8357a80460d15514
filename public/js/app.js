@@ -968,7 +968,7 @@ class App {
             el('button', { class: 'icon-btn', title: 'Remove', 'aria-label': 'Remove effect', onclick: () => this.op('effect.remove', { effectId: fx.id }) }, '×'),
           ]),
           open ? el('div', { class: 'fx-params' }, [fx.type === 'eq' ? this.eqCurve(fx) : null, ...Object.entries(def.params).map(([k, s]) => s.type === 'string' ? el('label', { class: 'field inline' }, [el('span', {}, k === 'ir' ? 'Impulse response' : paramLabel(k)), el('select', { class: 'input', onchange: (e) => this.op('effect.update', { effectId: fx.id, params: { [k]: e.target.value } }) }, [
-            el('option', { value: '', disabled: true, selected: !fx.params[k] }, 'Choose a file from the bin…'),
+            el('option', { value: '', selected: !fx.params[k] }, k === 'ir' ? 'None (dry)' : 'Choose a file from the bin…'),
             ...this.project.assets.map((a) => el('option', { value: a.id, selected: fx.params[k] === a.id }, `${a.name} (${a.duration.toFixed(1)} s)`)),
           ])]) : this.slider({
             label: paramLabel(k) + (([this.project.master, ...this.project.tracks].find((o) => o.automation?.[`fx:${fx.id}:${k}`]?.length)) ? ' (auto)' : ''), min: s.minimum, max: s.maximum, step: stepFor(s), value: fx.params[k] ?? s.default, reset: s.default, log: s.unit === 'Hz',

@@ -1,6 +1,7 @@
 // Browser playback through the shared graph, with live parameter updates and meters.
 import { buildProjectGraph, structureKey, projectEnd, loadWorklets } from './engine/graph.js';
 import { loadPluginModules } from './engine/plugins.js';
+import { loadContextBuffer, contextBufferView } from './engine/ir-cache.js';
 import { getToken } from './api.js';
 import { api } from './api.js';
 
@@ -89,11 +90,26 @@ export class Player extends EventTarget {
     return p;
   }
 
+  // Convolution IRs live in a per-context cache (separate from clip buffers): the same
+  // IR is decoded once however many tracks or graph rebuilds use it, and it is released
+  // with the context. Returns the decoded AudioBuffer, or null for missing/broken IRs.
+  loadIr(assetId) {
+    if (!assetId) return Promise.resolve(null);
+    const ctx = this.ensureContext();
+    return loadContextBuffer(ctx, assetId, (id) => api.audio(this.pid, id).then((ab) => ctx.decodeAudioData(ab)))
+      .then((buf) => { this.dispatchEvent(new Event('buffer')); return buf; })
+      .catch((e) => { console.warn(`IR ${assetId} could not be decoded; convolution stays dry`, e); return null; });
+  }
+
   async preload() {
-    const ids = new Set();
-    for (const t of this.project.tracks) for (const c of t.clips) ids.add(c.assetId);
-    for (const list of [this.project.master?.effects || [], ...this.project.tracks.map((t) => t.effects || [])]) for (const e of list) if (e.type === 'convolution' && e.params?.ir) ids.add(e.params.ir);
-    await Promise.all([...ids].map((id) => this.loadAsset(id).catch(() => null)));
+    const clipIds = new Set();
+    const irIds = new Set();
+    for (const t of this.project.tracks) for (const c of t.clips) clipIds.add(c.assetId);
+    for (const list of [this.project.master?.effects || [], ...this.project.tracks.map((t) => t.effects || [])]) for (const e of list) if (e.type === 'convolution' && e.params?.ir) irIds.add(e.params.ir);
+    await Promise.all([
+      ...[...clipIds].map((id) => this.loadAsset(id).catch(() => null)),
+      ...[...irIds].map((id) => this.loadIr(id).catch(() => null)),
+    ]);
   }
 
   get position() {
@@ -123,6 +139,7 @@ export class Player extends EventTarget {
     this.trackMeters.clear();
     this.graph = buildProjectGraph(ctx, this.project, this.buffers, {
       from, to, when: this.startTime, destination: this.bus, speed: this.speed || 1,
+      irBuffers: contextBufferView(ctx), loadIr: (id) => this.loadIr(id),
       streamSource: (clip, o) => (this.isStreamed(clip.assetId) ? this.streamSource(clip, o) : null),
       onTrack: (id, node) => {
         const a = ctx.createAnalyser(); a.fftSize = 1024;

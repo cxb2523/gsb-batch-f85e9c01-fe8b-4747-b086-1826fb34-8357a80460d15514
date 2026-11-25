@@ -4,6 +4,7 @@
 // Registered plugins become ordinary effect types named "plugin:<id>", usable in
 // the browser and in server renders alike.
 import { EFFECTS } from './graph.js';
+import { workletModuleUrl } from './ir-cache.js';
 
 export const pluginType = (id) => `plugin:${id}`;
 
@@ -22,7 +23,7 @@ export async function loadPluginModules(ctx, project, urlFor) {
   const ids = new Set();
   for (const list of [project.master?.effects || [], ...project.tracks.map((t) => t.effects || [])]) for (const e of list) if (EFFECTS[e.type]?.plugin) ids.add(EFFECTS[e.type].plugin);
   await Promise.all([...ids].map((id) => {
-    if (!set.has(id)) set.set(id, ctx.audioWorklet.addModule(urlFor(id)));
+    if (!set.has(id)) set.set(id, ctx.audioWorklet.addModule(workletModuleUrl(urlFor(id))));
     return set.get(id);
   }));
 }

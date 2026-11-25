@@ -7,7 +7,7 @@ process.on('message', async ({ id, project, files, from, to, contentEnd, keep, p
     const ch = await renderSegment(project, files, { from, to, contentEnd, plugins });
     process.send({ id, channels: ch.map((c) => c.slice(keep)) });
   } catch (err) {
-    process.send({ id, error: err.message });
+    process.send({ id, error: err.message, code: err.code, status: err.status, irId: err.irId });
   }
 });
 process.on('disconnect', () => process.exit(0));

@@ -230,9 +230,10 @@ const median = (a) => { const s = [...a].sort((x, y) => x - y); return s[s.lengt
 // Returns one reading per 100 ms block: { t (s, end of block), m, s, i, tp }.
 export async function runMeter(channels, sr) {
   const { OfflineAudioContext, AudioWorkletNode } = await import('node-web-audio-api');
+  const { loadWorklets } = await import('../public/js/engine/graph.js');
   const n = channels[0].length;
   const ctx = new OfflineAudioContext(channels.length, n, sr);
-  await ctx.audioWorklet.addModule(WORKLET);
+  await loadWorklets(ctx, WORKLET);
   const buf = ctx.createBuffer(channels.length, n, sr);
   channels.forEach((c, i) => buf.copyToChannel(f32(c), i));
   const src = ctx.createBufferSource(); src.buffer = buf;

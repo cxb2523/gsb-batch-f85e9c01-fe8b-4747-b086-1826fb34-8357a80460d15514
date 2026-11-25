@@ -7,8 +7,10 @@ import { OfflineAudioContext, AudioWorkletNode } from 'node-web-audio-api';
 import { buildProjectGraph, loadWorklets, setWorkletNode } from '../public/js/engine/graph.js';
 import { registerPlugin, loadPluginModules } from '../public/js/engine/plugins.js';
 import { irAssetIds } from '../public/js/engine/studiofx.js';
+import { loadContextBuffer, contextBufferView } from '../public/js/engine/ir-cache.js';
 
 setWorkletNode(AudioWorkletNode);
+// node-web-audio-api's addModule resolves a filesystem path (the browser gets a URL instead).
 const WORKLET_PATH = fileURLToPath(new URL('../public/js/engine/dsp-worklet.js', import.meta.url));
 
 async function wavLayout(fh) {
@@ -77,19 +79,36 @@ export async function renderSegment(project, files, { from, to, contentEnd, plug
   }
   const local = { ...project, tracks: project.tracks.map((t) => ({ ...t, clips: t.clips.map((c) => (shift.has(c.assetId) ? { ...c, offset: c.offset - shift.get(c.assetId), ...(c.envelope ? { envelope: c.envelope.map((pt) => ({ ...pt, time: pt.time - shift.get(c.assetId) })) } : {}) } : c)) })) };
 
-  // Impulse responses for convolution reverbs: whole files, separate from clip excerpts.
-  const irBuffers = new Map();
-  for (const id of irAssetIds(project)) {
-    if (!files[id]) continue;
-    const a = await readWavFrames(files[id], 0, Infinity);
-    const b = ctx.createBuffer(a.channels.length, Math.max(1, a.frames), a.sampleRate);
-    a.channels.forEach((ch, i) => b.copyToChannel(ch, i));
-    irBuffers.set(id, b);
-  }
+  // Impulse responses for convolution reverbs: whole files, cached per context so an
+  // IR shared by several tracks is read/decoded only once. All referenced IRs are loaded
+  // before the graph is built. Two distinct outcomes, never a silent reverb:
+  //   • no IR (empty `ir` param / asset missing from the map) → dry pass, no error;
+  //   • IR present but undecodable → a tagged ir_decode_failed error the caller can
+  //     distinguish from "no IR".
+  const irIds = [...irAssetIds(project)];
+  const decodeIr = async (id) => {
+    const file = files[id];
+    if (!file) return null; // IR asset not part of this render: treat as no IR (dry).
+    try {
+      const a = await readWavFrames(file, 0, Infinity);
+      const b = ctx.createBuffer(a.channels.length, Math.max(1, a.frames), a.sampleRate);
+      a.channels.forEach((ch, i) => b.copyToChannel(ch, i));
+      return b;
+    } catch (err) {
+      if (err.code === 'ENOENT') return null; // file vanished between edit and render: no IR → dry
+      throw Object.assign(new Error(`Impulse response ${id} could not be decoded: ${err.message}`), {
+        status: 422, code: 'ir_decode_failed', irId: id, cause: err,
+      });
+    }
+  };
+  await Promise.all(irIds.map((id) => loadContextBuffer(ctx, id, decodeIr)));
   await loadWorklets(ctx, WORKLET_PATH);
   const pluginPaths = Object.fromEntries(plugins.map((pl) => [pl.manifest.id, pl.path]));
   await loadPluginModules(ctx, local, (id) => pluginPaths[id]);
-  buildProjectGraph(ctx, local, buffers, { from, to: playEnd, when: 0, irBuffers, exact: true });
+  buildProjectGraph(ctx, local, buffers, {
+    from, to: playEnd, when: 0, exact: true,
+    irBuffers: contextBufferView(ctx), loadIr: (id) => loadContextBuffer(ctx, id, decodeIr),
+  });
   const out = await ctx.startRendering();
   // Copy out of the native AudioBuffer: its memory can go away once it is collected.
   return Array.from({ length: nch }, (_, c) => out.getChannelData(c).slice());

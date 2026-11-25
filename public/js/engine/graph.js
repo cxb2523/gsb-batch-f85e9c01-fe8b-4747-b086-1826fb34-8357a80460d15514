@@ -104,7 +104,7 @@ export const EFFECTS = {
 // Worklet DSP must be loaded into a context before building a graph that uses it.
 const workletsLoaded = new WeakMap();
 export function loadWorklets(ctx, url) {
-  if (!workletsLoaded.has(ctx)) workletsLoaded.set(ctx, ctx.audioWorklet.addModule(url));
+  if (!workletsLoaded.has(ctx)) workletsLoaded.set(ctx, ctx.audioWorklet.addModule(workletModuleUrl(url)));
   return workletsLoaded.get(ctx);
 }
 let WorkletNodeCtor = globalThis.AudioWorkletNode;
@@ -116,6 +116,7 @@ import { MORE_EFFECTS, buildMoreEffect } from './morefx.js';
 Object.assign(EFFECTS, MORE_EFFECTS);
 import { STUDIO_EFFECTS, buildStudioEffect } from './studiofx.js';
 Object.assign(EFFECTS, STUDIO_EFFECTS);
+import { contextBufferView, workletModuleUrl } from './ir-cache.js';
 
 // Lowpass/highpass biquads take Q in dB; −3.01 dB is a flat Butterworth response.
 const BUTTERWORTH_Q_DB = -3.0103;
@@ -511,14 +512,17 @@ const trackLevel = (project, t) => {
  * onTrack(trackId, node): optional tap after each track's fader (for meters).
  * Returns { output, update(project), stop() }.
  */
-export function buildProjectGraph(ctx, project, buffers, { from = 0, to = Infinity, when = 0, destination, onTrack, streamSource, irBuffers, speed = 1, exact = false } = {}) {
+export function buildProjectGraph(ctx, project, buffers, { from = 0, to = Infinity, when = 0, destination, onTrack, streamSource, irBuffers, loadIr, speed = 1, exact = false } = {}) {
   const nodes = [];
   const sources = [];
   const fx = new Map();
   const trackNodes = new Map();
 
   const channels = project.channels === 6 ? 6 : 2;
-  const timing = { from, when, channels, irBuffers: irBuffers || buffers };
+  // Convolution IRs are cached per context. irBuffers is an optional synchronous
+  // Map-style view; when absent the context cache view is used. loadIr(id) decodes
+  // an IR on demand (e.g. when the user switches IR while the graph is running).
+  const timing = { from, when, channels, irBuffers: irBuffers || contextBufferView(ctx), loadIr };
   // speed: transport playback speed (review at 1.25× etc.); 1 for every export.
   const T = (x) => when + (x - from) / speed;
   const masterChain = buildChain(ctx, project.master?.effects, nodes, fx, timing);

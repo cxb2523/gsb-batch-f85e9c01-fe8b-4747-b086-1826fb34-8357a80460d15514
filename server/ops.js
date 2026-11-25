@@ -51,6 +51,8 @@ function checkEffectParams(type, params = {}) {
     const spec = Object.hasOwn(def.params, k) ? def.params[k] : null;
     if (!spec) throw new ValidationError(`${type} has no parameter "${k}" (has: ${Object.keys(def.params).join(', ')})`);
     if (spec.type === 'string') {
+      // Empty string clears an optional string parameter (e.g. convolution's `ir` → no IR, dry pass).
+      if (v === '') continue;
       if (typeof v !== 'string' || !/^ast_[a-f0-9]+$/.test(v)) throw new ValidationError(`${type}.${k} must be an asset id (ast_…) from the bin`);
       continue;
     }

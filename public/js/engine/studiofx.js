@@ -2,6 +2,8 @@
 // Graphic EQ and Convolution Reverb (with your own impulse response from the bin).
 // Native nodes only, so preview and export are identical.
 
+import { silentIrBuffer } from './ir-cache.js';
+
 const THIRD_OCTAVES = [25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630, 800, 1000, 1250, 1600, 2000, 2500, 3150, 4000, 5000, 6300, 8000, 10000, 12500, 16000, 20000];
 const bandKey = (f) => `g${f >= 1000 ? `${+(f / 1000).toFixed(2)}k`.replace('.', '_') : String(f).replace('.', '_')}`;
 
@@ -51,7 +53,11 @@ export const STUDIO_EFFECTS = {
 
 const dbToGain = (db) => Math.pow(10, db / 20);
 
-/** Returns null for other types. timing.irBuffers: Map assetId → AudioBuffer. */
+/**
+ * Returns null for other types.
+ * timing.irBuffers: Map-like view of ready AudioBuffers (per-context cache).
+ * timing.loadIr(id): Promise that decodes an IR asset into the context cache.
+ */
 export function buildStudioEffect(ctx, fx, P, timing) {
   if (!STUDIO_EFFECTS[fx.type]) return null;
   const nodes = [], targets = {};
@@ -103,10 +109,37 @@ export function buildStudioEffect(ctx, fx, P, timing) {
       const pre = mk(ctx.createDelay(0.25)), wet = mk(ctx.createGain()), lvl = mk(ctx.createGain());
       input.connect(output);
       input.connect(pre); pre.connect(conv); conv.connect(lvl); lvl.connect(wet); wet.connect(output);
-      let irId = null;
+      let irId = undefined; // distinct from null (the "no IR" state) so the first update always applies
+      let irSeq = 0;
+      const applyIr = (id) => {
+        // No IR (or one not decoded yet): swap in a one-frame silent IR so the wet
+        // branch contributes nothing while the input → output dry path stays at unity.
+        // We never assign null: the server convolver rejects it, and the silent IR is
+        // the exact equivalent in browsers. Normalization must be off (and set before
+        // the buffer) for the all-zero placeholder — normalizing silence is undefined
+        // and some engines divide by zero when the buffer is attached while normalize is on.
+        const silent = silentIrBuffer(ctx);
+        const b = (id && timing?.irBuffers?.get(id)) || silent;
+        conv.normalize = b !== silent;
+        if (conv.buffer !== b) conv.buffer = b;
+      };
       update = (params) => {
         const p = P(params);
-        if (p.ir !== irId) { irId = p.ir; const b = timing?.irBuffers?.get(p.ir); conv.buffer = b || null; }
+        const nextId = p.ir || null;
+        if (nextId !== irId) {
+          irId = nextId;
+          const seq = ++irSeq;
+          applyIr(nextId); // swap immediately; silent IR until the real one is decoded → dry, never an error
+          if (nextId && timing?.loadIr) {
+            // IR switched while the graph is running. timing.loadIr goes through the
+            // per-context cache (each IR decoded once), then we swap the convolver
+            // buffer in. A stale switch (the user changed IR again meanwhile) must not
+            // resurrect an older buffer.
+            Promise.resolve(timing.loadIr(nextId))
+              .then(() => { if (seq === irSeq && irId === nextId) applyIr(nextId); })
+              .catch(() => {}); // undecodable IR stays dry; the export path reports it explicitly
+          }
+        }
         pre.delayTime.value = p.predelay / 1000; wet.gain.value = p.mix; lvl.gain.value = dbToGain(p.gain);
       };
       targets.mix = { param: wet.gain, map: (v) => v };

@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import { OfflineAudioContext, AudioWorkletNode } from 'node-web-audio-api';
 import { buildMoreEffect, MORE_EFFECTS } from '../public/js/engine/morefx.js';
+import { loadWorklets } from '../public/js/engine/graph.js';
 
 const SR = 48000;
 const WORKLET = fileURLToPath(new URL('../public/js/engine/dsp-worklet.js', import.meta.url));
@@ -20,7 +21,7 @@ const TYPES = Object.keys(MORE_EFFECTS);
 async function render(type, { params = {}, from = 0, seconds = 1, signal }) {
   const n = Math.round(SR * seconds);
   const ctx = new OfflineAudioContext(2, n, SR);
-  await ctx.audioWorklet.addModule(WORKLET);
+  await loadWorklets(ctx, WORKLET);
   const buf = ctx.createBuffer(2, n, SR);
   const f0 = Math.round(from * SR);
   for (let ch = 0; ch < 2; ch++) { const d = buf.getChannelData(ch); for (let i = 0; i < n; i++) d[i] = signal((f0 + i) / SR, ch); }
@@ -272,7 +273,7 @@ test('5.1 bus/master: every effect accepts six channels and keeps the centre cha
   for (const type of TYPES) {
     const n = S(0.25);
     const ctx = new OfflineAudioContext(6, n, SR);
-    await ctx.audioWorklet.addModule(WORKLET);
+    await loadWorklets(ctx, WORKLET);
     const buf = ctx.createBuffer(6, n, SR);
     for (let ch = 0; ch < 6; ch++) { const d = buf.getChannelData(ch); for (let i = 0; i < n; i++) d[i] = music(i / SR, ch); }
     const src = ctx.createBufferSource(); src.buffer = buf;
@@ -292,7 +293,7 @@ test('graph.js: the new effects are registered and build through buildProjectGra
   for (const t of TYPES) assert.equal(EFFECTS[t], MORE_EFFECTS[t]);
   const run = async (effects) => {
     const ctx = new OfflineAudioContext(2, S(0.5), SR);
-    await ctx.audioWorklet.addModule(WORKLET);
+    await loadWorklets(ctx, WORKLET);
     const b = ctx.createBuffer(1, S(0.5), SR); const d = b.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = 0.5 * Math.sin((TAU * 220 * i) / SR);
     const project = { sampleRate: SR, master: { gain: 0, effects: [] }, tracks: [{ id: 't', kind: 'audio', gain: 0, pan: 0, sends: [], automation: {}, effects, clips: [{ id: 'c', assetId: 'a', start: 0, duration: 0.5, offset: 0, gain: 0 }] }] };
     buildProjectGraph(ctx, project, new Map([['a', b]]), { from: 0, when: 0 });

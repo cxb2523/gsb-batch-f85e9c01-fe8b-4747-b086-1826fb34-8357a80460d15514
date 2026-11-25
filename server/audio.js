@@ -397,7 +397,7 @@ function renderPool() {
       const job = pool.pending.get(m.id);
       pool.pending.delete(m.id);
       if (!job) return;
-      if (m.error) job.reject(Object.assign(new Error(m.error), { status: 422, code: 'render_failed' }));
+      if (m.error) job.reject(Object.assign(new Error(m.error), { status: m.status || 422, code: m.code || 'render_failed', irId: m.irId }));
       else job.resolve(m.channels);
       const next = pool.queue.shift();
       if (next) send(w, next); else { pool.idle.push(w); hold(w, false); }
