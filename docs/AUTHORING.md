@@ -133,9 +133,11 @@ Screen operations (they resolve everything drawn so far first):
 
 - `p.warp(x, y, z, R, fn(dx, dy, rho) => [ox, oy] | null)` — displace pixels (lensing, heat haze, space rips).
 - `p.flash(color, amount)` — ordered-dither flash of the whole frame.
-- `p.post(fn({ pix, W, H, kind, zb, bayer, rgb, hex, P, Q, night, mode }))` — custom full-frame pass (pix is Uint32
+- `p.post(fn({ pix, W, H, kind, zb, bayer, rgb, hex, P, Q, night, mode, sig }))` — custom full-frame pass (pix is Uint32
   ABGR). `Q(sx, sy, h = 0)` → `[x, y, depth]` is the inverse of `P`: the world point at height `h` under a screen
   pixel (screen-space spells that must know what lies under each pixel: erasers, pixelation zones, masks).
+  `sig` is a string that changes whenever the camera projection changes (mode, size, origin, scale, depth offset,
+  yaw/pitch, lens): key any per-camera cache on it so a cache hit can never reuse rays from a slightly moved camera.
 - `p.worldScale(k)` — scales everything drawn after it in this frame by `k` about the origin (zoom-outs, growing
   worlds). The baked stage ground does not scale: use `stage: { ground: 'none' }` and draw your own.
 - `p.project(x, y, z)` → `[sx, sy, depth, pixelsPerUnit]`.
@@ -157,6 +159,22 @@ Engine notes learned while converting the 64 effects:
   first: `p.post(({ zb }) => zb.fill(-1e9))`.
 - Effect-specific helpers belong on the definition object (`this.helper(...)`), never as globals: every file
   is loaded into the same page.
+
+Render state and caches (what must not leak between frames):
+- **Frame state is per frame.** At the start of every `render(def, t)` the guide list, the lens and the deferred
+  light / ground-light / shadow buffers are cleared, so a frame only ever shows its own effect, parameters and
+  camera. Calling `p.flush()`, `p.post`, `p.grade`, `p.warp` or `p.flash` inside one frame still works: they
+  resolve and drain what was drawn so far, and later draws accumulate again into the cleared buffers.
+- **Caches must key on every input that changes their output.** The engine's own ground texture / ground colour
+  / hue-ramp caches key on the effect id, the stage (ground, radius, shape, tiles), night, transparent, the full
+  camera and the exact hue; a hit must equal a cold render. Your own per-camera caches should key on `sig`
+  (from `p.post`) or `p.v.camSig`, never on rounded projections, or a small camera move can reuse stale rays.
+- **`p.param(key)` and the shared knobs are read fresh each call**, so changing a parameter and re-rendering the
+  same `t` always reflects the new value; do not copy a knob into a cached structure without putting it in the
+  cache key.
+- `node tools/state-check.mjs` renders the same frame from a warm and a cold view, after other effects, after
+  other parameter values, after camera moves and after multi-flush frames, and compares pixels — run it after
+  adding caches or per-frame state.
 
 ## Style rules (from pixel-plays, adapted for VFX)
 

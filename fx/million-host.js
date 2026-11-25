@@ -129,7 +129,9 @@ PXFX.define({
   // ground under every pixel (world point, depth, base colour) and the soldier whose feet land in it; cached per camera
   ground(p, A, Fx, Fy, hpx, R) {
     const v = p.v, W = v.W, H = v.H, fs = v.fs;
-    const key = [A.key, v.mode, W, H, fs.toFixed(8), Fx.toFixed(4), Fy.toFixed(4), v.yawV, v.OX, v.OY.toFixed(3), p.night ? 1 : 0, v.hue, hpx > 0 ? Math.round(hpx * 100) : 0].join('|');
+    // camSig carries the full, unrounded camera (origin, scale, yaw/pitch, depth offset, lens, projection
+    // axes), so a slightly moved camera can never hit stale ground; the rest are this effect's own inputs.
+    const key = [A.key, v.camSig, Fx.toFixed(4), Fy.toFixed(4), p.night ? 1 : 0, v.hue, hpx > 0 ? Math.round(hpx * 100) : 0].join('|');
     let G = this._ground;
     if (G && G.key === key) return G;
     const N0 = W * H;

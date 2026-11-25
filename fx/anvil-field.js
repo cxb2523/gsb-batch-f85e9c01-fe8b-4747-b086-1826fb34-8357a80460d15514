@@ -175,7 +175,10 @@ PXFX.define({
       }
     }
     // ---- pour paths (stable: built from the fixed held frame and the mould at rest), cached per camera ----
-    const ckey = [p.mode, p.project(0, 0, 0).join(), p.project(1, 1, 1).join()].join('|');
+    // The paths are world geometry that depends only on the camera direction (HF's face follows cam().fwd),
+    // so key on the renderer's precise camera signature — never on a projection that can be null when a probe
+    // point falls outside a perspective camera (that used to crash: p.project(...).join() on null).
+    const ckey = p.v.camSig;
     if (!this._pp || this._ppKey !== ckey) {
       const pp = [], M0 = this.frame([this.MX, 0, this.ZM], [1, 0, 0], [0, 0, 1], this.MLEN);
       for (let c = 0; c < 2; c++) {

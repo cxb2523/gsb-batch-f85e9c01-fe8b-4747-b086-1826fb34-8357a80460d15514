@@ -102,7 +102,10 @@
   }
   function rampArr(id, hue) {
     if (!hue || chroma(id) < .075) return RAMPS[id];
-    const key = id * 4096 + (hue | 0);
+    // key on the exact hue: truncating to an integer let two different hues (30.4 and 30.6) share one
+    // entry, so a cache hit returned the first hue's colours and a cold render returned the second's.
+    // The key must cover every input that changes the rotated ramp, or hit and miss disagree.
+    const key = id + ':' + hue;
     let r = hueCache.get(key);
     if (!r) { r = Uint32Array.from(RAMP_RGB[id].map(c => { const h = hueRot(c, hue); return rgb(h[0], h[1], h[2]); })); hueCache.set(key, r); }
     return r;
@@ -241,7 +244,7 @@
       this.fx = cp * sy; this.fy = cp * cy; this.fz = sp;   // towards the viewer
       this.ux = -sp * sy; this.uy = -sp * cy; this.uz = cp; // screen up
       this.hx = sy; this.hy = cy;                         // 2D: horizontal depth axis
-      this.yawV = yaw;
+      this.yawV = yaw; this.pitchV = pitch;
       const Tz = v.z == null ? h * .4 : v.z;
       this.Tz = Tz;
       const W = this.W, H = this.H, zoom = v.zoom || 1;
@@ -264,6 +267,15 @@
         tx: (ln.to || ln.c)[0] * fs0, ty: (ln.to || ln.c)[1] * fs0, tz: (ln.to || ln.c)[2] * fs0 } : null;
       this.persp = m === '3d';
       if (this.persp) { this.f = (H / 2) / Math.tan(.3); this.D = this.f / S; }
+    }
+    // precise signature of everything P()/Q() read, for effects that cache per-pixel view rays: any change here
+    // means the projection changed, so a cache keyed on this can never reuse stale rays. A getter, not a snapshot,
+    // because effects can still move the projection after camera() runs (worldScale() changes fs mid-frame).
+    get camSig() {
+      return [this.mode, this.W, this.H, this.S, this.OX, this.OY, this.Tz, this.fs, this.yawV, this.pitchV,
+        this.rx, this.ry, this.fx, this.fy, this.fz, this.ux, this.uy, this.uz, this.hx, this.hy,
+        this.persp ? this.f : 0, this.persp ? this.D : 0,
+        this.lens ? [this.lens.k, this.lens.cx, this.lens.cy, this.lens.cz, this.lens.tx, this.lens.ty, this.lens.tz].join() : 0].join('|');
     }
     // project a world point: sets px, py (pixels), pd (depth, larger is nearer), ps (pixels per world unit)
     P(x, y, z) {
@@ -321,11 +333,19 @@
     }
     bake(def) {
       const st = def.stage || E, v = def.view || E;
-      const key = [def.id, this.mode, this.W, this.H, this.night ? 1 : 0, this.transparent ? 1 : 0, this.OX, this.OY.toFixed(3), this.mode === '3d' ? this.yawV.toFixed(4) + this.pitch : 0, this.lens ? [this.lens.k, this.lens.cx, this.lens.cy, this.lens.cz, this.lens.tx, this.lens.ty, this.lens.tz].map(x => x.toFixed(4)).join() : 0].join('|');
+      const R = st.r || (v.r || 3) * .92, shape = st.shape || 'round', tiles = st.tiles;
+      // Every input that changes a baked pixel belongs in the key, or a hit reuses the previous effect's
+      // ground: the stage (ground name, radius, shape, tiles), the camera projection the bake reads
+      // (screen origin, scale, depth offset, yaw/pitch) and the per-frame lens. Floats go in at full
+      // precision — rounding let two slightly different cameras share a key, so a cache hit could differ
+      // by a pixel from a cold (uncached) render.
+      const key = [def.id, this.mode, this.W, this.H, this.night ? 1 : 0, this.transparent ? 1 : 0,
+        st.ground || 'stone', R, shape, tiles ? 1 : 0,
+        this.OX, this.OY, this.S, this.Tz, this.yawV, this.pitchV,
+        this.lens ? [this.lens.k, this.lens.cx, this.lens.cy, this.lens.cz, this.lens.tx, this.lens.ty, this.lens.tz].join() : 0].join('|');
       if (key === this.bakeKey) return;
       this.bakeKey = key;
       const W = this.W, H = this.H, gs = groundSet(st.ground || 'stone', this.night);
-      const R = st.r || (v.r || 3) * .92, shape = st.shape || 'round', tiles = st.tiles;
       const bg = this.transparent ? 0 : this.night ? rgb(20, 19, 26) : rgb(255, 255, 255), flat = this.mode === '2d';
       const pix = this.basePix, zb = this.baseZ, kind = this.baseKind, tex = groundTex(def, R, shape, tiles);
       for (let iy = 0; iy < H; iy++) for (let ix = 0; ix < W; ix++) {
@@ -348,7 +368,13 @@
       }
     }
     render(def, t) {
-      this.lensNow = null; this.guides.length = 0;
+      // start every frame from clean per-frame state: the guide list, the lens and the deferred light /
+      // ground-light / shadow buffers. flush() also drains these as it resolves them, but clearing here as
+      // well means a frame can never inherit residue from the previous effect, camera or parameter set even
+      // if a draw bailed out early. Multiple flush() calls inside one frame still work: they resolve and
+      // drain what was drawn so far, and later draws accumulate into the cleared buffers again.
+      this.guides.length = 0; this.lensNow = null;
+      this.L.fill(0); this.LM.fill(0); this.GL.fill(0); this.shadow.fill(0);
       const ap = this.api;
       ap.t = t; ap.mode = this.mode; ap.night = this.night; ap.props = !this.noProps; ap.def = def;   // lens may read params
       if (def.lensAt) { try { this.lensNow = def.lensAt.call(def, t, this.api); } catch (e) { if (this.errors++ < 3) console.error('[pxfx]', def.id, e); } }
@@ -1171,7 +1197,7 @@
       v.flush();
       fn({ pix: v.pix, W: v.W, H: v.H, kind: v.kind, zb: v.zb, bayer: bayerAt, rgb, hex, P: (x, y, z) => (v.P(x, y, z) ? [v.px, v.py, v.pd, v.ps] : null),
         // inverse: the world point at height h under screen pixel (sx, sy), in the same (scaled) units P takes
-        Q: (sx, sy, h = 0) => (v.Q(sx, sy, h * v.fs) ? [v.qx / v.fs, v.qy / v.fs, v.qd] : null), night: v.night, mode: v.mode });
+        Q: (sx, sy, h = 0) => (v.Q(sx, sy, h * v.fs) ? [v.qx / v.fs, v.qy / v.fs, v.qd] : null), night: v.night, mode: v.mode, sig: v.camSig });
     }
     // scale everything drawn after this call (in this frame) by k about the origin, on top of the size knob:
     // camera zoom-outs and growing worlds. The baked ground does not scale (use stage ground 'none' and draw your own).

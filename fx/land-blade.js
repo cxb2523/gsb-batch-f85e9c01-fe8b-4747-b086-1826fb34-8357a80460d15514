@@ -143,9 +143,10 @@ PXFX.define({
     this._cols[key] = { tones: g.tones.map(conv), speck: g.speck.map(conv), pit: this.palette.pit.map(conv), strata: this.palette.strata.map(conv) };
     return this._cols[key];
   },
-  // per-pixel view rays (ground point at h = 0 and its change per unit of height), cached per camera
-  rays(W, H, mode, P, Q) {
-    const key = [W, H, mode].concat([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]].map(v => { const q = P(v[0], v[1], v[2]); return q ? q[0].toFixed(3) + ',' + q[1].toFixed(3) : 'x'; })).join('|');
+  // per-pixel view rays (ground point at h = 0 and its change per unit of height), cached per camera. Key on the
+  // renderer's precise camera signature (sig) so a hit can never reuse rays from a slightly different camera.
+  rays(W, H, mode, P, Q, sig) {
+    const key = sig || [W, H, mode].concat([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]].map(v => { const q = P(v[0], v[1], v[2]); return q ? q[0].toFixed(3) + ',' + q[1].toFixed(3) : 'x'; })).join('|');
     if (this._ray && this._ray.key === key) return this._ray;
     const a = new Float32Array(W * H * 6), ok = new Uint8Array(W * H);
     for (let iy = 0; iy < H; iy++) for (let ix = 0; ix < W; ix++) {
@@ -197,8 +198,8 @@ PXFX.define({
     const lift = this.lift(t, p), ph = this.phi(t, p), out = t >= this.L0 && t < this.SLAM, cs = Math.cos(ph), sn = Math.sin(ph);
     const heads = [this.head(t, 0), this.head(t, 1)];
     // ---- 1. ground pass: the pit, the slab's top face (the same ground texture), its shadow, the cut line ----
-    p.post(({ pix, W, H, kind, zb, bayer, P, Q, mode }) => {
-      const rc = self.rays(W, H, mode, P, Q), a = rc.a, flat = mode === '2d';
+    p.post(({ pix, W, H, kind, zb, bayer, P, Q, mode, sig }) => {
+      const rc = self.rays(W, H, mode, P, Q, sig), a = rc.a, flat = mode === '2d';
       self.mask(rc, sh, W, H);
       const ins = rc.ins, SX = PXFX.SHADOW_X, SY = PXFX.SHADOW_Y, hs = lift - TH * .5;
       if (out) {

@@ -187,11 +187,13 @@ PXFX.define({
     const strain = p.env(t, this.LIFT[0] - .05, this.LIFT[0] + .05, T0 - .1, T0 + .5);
     const seamBase = (.42 + strain * (.35 + .25 * Math.sin(t * 26))) * seamFade;
     // ---- 1. the board, painted per pixel: resting tops, soil sides seen through the holes ----
-    p.post(({ pix, W, H, kind, zb, bayer, P, Q, mode }) => {
+    p.post(({ pix, W, H, kind, zb, bayer, P, Q, mode, sig }) => {
       const flat = mode === '2d', ids = self._ids && self._ids.length === W * H ? self._ids : (self._ids = new Int16Array(W * H));
       // every pixel's view ray as ground point + change per unit of height (rays are straight: linear in h);
-      // cached until the camera moves, so a still camera costs no inverse projections
-      const key = [W, H, mode].concat([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]].map(v => { const q = P(v[0], v[1], v[2]); return q ? q[0].toFixed(3) + ',' + q[1].toFixed(3) : 'x'; })).join('|');
+      // cached until the camera moves, so a still camera costs no inverse projections. Key on the renderer's
+      // precise camera signature: two slightly different cameras must not share these rays, or a cache hit
+      // (stale rays) renders a pixel differently from a cold, uncached frame.
+      const key = sig || [W, H, mode].concat([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]].map(v => { const q = P(v[0], v[1], v[2]); return q ? q[0].toFixed(3) + ',' + q[1].toFixed(3) : 'x'; })).join('|');
       let rc = self._ray;
       if (!rc || rc.key !== key) {
         rc = self._ray = { key, a: new Float32Array(W * H * 6), ok: new Uint8Array(W * H) };

@@ -8,7 +8,8 @@
     "snap": "node tools/snap.mjs",
     "qa": "node tools/gallery.mjs",
     "media": "node tools/media.mjs",
-    "check": "node tools/site-check.mjs"
+    "check": "node tools/site-check.mjs",
+    "state-check": "node tools/state-check.mjs"
   },
   "devDependencies": {
     "puppeteer": "^24.11.2"
